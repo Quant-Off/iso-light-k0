@@ -1,0 +1,14 @@
+# 빌드 산출물 제외 (컨테이너 내에서 새로 빌드됨)
+target/
+*.iso
+isodir/
+
+# Docker 관련 파일 자체는 제외 불필요하지만 명시
+.dockerignore
+
+# VCS
+.git/
+.gitignore
+
+# 개발 환경
+.cargo/advisory-db/
