@@ -75,6 +75,7 @@ impl EndpointId {
 /// 잘 알려진(well-known) 커널 서비스 엔드포인트 ID.
 pub const EP_SYSTEM: EndpointId = EndpointId(0x0000); // 커널 시스템 콜
 pub const EP_CRYPTO: EndpointId = EndpointId(0x0001); // 암호화 서비스
+pub const EP_SIGN: EndpointId = EndpointId(0x0002);   // ML-DSA PQ 서명 서비스
 
 //
 // Capability 토큰

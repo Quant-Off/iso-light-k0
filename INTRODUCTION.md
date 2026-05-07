@@ -162,9 +162,50 @@ flowchart TB
     M --> N["MMU typestate 초기화 (KASLR 오프셋)"]
     N --> O["직접 선형 매핑 구축 (2 MiB 페이지)"]
     O --> P["커널 세그먼트 W^X 매핑<br/>(IST 가드 페이지 제외)"]
-    P --> Q["IPC 서브시스템 초기화"]
-    Q --> R["인터럽트 활성화, 메인 이벤트 루프"]
+    P --> P1["CR0.WP + CR4.SMEP/SMAP/UMIP + EFER.SCE 활성"]
+    P1 --> P2["TSS.RSP0 + syscall 인프라(STAR/LSTAR/SFMASK + KernelGsBase)"]
+    P2 --> Q["IPC 서브시스템 초기화"]
+    Q --> R["인터럽트 활성화"]
+    R --> S["임베드 사용자 ELF spawn (debug)"]
+    S --> T["enter_ring3 (cr3 + swapgs + iretq) → Ring 3"]
+    T --> U["사용자 syscall 처리 / sys_exit 시 cli+hlt"]
 ```
+
+## Ring 3 사용자 프로세스
+
+`iso-light-k0` 는 정적 ELF64 사용자 프로그램을 임베드하여 Ring 3 에서 실행합니다.
+
+| 사용자 크레이트 | 용도 |
+|--------|------|
+| `crates/iso-user-hello` | Ring 3 진입 + `sys_write` / `sys_getrandom` / `sys_exit` 동작 검증 |
+| `crates/iso-user-lumen` | `lumen` 프로젝트의 `elib-k0-nt` 와이어 호환성 (BLAKE3 / Ed25519 / X25519 / AES-256-GCM) 을 Ring 3 에서 실증 |
+
+빌드는 두 단계입니다:
+
+```bash
+make user-hello        # 사용자 ELF 빌드 (build-std=core)
+make build             # 커널 빌드 — build.rs 가 사용자 ELF 를 include_bytes! 임베드
+make iso && make run   # QEMU 부팅
+```
+
+### 보안 격리 4중 경계
+
+| 비트 | 효과 |
+|------|------|
+| `CR4.SMEP` | 커널이 사용자 페이지에서 코드 실행 차단 |
+| `CR4.SMAP` | 커널 ↔ 사용자 메모리 직접 접근 차단(stac/clac 윈도우만 허용) |
+| `IA32_FMASK` | syscall 진입 시 사용자 RFLAGS 의 IF/TF/AC/DF/NT/IOPL 즉시 0 |
+| `CR4.UMIP` | Ring 3 에서 SGDT/SIDT/STR/SLDT/SMSW 차단 |
+
+### Syscall ABI
+
+| 번호 | 이름 | 역할 |
+|------|------|------|
+| 0 | `Exit` | 프로세스 종료 |
+| 1 | `Write(fd, buf, len)` | `fd=2` 만 지원 — VGA(stderr) 출력 |
+| 5 | `GetRandom(_, buf, len)` | 커널 DRBG 출력 |
+
+호출 규약: 번호 = `RAX`, 인자 = `RDI/RSI/RDX/R10/R8/R9`, 반환 = `RAX`(음수 = `SyscallError`). `RCX/R11` 은 CPU 가 자동 저장. 사용자 ↔ 커널 메모리 전송은 SMAP `stac/clac` 윈도우 안에서만 수행되며 길이/주소가 항상 검증됩니다.
 
 ## IPC Endpoints
 
@@ -195,4 +236,6 @@ flowchart TB
 
 ## Roadmap
 
-향후 계획에는 HSM 드라이버 인터페이스(추상화 트레이트), `RDRAND`/`RDSEED` 기반 CSPRNG, 사용자 공간 프로세스 로더, 스케줄러 연동(IPC 블로킹), TUI 프레임버퍼 렌더링 엔진, ARM64 타겟 지원이 포함됩니다.
+향후 계획에는 HSM 드라이버 인터페이스(추상화 트레이트), 다중 사용자 프로세스 스케줄러(IPC 블로킹 연동), 사용자 ↔ 커널 IPC capability 발급 시스템콜(`SyscallNum::IpcCall/IpcRecv/IpcReply/CapRequest`), 더 많은 모듈 격리 (KPTI 스타일 PML4 분리), TUI 프레임버퍼 렌더링 엔진, ARM64 타겟 지원이 포함됩니다.
+
+> **참고**: Ring 3 사용자 공간 로더는 `kernel-compatible` 브랜치에서 구현되었습니다 (`src/syscall.rs`, `src/process.rs`, `src/elf.rs`, `crates/iso-user-{hello,lumen}/`). lumen 프로젝트와의 결합 검증은 `iso-user-lumen` 의 BLAKE3/Ed25519/X25519/AES-256-GCM 와이어 호환 검증으로 수행됩니다.

@@ -14,6 +14,8 @@ pub mod boot_stub; // Multiboot2 헤더 + 32-bit 부팅 스텁 (global_asm)
 pub mod capability; // Capability-based Access Control
 pub mod cpu; // CPU 특수 레지스터 / SIMD·FPU 컨텍스트 활성화
 pub mod crypto_service; // EP_CRYPTO 엔드포인트 암호화 서비스 디스패처
+pub mod sign_service;   // EP_SIGN 엔드포인트 ML-DSA PQ 서명 서비스
+pub mod elf; // ELF64 정적 실행 파일 파서
 pub mod hsm; // HSM 추상 트레이트 + NullHsm
 pub mod idt;
 pub mod ipc; // IPC 메시지 패싱 (동기 rendezvous)
@@ -21,13 +23,31 @@ pub mod keystore; // 소프트 PSK 키 저장소 (HSM 폴백)
 pub mod memory_map;
 pub mod mmu;
 mod panic;
+#[cfg(target_arch = "x86_64")]
+pub mod process; // 정적 프로세스 슬롯 + Ring 3 진입
 pub mod stack; // 커널 스택 + 가드 페이지 레이아웃
+#[cfg(target_arch = "x86_64")]
+pub mod syscall; // syscall/sysret 사용자 ↔ 커널 진입 경로
 pub mod tls; // TLS 1.3 PSK (psk_dhe_ke / psk_pq_hybrid_ke)
 pub mod tss;
 pub mod vga;
 // 보안 메모리 소거는 외부 `zeroize` 크레이트(elib-k0-nt) 사용
 
 use mmu::{AddressSpace, KERNEL_VMA_BASE, Mmu, PageTableFlags, Uninitialized};
+
+//
+// 사용자 ELF 페이로드 (build.rs 가 OUT_DIR 로 복사한 후 환경변수로 노출)
+//
+// Phase C/D 의 사용자 크레이트가 빌드되어 있지 않으면 build.rs 가 4-byte
+// ELF magic placeholder 만 임베드함. 그 경우 elf::parse() 가 `Truncated` /
+// `BadMagic` 으로 거절하여 spawn 시도가 안전하게 fail-stop 됨.
+//
+// Phase E 통합 단계에서 _kernel_start 가 spawn_elf + enter_ring3 를 호출하면
+// dead_code 경고가 자동으로 해소됨. 그 전까지 일시 허용.
+#[allow(dead_code)]
+const USER_HELLO_ELF: &[u8] = include_bytes!(env!("ISO_USER_HELLO_ELF"));
+#[allow(dead_code)]
+const USER_LUMEN_ELF: &[u8] = include_bytes!(env!("ISO_USER_LUMEN_ELF"));
 
 //
 // 링커 스크립트 심볼
@@ -170,6 +190,41 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // SAFETY: IDT가 로드된 이후이므로 XSETBV가 GP를 일으키면 #GP 핸들러로 진입 가능
     unsafe {
         cpu::finalize_simd_fpu();
+    }
+
+    //
+    // 4.6. 사용자/커널 격리 보안 비트 일괄 활성화
+    //
+    // CR0.WP, CR4.SMEP/SMAP/UMIP, IA32_EFER.SCE 를 한 번에 켜서 Ring 3
+    // 사용자 프로세스가 진입하기 전에 격리 경계를 확립함.
+    // SAFETY: enable_simd_fpu() 로 CpuFeatures 가 캐싱됨, IDT 활성, CLI 상태
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        cpu::enable_security_bits();
+        vga::println(
+            b"[iso-light-k0] CR0.WP + CR4.SMEP/SMAP/UMIP + EFER.SCE Ready.",
+            vga::Color::Green,
+        );
+    }
+
+    //
+    // 4.7. syscall/sysret 인프라 설치
+    //
+    // STAR/LSTAR/CSTAR/SFMASK + KernelGsBase 를 BSP 에 설치.
+    // RSP0 는 부트 스택 최상단(boot_stack_top) 으로 설정 — 인터럽트가 사용자
+    // 모드에서 발생하면 자동으로 본 RSP 가 적재됨. syscall stub 은 GS-relative
+    // 로 동일 값을 사용함.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let (_, kstack_top) = stack::boot_stack_range();
+        // 16-byte 정렬 — System V x86_64 ABI 요구사항
+        let kstack_top = kstack_top & !0xF;
+        tss::set_rsp0(kstack_top);
+        syscall::install(kstack_top);
+        vga::println(
+            b"[iso-light-k0] Syscall ABI Installed (STAR/LSTAR/SFMASK).",
+            vga::Color::Green,
+        );
     }
 
     //
@@ -412,7 +467,7 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     unsafe {
         ipc::init();
         vga::println(
-            b"[iso-light-k0] IPC Init Done. (EP_SYSTEM, EP_CRYPTO)",
+            b"[iso-light-k0] IPC Init Done. (EP_SYSTEM, EP_CRYPTO, EP_SIGN)",
             vga::Color::Green,
         );
     }
@@ -454,7 +509,71 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
         vga::println(b"[iso-light-k0] All Task Done.", vga::Color::Green);
     }
 
+    //
+    // 16. Ring 3 사용자 프로세스 spawn (debug 빌드 + 유효 ELF 한정)
+    //
+    // 우선 lumen 와이어 호환 검증 프로그램(iso-user-lumen) 을 시도. ELF 가
+    // placeholder(4 바이트) 또는 빌드되지 않은 경우 elf::parse 가 거절하므로
+    // 그 다음 iso-user-hello 를 시도. 둘 다 실패하면 커널 메인 루프 진입.
+    //
+    // enter_ring3 는 ! 반환 — 성공 시 본 함수는 결코 메인 루프에 도달하지 않음.
+    // 사용자 프로세스가 sys_exit 하면 syscall::sys_exit 가 cli + hlt 무한
+    // 루프로 정지함.
+    #[cfg(all(target_arch = "x86_64", debug_assertions))]
+    // SAFETY: 위 단계가 모두 완료된 후. activate() 는 호출하지 않으며
+    //         enter_ring3 가 사용자 PML4 로 cr3 전환을 직접 수행함.
+    unsafe {
+        let kernel_space = &*(&raw const KERNEL_ADDR_SPACE);
+        try_spawn_user(USER_LUMEN_ELF, b"iso-user-lumen", kernel_space);
+        try_spawn_user(USER_HELLO_ELF, b"iso-user-hello", kernel_space);
+        vga::println(
+            b"[iso-light-k0] no valid user ELF embedded; entering kernel main loop",
+            vga::Color::Yellow,
+        );
+    }
+
     kernel_main_loop()
+}
+
+/// 임베드된 사용자 ELF 를 spawn 하고 성공 시 Ring 3 으로 진입함.
+///
+/// `elf` 가 placeholder (4-byte ELF magic) 이거나 손상된 경우 elf::parse 가
+/// 거절하며, 본 함수는 단순히 반환되어 호출자가 다음 ELF 를 시도하거나
+/// 메인 루프로 진입하도록 함.
+///
+/// # Safety
+/// 부팅 단계 16 의 모든 사전 조건이 충족된 상태에서만 호출.
+#[cfg(all(target_arch = "x86_64", debug_assertions))]
+unsafe fn try_spawn_user(elf: &[u8], label: &[u8], kernel_space: &AddressSpace) {
+    // 4-byte placeholder 는 ELF 헤더 64 바이트 미만이므로 parse 가 Truncated 로 거절.
+    // 그러나 길이 컷오프로 빠르게 판별하여 vga 메시지 노이즈를 줄임.
+    if elf.len() < 64 {
+        return;
+    }
+
+    // SAFETY: 부팅 단계 16 의 사전조건. spawn_elf 내부에서 ELF 검증 + 페이지 매핑.
+    match unsafe { process::spawn_elf(kernel_space, elf) } {
+        Ok(pid) => {
+            // SAFETY: VGA 직접 접근은 debug 빌드 한정 단일 코어 부팅 경로
+            unsafe {
+                vga::print(b"[iso-light-k0] spawned ", vga::Color::LightGray);
+                vga::print(label, vga::Color::White);
+                vga::println(b", entering Ring 3...", vga::Color::Green);
+            }
+            // SAFETY: 본 함수에서 spawn 직후 즉시 진입 — 다른 코드 끼지 않음.
+            //         enter_ring3 는 ! 반환.
+            unsafe {
+                process::enter_ring3(pid);
+            }
+        }
+        Err(_) => {
+            // SAFETY: VGA 직접 접근은 debug 빌드 한정 단일 코어 부팅 경로
+            unsafe {
+                vga::print(b"[iso-light-k0] spawn rejected ", vga::Color::DarkGray);
+                vga::println(label, vga::Color::DarkGray);
+            }
+        }
+    }
 }
 
 /// EP_CRYPTO 라운드트립 검증용 스모크 테스트 (debug 전용).
@@ -519,7 +638,7 @@ unsafe fn crypto_smoke_test() {
     // 4. 응답 형식 검증: HashResp · algo 에코 · 32바이트 다이제스트
     let payload = reply.payload_bytes();
     let ok = reply.header.msg_type == MessageType::HashResp
-        && payload.len() >= 56
+        && payload.len() >= ipc::CRYPTO_DATA_OFFSET
         && payload[0] == CryptoAlgo::Blake3 as u8
         && u16::from_le_bytes([payload[4], payload[5]]) as usize == 32;
 

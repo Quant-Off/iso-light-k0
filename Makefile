@@ -87,20 +87,51 @@ QEMU_DEBUG_FLAGS := \
     -D /tmp/qemu-$(KERNEL_NAME).log
 
 #
+# 사용자 ELF (Ring 3 스모크 테스트 / lumen 와이어 호환 검증)
+#
+USER_HELLO_DIR := crates/iso-user-hello
+USER_HELLO_ELF := $(USER_HELLO_DIR)/target/$(TARGET)/release/iso-user-hello
+
+USER_LUMEN_DIR := crates/iso-user-lumen
+USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
+
+#
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user
 
 all: iso
 
 #
-# 커널 빌드
+# 사용자 ELF 빌드 (커널 prerequisite)
 #
-build:
+# 사용자 크레이트는 워크스페이스 외부 (별도 .cargo/config.toml + linker.ld + build-std=core).
+# 본 Makefile 룰에서 별도 cargo invocation 으로 ELF 를 산출함.
+user-hello:
+	cd $(USER_HELLO_DIR) && $(CARGO) build --release
+
+# Phase D 가 추가될 때 활성화. 없으면 무시(`|| true`).
+user-lumen:
+	@if [ -d $(USER_LUMEN_DIR) ]; then \
+		cd $(USER_LUMEN_DIR) && $(CARGO) build --release; \
+	else \
+		echo "[user-lumen] not yet introduced (Phase D), skipping"; \
+	fi
+
+userspace: user-hello user-lumen
+
+#
+# 커널 빌드 (사용자 ELF prerequisite)
+#
+build: userspace
 	$(CARGO) build --target $(TARGET)
 
-build-rel:
+build-rel: userspace
 	$(CARGO) build --target $(TARGET) --release
+
+clean-user:
+	@if [ -d $(USER_HELLO_DIR)/target ]; then $(CARGO) clean --manifest-path $(USER_HELLO_DIR)/Cargo.toml; fi
+	@if [ -d $(USER_LUMEN_DIR)/target ]; then $(CARGO) clean --manifest-path $(USER_LUMEN_DIR)/Cargo.toml; fi
 
 #
 # ISO 생성 공통 함수
@@ -153,7 +184,7 @@ run-dbg: iso
 #
 # 정리
 #
-clean:
+clean: clean-user
 	$(CARGO) clean
 	@rm -rf $(ISO_DIR) $(ISO_DEBUG) $(ISO_REL)
 	@echo "[clean] 완료"

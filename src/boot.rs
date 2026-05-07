@@ -8,15 +8,25 @@
 //! GDT는 플랫 메모리 모델을 제공하며, 실질적인 메모리 보호는 이후
 //! 페이징(4단계 페이지 테이블)이 담당합니다.
 //!
-//! GDT 레이아웃 (40 bytes = 5 x 8):
-//!   [0] 0x00  Null 디스크립터 (8 bytes)
-//!   [1] 0x08  커널 코드 64비트 (8 bytes)  (KERNEL_CS)
-//!   [2] 0x10  커널 데이터       (8 bytes)  (KERNEL_DS)
-//!   [3] 0x18  TSS Low          (8 bytes)  (TSS_SELECTOR, 64비트 시스템 디스크립터 하위)
-//!   [4] 0x20  TSS High         (8 bytes)  (64비트 시스템 디스크립터 상위)
+//! GDT 레이아웃 (56 bytes = 7 x 8) — `syscall`/`sysret` 호환:
+//!   [0] 0x00  Null 디스크립터                                  (8 bytes)
+//!   [1] 0x08  커널 코드 64비트                  (KERNEL_CS)    (8 bytes)
+//!   [2] 0x10  커널 데이터                       (KERNEL_DS)    (8 bytes)
+//!   [3] 0x18  사용자 데이터 (Ring 3, DPL=3)     (USER_DS_BASE) (8 bytes)
+//!   [4] 0x20  사용자 코드 64비트 (Ring 3)       (USER_CS_BASE) (8 bytes)
+//!   [5] 0x28  TSS Low                           (TSS_SELECTOR) (8 bytes)
+//!   [6] 0x30  TSS High                                         (8 bytes)
 //!
 //! 64비트 TSS 시스템 디스크립터는 16바이트(2 GDT 슬롯)를 사용합니다
 //! (Intel SDM Vol.3A Fig 7-4).
+//!
+//! `syscall`/`sysret` 호환을 위한 STAR MSR 레이아웃:
+//!   - STAR[47:32] = 0x08 → SYSCALL: CS = 0x08(KERNEL_CS), SS = 0x10(KERNEL_DS)
+//!   - STAR[63:48] = 0x10 → SYSRET 64-bit: SS = 0x10+8 |3 = 0x1B(USER_DS),
+//!     SYSRET CS    (cont.)                CS = 0x10+16|3 = 0x23(USER_CS)
+//!   - STAR[63:48] 의 숫자값(0x10) 은 KERNEL_DS 셀렉터와 우연히 같지만 의미는
+//!     다름 — STAR base 는 단순한 16-bit 베이스 오프셋이며 셀렉터로 직접
+//!     쓰이지는 않음. (AMD64 APM Vol.2 §6.1.1)
 
 use core::mem::size_of;
 
@@ -28,28 +38,44 @@ use core::mem::size_of;
 pub const KERNEL_CS: u16 = 0x08;
 /// Ring 0 데이터 세그먼트 셀렉터: GDT[2], RPL=0
 pub const KERNEL_DS: u16 = 0x10;
-/// TSS 셀렉터: GDT[3], RPL=0 (64-bit 시스템 디스크립터 하위 8바이트)
-pub const TSS_SELECTOR: u16 = 0x18;
+/// Ring 3 데이터 세그먼트 셀렉터(베이스): GDT[3], RPL=3 → 0x1B
+pub const USER_DS: u16 = 0x18 | 3;
+/// Ring 3 64-bit 코드 세그먼트 셀렉터: GDT[4], RPL=3 → 0x23
+pub const USER_CS: u16 = 0x20 | 3;
+/// TSS 셀렉터: GDT[5], RPL=0 (64-bit 시스템 디스크립터 하위 8바이트)
+pub const TSS_SELECTOR: u16 = 0x28;
+
+/// `STAR[47:32]` 에 적재할 SYSCALL 베이스 셀렉터 = `KERNEL_CS`
+pub const SYSCALL_CS_BASE: u16 = KERNEL_CS;
+/// `STAR[63:48]` 에 적재할 SYSRET 베이스 (KERNEL_DS 와 같은 숫자값이지만
+/// CPU 가 이 값에 직접 8/16 을 더해 USER_DS / USER_CS 를 산출함)
+pub const SYSRET_CS_BASE: u16 = KERNEL_DS;
 
 //
 // 정적 커널 GDT (가변, TSS 디스크립터 런타임 패칭 필요)
 //
 
-/// 커널 GDT (5 × 8 bytes = 40 bytes).
+/// 커널 GDT (7 × 8 bytes = 56 bytes).
 ///
-/// GDT[3..4]는 TSS 디스크립터(16바이트)를 위해 예약된 두 슬롯으로,
+/// GDT[5..6]는 TSS 디스크립터(16바이트)를 위해 예약된 두 슬롯으로,
 /// `init_gdt()`에서 런타임에 TSS 주소/크기로 채워짐.
 /// TSS 주소는 컴파일 타임 상수가 아니므로 `static mut`으로 선언함.
 ///
+/// 사용자 세그먼트(GDT[3..4])는 컴파일 타임에 결정되므로 정적 초기화로 충분.
+/// 64-bit 모드에서 CS 의 base/limit 는 무시되고 L(롱모드) 와 DPL/Type 만 의미를
+/// 가짐. DS 도 `mov ds, ax` 시 P/DPL/Type 만 점검됨.
+///
 /// # Safety
-/// `init_gdt()` 호출 전까지 GDT[3..4]는 0(Null)이므로 LTR 이전에 유효함.
+/// `init_gdt()` 호출 전까지 GDT[5..6]는 0(Null)이므로 LTR 이전에 유효함.
 // SAFETY: 부팅 초기 단일 코어, init_gdt()에서 한 번만 초기화됨
-static mut KERNEL_GDT: [u64; 5] = [
+static mut KERNEL_GDT: [u64; 7] = [
     0,                     // [0] Null 디스크립터
     0x00AF_9A00_0000_FFFF, // [1] 커널 코드 64비트 (P=1, DPL=0, L=1, Type=Execute/Read)
     0x00CF_9200_0000_FFFF, // [2] 커널 데이터      (P=1, DPL=0, G=1, D/B=1, Type=Read/Write)
-    0,                     // [3] TSS Low  (런타임 패칭)
-    0,                     // [4] TSS High (런타임 패칭)
+    0x00CF_F200_0000_FFFF, // [3] 사용자 데이터    (P=1, DPL=3, G=1, D/B=1, Type=Read/Write)
+    0x00AF_FA00_0000_FFFF, // [4] 사용자 코드 64비트(P=1, DPL=3, L=1, Type=Execute/Read)
+    0,                     // [5] TSS Low  (런타임 패칭)
+    0,                     // [6] TSS High (런타임 패칭)
 ];
 
 //
@@ -128,13 +154,13 @@ const fn tss_desc_high(base: u64) -> u64 {
 pub unsafe fn init_gdt(tss_base: u64, tss_limit: u16) {
     // SAFETY: 단일 코어 부팅 초기, CLI 상태
     unsafe {
-        // 1. TSS 디스크립터 패칭
-        KERNEL_GDT[3] = tss_desc_low(tss_base, tss_limit);
-        KERNEL_GDT[4] = tss_desc_high(tss_base);
+        // 1. TSS 디스크립터 패칭 (GDT[5..6])
+        KERNEL_GDT[5] = tss_desc_low(tss_base, tss_limit);
+        KERNEL_GDT[6] = tss_desc_high(tss_base);
 
         // 2. LGDT + 세그먼트 재로드
         let ptr = GdtPointer {
-            limit: (size_of::<[u64; 5]>() - 1) as u16,
+            limit: (size_of::<[u64; 7]>() - 1) as u16,
             // &raw은 static mut에서 공유 참조 없이 원시 포인터를 생성함
             base: (&raw const KERNEL_GDT) as *const u64 as u64,
         };

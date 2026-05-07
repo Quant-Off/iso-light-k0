@@ -2,6 +2,7 @@
 name = "iso-light-k0"
 version = "1.0.0"
 edition = "2024"
+build = "build.rs"
 
 # 빌드-타임 보안 게이트
 # `tls-external`: 외부망 통신용 TLS 프로필 활성화. 기본 OFF(공격면 0)

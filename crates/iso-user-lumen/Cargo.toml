@@ -1,0 +1,39 @@
+[package]
+name = "iso-user-lumen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Q. T. Felix NOTE: lumen 프로젝트의 elib-k0-nt 와이어 호환성을 Ring 3 사용자
+#                   공간에서 검증하는 전용 사용자 프로그램입니다. lumen 자체에는
+#                   의존하지 않으며, lumen 의 lumen-channel / lumen-core /
+#                   lumen-capability 가 사용하는 것과 *동일한* elib-k0-nt 모듈
+#                   을 직접 호출하여 동일 입력 → 동일 비트 출력을 실증합니다.
+#                   (lumen 의 KERNEL-COMPAT.md §3 와이어 호환 표 참고.)
+
+[[bin]]
+name = "iso-user-lumen"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false
+
+[dependencies]
+zeroize       = { path = "../../../elib-k0-nt/zeroize", version = "1.0.0" }
+constant-time = { path = "../../../elib-k0-nt/constant-time", version = "1.0.0" }
+blake         = { path = "../../../elib-k0-nt/blake", version = "1.0.0" }
+ed25519       = { path = "../../../elib-k0-nt/ed25519", version = "1.0.0" }
+x25519        = { path = "../../../elib-k0-nt/x25519", version = "1.0.0" }
+aes           = { path = "../../../elib-k0-nt/aes", version = "1.0.0" }
+sha2          = { path = "../../../elib-k0-nt/sha2", version = "1.0.0" }
+sha3          = { path = "../../../elib-k0-nt/sha3", version = "1.0.0" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+codegen-units = 1
+strip = "symbols"

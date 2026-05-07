@@ -201,6 +201,42 @@ pub unsafe fn print_hex(val: u64, fg: Color) {
     }
 }
 
+//
+// release 빌드 stub
+//
+// EAL4+ 보안 요구사항(§ 모듈 docstring) 에 따라 release 에서 모든 출력은
+// 컴파일 단계에서 제거되어야 함. 호출 측이 매번 `#[cfg(debug_assertions)]`
+// 로 감싸지 않아도 되도록, release 빌드 동안 동일 시그니처의 빈 함수로
+// 대체함. (호출은 그대로 살아있지만 본체가 비어 정보 유출 표면이 0.)
+//
+#[cfg(not(debug_assertions))]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn clear() {}
+
+#[cfg(not(debug_assertions))]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn print(_s: &[u8], _fg: Color) {}
+
+#[cfg(not(debug_assertions))]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn println(_s: &[u8], _fg: Color) {}
+
+#[cfg(not(debug_assertions))]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn print_hex(_val: u64, _fg: Color) {}
+
+#[cfg(not(debug_assertions))]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn print_exception(
+    _name: &[u8],
+    _error_code: Option<u64>,
+    _rip: u64,
+    _cs: u64,
+    _rflags: u64,
+    _rsp: u64,
+) {
+}
+
 /// CPU 예외 발생 시 VGA에 진단 화면을 출력함 (디버그 빌드 전용).
 ///
 /// 출력 정보: 예외 이름, 오류 코드, RIP, CS, RSP, RFLAGS

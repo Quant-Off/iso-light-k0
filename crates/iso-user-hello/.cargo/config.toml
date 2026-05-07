@@ -1,0 +1,20 @@
+[build]
+target = "x86_64-unknown-none"
+
+[unstable]
+# 사용자 ELF 의 코드 모델을 통제하려면 core 를 직접 컴파일해야 함.
+# 사전 빌드된 sysroot 의 core 와는 코드 모델이 충돌하므로 build-std 사용.
+build-std = ["core"]
+
+# Q. T. Felix NOTE: 자체 사용자 링커 스크립트(linker.ld)로 사용자 영역
+#                   (DEFAULT_USER_ENTRY = 0x400000) 에 정적 ELF 를 배치합니다.
+[target.x86_64-unknown-none]
+# `cargo build` 가 본 크레이트 디렉토리에서 호출된다고 가정하고
+# `linker.ld` 를 상대 경로로 참조함.
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+    "-C", "link-arg=-nostdlib",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+    "-C", "relocation-model=static",
+]
