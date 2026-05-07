@@ -1,0 +1,66 @@
+# iso-light-k0 Docker Compose — Ubuntu 24.04 QEMU 테스트 환경
+#
+# 서비스:
+#   build   - 커널 ELF 빌드 (debug)
+#   iso     - ISO 이미지 생성 (debug)
+#   test    - ISO 빌드 후 QEMU 부팅 + 암호 스모크 검증
+#
+# 사용 예:
+#   docker compose run --rm build       # ELF 빌드
+#   docker compose run --rm iso         # ISO 생성
+#   docker compose run --rm test        # 전체 빌드 + QEMU 테스트
+#   docker compose run --rm test bash   # 컨테이너 쉘 진입
+#
+# 마운트 레이아웃 (호스트 → 컨테이너):
+#   ./                       → /workspace/iso-light-k0      (소스 + ISO 출력)
+#   ../elib-k0-nt/           → /workspace/elib-k0-nt        (path-dep 크레이트)
+#   named volume iso-target  → /workspace/iso-light-k0/target
+#   named volume elib-target → /workspace/elib-k0-nt/target
+#
+# Cargo.toml 의 `path = "../elib-k0-nt/..."` 가 컨테이너 내부에서도 그대로
+# 해석되도록 두 프로젝트를 같은 부모(/workspace) 아래에 배치함.
+# target/ 은 호스트(macOS)와의 cross-target 충돌을 막기 위해 named volume 사용.
+
+x-kernel-build: &kernel-build
+  build:
+    context: .
+    dockerfile: Dockerfile
+  volumes:
+    - .:/workspace/iso-light-k0
+    - ../elib-k0-nt:/workspace/elib-k0-nt:ro
+    - cargo-registry:/usr/local/cargo/registry
+    - cargo-git:/usr/local/cargo/git
+    - iso-target:/workspace/iso-light-k0/target
+    - elib-target:/workspace/elib-k0-nt/target
+  working_dir: /workspace/iso-light-k0
+
+services:
+
+  # ── 커널 ELF 빌드 ─────────────────────────────────────────────────────────
+  build:
+    <<: *kernel-build
+    command: make build
+
+  # ── ISO 이미지 생성 ────────────────────────────────────────────────────────
+  iso:
+    <<: *kernel-build
+    command: make iso
+
+  # ── QEMU 부팅 + 암호 스모크 테스트 ───────────────────────────────────────
+  # ISO 빌드 후 qemu-system-x86_64로 커널을 부팅하여 serial 출력 + VGA
+  # 프레임버퍼 덤프(crypto smoke 결과 확인)를 검증함.
+  # KVM이 없는 환경(macOS 포함)에서는 TCG 소프트웨어 에뮬레이션으로 실행됨.
+  test:
+    <<: *kernel-build
+    command: /bin/bash /workspace/iso-light-k0/scripts/qemu-test.sh
+    # KVM 가속이 필요한 경우 아래 주석 해제 (Linux 호스트 전용)
+    # privileged: true
+    # devices:
+    #   - /dev/kvm:/dev/kvm
+
+# ── 캐시 / 산출물 볼륨 ───────────────────────────────────────────────────────
+volumes:
+  cargo-registry:
+  cargo-git:
+  iso-target:
+  elib-target:
