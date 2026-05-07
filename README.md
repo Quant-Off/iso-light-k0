@@ -8,11 +8,11 @@
 > [!TIP]
 > 자세한 기능 및 아키텍처 설명은 [INTRODUCTION.md](INTRODUCTION.md)를 참고하세요.
 
-## Prerequisites
+## 요구 사항
 
 Rust nightly와 `x86_64-unknown-none` 타겟, `grub-mkrescue`, `qemu-system-x86_64`이 필요합니다. 컨테이너로 빌드하는 경우 Docker만으로 충분합니다.
 
-## Build
+## 빌드
 
 로컬 환경에서는 `make`을 사용합니다.
 
@@ -34,6 +34,6 @@ docker compose run --rm iso   # 컨테이너에서 ISO 생성
 docker compose run --rm test  # 컨테이너에서 QEMU 테스트
 ```
 
-## License
+## 라이선스
 
 이 프로젝트는 [MIT LICENSE](LICENSE)하에 있습니다.
