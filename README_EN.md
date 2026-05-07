@@ -1,7 +1,7 @@
 # iso-light-k0
 
 [![Language](https://img.shields.io/badge/README-Korean_Ver-blue?style=for-the-badge)](README.md)
-[![Qu4nt-Space-Discord](https://img.shields.io/badge/Qu4nt_Space-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://github.com/Quant-Off/)
+[![Qu4nt-Space-Discord](https://img.shields.io/badge/Qu4nt_Space-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/9utg4hp3m8)
 
 An **ultra-lightweight security microkernel** targeting diverse architectures and bare-metal environments. Guarantees memory safety in Rust `no_std`, and enforces the principle of least privilege through **Capability-based Access Control** and **synchronous IPC**.
 

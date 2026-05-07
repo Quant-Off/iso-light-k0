@@ -1,7 +1,7 @@
 # Introduction
 
 [![Language](https://img.shields.io/badge/INTRODUCTION-Korean_Ver-blue?style=for-the-badge)](INTRODUCTION.md)
-[![Qu4nt-Space-Discord](https://img.shields.io/badge/Qu4nt_Space-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://github.com/Quant-Off/)
+[![Qu4nt-Space-Discord](https://img.shields.io/badge/Qu4nt_Space-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/9utg4hp3m8)
 
 `iso-light-k0` is an **ultra-lightweight security microkernel** targeting diverse architectures and bare-metal environments. It guarantees memory safety in Rust `no_std` and enforces the principle of least privilege through **Capability-based Access Control** and **synchronous IPC**. Cryptographic primitives leverage crates from [`elib-k0-nt`](https://github.com/Quant-Off/elib-k0-nt).
 
