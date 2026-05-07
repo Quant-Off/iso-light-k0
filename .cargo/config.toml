@@ -1,0 +1,15 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# 링커 스크립트: 섹션 배치 순서 및 물리 로드 주소(0x100000) 지정
+# ENTRY(_start)가 링커 스크립트에 선언되어 있으므로 -e_start는 불필요하나 명시 유지
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+    "-C", "link-arg=-e_start",
+    "-C", "link-arg=-no-pie",
+    # x86_64 kernel code model: 모든 커널 심볼 VMA를 상위 2 GiB
+    # (0xFFFFFFFF80000000 ~ 0xFFFFFFFFFFFFFFFF)에 배치
+    # R_X86_64_32S 릴로케이션으로 부호 확장 32비트 절대 주소 참조 가능
+    "-C", "code-model=kernel",
+]
