@@ -4,3 +4,4 @@ dist/
 *.iso
 Cargo.lock
 isodir/boot/kernel.bin
+AIR-GAP.md
