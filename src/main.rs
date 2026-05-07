@@ -2,10 +2,10 @@
 #![no_main]
 // x86-interrupt 호출 규약: extern "x86-interrupt" 핸들러 작성에 필요
 #![feature(abi_x86_interrupt)]
-// `static mut` 접근은 Rust 2024 의 `static_mut_refs` lint 를 회피하기 위해
-// `*(&raw const|mut X)` 패턴을 사용함. clippy 의 `deref_addrof` 는 이 패턴을
+// `static mut` 접근은 Rust 2024 의 `static_mut_refs`lint를 회피하기 위해
+// `*(&raw const|mut X)` 패턴을 사용함. clippy의 `deref_addrof`는 이 패턴을
 // `X` 직접 접근과 동치로 보고 경고하지만, 직접 접근은 다시 `static_mut_refs`
-// 를 유발하므로 커널 전역에서 본 lint 를 명시적으로 허용함
+// 를 유발하므로 커널 전역에서 본 lint를 명시적으로 허용함
 #![allow(clippy::deref_addrof)]
 
 pub mod allocator;
