@@ -1,0 +1,48 @@
+[package]
+name = "iso-light-k0"
+version = "1.0.0"
+edition = "2024"
+
+# 빌드-타임 보안 게이트
+# `tls-external`: 외부망 통신용 TLS 프로필 활성화. 기본 OFF(공격면 0)
+# 활성화해도 런타임 별도 Capability가 추가로 필요한 이중 게이팅 구조
+# 폐쇄망 전용(`closed` 프로필)은 본 feature 없이도 항상 사용 가능
+[features]
+default = []
+tls-external = []
+
+# `cargo clippy --all-targets`가 bare-metal(no_std) 커널 바이너리에 대해
+# test/bench/doctest harness를 합성하면 `extern crate test;`를 주입하여
+# `x86_64-unknown-none` 타깃에서 E0463(test 크레이트 없음)으로 실패함
+# 이 커널은 호스트 측 단위 테스트 대상이 아니므로 모든 보조 타깃을 비활성화함
+[[bin]]
+name = "iso-light-k0"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false
+
+# 커널 패닉 시 스택 와인딩을 방지하고 즉각 중단
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true      # Link Time Optimization을 통한 바이너리 최소화
+opt-level = "z" # 크기 최적화
+
+[dependencies]
+zeroize = { path = "../elib-k0-nt/zeroize", version = "1.0.0" }
+mlkem = { path = "../elib-k0-nt/mlkem", version = "1.0.0" }
+mldsa = { path = "../elib-k0-nt/mldsa", version = "1.0.0" }
+chacha20 = { path = "../elib-k0-nt/chacha20", version = "1.0.0" }
+aes = { path = "../elib-k0-nt/aes", version = "1.0.0" }
+ed25519 = { path = "../elib-k0-nt/ed25519", version = "1.0.0" }
+ed448 = { path = "../elib-k0-nt/ed448", version = "1.0.0" }
+x25519 = { path = "../elib-k0-nt/x25519", version = "1.0.0" }
+x448 = { path = "../elib-k0-nt/x448", version = "1.0.0" }
+sha2 = { path = "../elib-k0-nt/sha2", version = "1.0.0" }
+sha3 = { path = "../elib-k0-nt/sha3", version = "1.0.0" }
+blake = { path = "../elib-k0-nt/blake", version = "1.0.0" }
+constant-time = { path = "../elib-k0-nt/constant-time", version = "1.0.0" }
+rng = { path = "../elib-k0-nt/rng", version = "1.0.0" }
