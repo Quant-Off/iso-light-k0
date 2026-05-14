@@ -1,7 +1,7 @@
 use constant_time::{Choice, CtEqOps};
 use zeroize::Zeroize;
 
-use crate::bus::{BusInstance, BusKind};
+use crate::bus::{BusDriver, BusInstance, BusKind, MAX_BUS_INIT_BLOB};
 use crate::capability::{self, CapError};
 use crate::syscall::{SyscallContext, SyscallError, is_user_address};
 
@@ -85,6 +85,8 @@ pub enum HsmCapError {
     NotAttached,
     Busy,
     TokenGen,
+    // Phase 2: bus.open(init_blob) 실패 (D-16 all-or-nothing).
+    BadInit,
 }
 
 //
@@ -238,7 +240,7 @@ impl HsmRegistry {
 
     // SAFETY contract (D-09, D-12): BSP single-core; CAP_DRBG must be initialized
     // via capability::init_prng() before this is entered.
-    pub unsafe fn attach(&mut self, rights: HsmRights) -> Result<HsmCapability, HsmCapError> {
+    pub unsafe fn attach(&mut self, bus_kind: BusKind, init_blob: &[u8], rights: HsmRights) -> Result<HsmCapability, HsmCapError> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if matches!(slot.state, HsmSlotState::Empty) {
                 // SAFETY: BSP single-core; capability::init_prng() completed in boot order
@@ -251,7 +253,15 @@ impl HsmRegistry {
                         _ => HsmCapError::TokenGen,
                     })?
                 };
-                // 상태 전이는 마지막: token / rights 가 모두 기록된 뒤에야 Attached 노출
+                // D-16: 슬롯 mutation 전에 stack-local bus 생성 → bus.open() 실패 시 슬롯 변경 0 (all-or-nothing).
+                let mut bus = BusInstance::new(bus_kind);
+                // Pitfall 7: BusError 의 모든 variant 를 HsmCapError::BadInit 으로 collapse.
+                match bus.open(init_blob) {
+                    Ok(()) => {}
+                    Err(_) => return Err(HsmCapError::BadInit),
+                }
+                // D-16 commit: bus → token → rights → state 순 (Phase 1 B-4 ordering 일관).
+                slot.bus = bus;
                 slot.token = token;
                 slot.rights = rights;
                 slot.state = HsmSlotState::Attached;
@@ -410,9 +420,9 @@ impl HsmRegistry {
 // Plan 05 boot smoke 진입점 (Ring 3 ABI 우회). D-16: Phase 1 attach 는 비인증.
 //
 // SAFETY: BSP 단일 코어 + capability::init_prng() 완료 가정.
-pub unsafe fn attach_kernel_side(rights: HsmRights) -> Result<HsmCapability, HsmCapError> {
+pub unsafe fn attach_kernel_side(bus_kind: BusKind, init_blob: &[u8], rights: HsmRights) -> Result<HsmCapability, HsmCapError> {
     // SAFETY: BSP single-core; with_registry_mut 의 invariant 위임
-    unsafe { with_registry_mut(|r| r.attach(rights)) }
+    unsafe { with_registry_mut(|r| r.attach(bus_kind, init_blob, rights)) }
 }
 
 //
@@ -434,8 +444,9 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
     }
 
     // (3) D-16: cap 검사 없이 직접 attach (Phase 5 에서 attestation 게이트가 본 호출 자체를 감쌈)
+    // Task 5 가 본 호출 전체를 D-15 ABI 로 재작성 — 본 패치는 Task 3 build-green 유지용 임시.
     // SAFETY: BSP single-core + capability::init_prng() 완료 가정
-    let cap = match unsafe { with_registry_mut(|r| r.attach(HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE)) } {
+    let cap = match unsafe { with_registry_mut(|r| r.attach(BusKind::Software, &[], HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE)) } {
         Ok(c) => c,
         Err(HsmCapError::Full) => return SyscallError::BadArg.as_rax(),
         Err(_) => return SyscallError::Internal.as_rax(),

@@ -880,6 +880,7 @@ unsafe fn tls_smoke_test() {
 
 #[cfg(all(target_arch = "x86_64", debug_assertions))]
 unsafe fn hsm_registry_smoke_test() {
+    use crate::bus::BusKind;
     use hsm_registry::{
         HSM_MAX_SLOTS, HsmCapability, HsmRights, HsmSlotIdx, HsmSlotInfo, attach_kernel_side,
         with_registry, with_registry_mut,
@@ -902,7 +903,7 @@ unsafe fn hsm_registry_smoke_test() {
     // Step 2: attach -> capability 발급 (실제 Hash-DRBG-SHA256 토큰)
     // SAFETY: capability::init_prng() 완료, BSP 단일 코어
     let cap = match unsafe {
-        attach_kernel_side(HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE)
+        attach_kernel_side(BusKind::Software, &[], HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE)
     } {
         Ok(c) => c,
         Err(_) => {
