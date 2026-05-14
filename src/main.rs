@@ -18,6 +18,7 @@ pub mod sign_service;   // EP_SIGN 엔드포인트 ML-DSA PQ 서명 서비스
 pub mod elf; // ELF64 정적 실행 파일 파서
 pub mod hsm; // HSM 추상 트레이트 + NullHsm
 pub mod hsm_registry; // Phase 1: HSM 멀티 슬롯 레지스트리 (capability-backed)
+pub mod bus; // Phase 2: 외부 버스 드라이버 추상화 (BusDriver trait + enum-dispatch)
 pub mod idt;
 pub mod ipc; // IPC 메시지 패싱 (동기 rendezvous)
 pub mod keystore; // 소프트 PSK 키 저장소 (HSM 폴백)
