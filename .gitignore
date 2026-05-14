@@ -5,3 +5,6 @@ dist/
 Cargo.lock
 isodir/boot/kernel.bin
 AIR-GAP.md
+
+# GSD planning artifacts (commit_docs: false)
+.planning/
