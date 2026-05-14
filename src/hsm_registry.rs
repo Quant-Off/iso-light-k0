@@ -1,6 +1,7 @@
 use constant_time::{Choice, CtEqOps};
 use zeroize::Zeroize;
 
+use crate::bus::{BusInstance, BusKind};
 use crate::capability::{self, CapError};
 use crate::syscall::{SyscallContext, SyscallError, is_user_address};
 
@@ -165,6 +166,7 @@ pub struct HsmSlot {
     pub state: HsmSlotState,
     pub token: u64,
     pub rights: HsmRights,
+    pub bus: BusInstance,
 }
 
 impl HsmSlot {
@@ -173,6 +175,7 @@ impl HsmSlot {
             state: HsmSlotState::Empty,
             token: 0,
             rights: HsmRights::NONE,
+            bus: BusInstance::new_empty(),
         }
     }
 }
@@ -181,6 +184,8 @@ impl Zeroize for HsmSlot {
     fn zeroize(&mut self) {
         // 비밀(토큰) 먼저 소거 — 관찰자가 Detaching 상태에서 본문을 읽어도 키 자료는 이미 0
         self.token.zeroize();
+        // Phase 2 cascade: BusInstance 의 활성 variant payload 를 비우고 Empty 로 reset (D-11).
+        self.bus.zeroize();
         self.rights = HsmRights::NONE;
         // 상태 전이는 가장 마지막 (PATTERNS B-4)
         self.state = HsmSlotState::Empty;
