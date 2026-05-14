@@ -191,12 +191,6 @@ impl Ring3ProcessBus {
     }
 }
 
-// Plan-01 임시 stub — Plan 02 가 ipc::endpoint_exists(id) 로 교체.
-#[inline]
-fn endpoint_exists_stub(id: EndpointId) -> bool {
-    id != EndpointId::INVALID
-}
-
 impl BusDriver for Ring3ProcessBus {
     fn open(&mut self, init: &[u8]) -> Result<(), BusError> {
         if self.open_state {
@@ -222,7 +216,7 @@ impl BusDriver for Ring3ProcessBus {
             return Err(BusError::BadInit);
         }
         // (5) endpoint 존재성만 검증 (caller 권한 게이트는 Phase 5 — Pitfall B + A3)
-        if !endpoint_exists_stub(endpoint) {
+        if !crate::ipc::endpoint_exists(endpoint) {
             return Err(BusError::BadInit);
         }
         // (6) commit

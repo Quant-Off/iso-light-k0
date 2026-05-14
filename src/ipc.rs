@@ -555,6 +555,19 @@ impl IpcRegistry {
 // SAFETY: 부팅 초기 단일 코어 접근만 허용 (SMP 이후 spinlock 필요)
 static mut IPC_REGISTRY: IpcRegistry = IpcRegistry::empty();
 
+// Phase 2 신규 — Ring3ProcessBus::open 의 endpoint 존재성 검증 진입점 (RESEARCH §3 / Pitfall B).
+pub fn endpoint_exists(id: EndpointId) -> bool {
+    if id == EndpointId::INVALID {
+        return false;
+    }
+    // SAFETY: BSP single-core read-only access; IPC_REGISTRY is initialized by
+    // ipc::init() in boot order before any user-space attach reaches this path.
+    let reg = unsafe { &*(&raw const IPC_REGISTRY) };
+    reg.endpoints
+        .iter()
+        .any(|slot| slot.as_ref().map_or(false, |ep| ep.id == id))
+}
+
 //
 // 공개 IPC API
 //
