@@ -109,6 +109,16 @@ impl HsmCapability {
         }
     }
 
+    #[cfg(debug_assertions)]
+    pub const fn with_forged_token(token: u64, slot: HsmSlotIdx, rights: HsmRights) -> Self {
+        Self {
+            token,
+            slot,
+            rights,
+            _pad: 0,
+        }
+    }
+
     // CT: token-nonzero & slot-eq & rights-subset, single-branch exit (CAP-03, SC-4b)
     #[inline]
     pub fn is_valid_for(&self, slot: HsmSlotIdx, required: HsmRights) -> bool {

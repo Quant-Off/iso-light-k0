@@ -510,6 +510,17 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     }
 
     //
+    // 14.7. 부트 시점 HsmRegistry 라운드트립 스모크 테스트 (Phase 1)
+    //
+    // 디버그 빌드에서만 수행. attach -> is_valid_for -> detach -> zeroize 사이클을
+    // in-kernel 경로로 검증하고 qemu-test.sh 가 기대하는 마일스톤 문자열을 출력.
+    #[cfg(all(target_arch = "x86_64", debug_assertions))]
+    // SAFETY: capability::init_prng / ipc::init / HsmRegistry static 모두 온라인. 단일 코어.
+    unsafe {
+        hsm_registry_smoke_test();
+    }
+
+    //
     // 15. 인터럽트 활성화 + 커널 메인 이벤트 루프
     //
     // IDT, GDT, TSS, PIC 초기화 완료 후 STI로 인터럽트 수신 시작
@@ -861,6 +872,163 @@ unsafe fn tls_smoke_test() {
         crate::tls::wipe_all();
         vga::println(
             b"[iso-light-k0] tls smoke: keystore + pool wiped",
+            vga::Color::Green,
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", debug_assertions))]
+unsafe fn hsm_registry_smoke_test() {
+    use hsm_registry::{
+        HSM_MAX_SLOTS, HsmCapability, HsmRights, HsmSlotIdx, HsmSlotInfo, attach_kernel_side,
+        with_registry, with_registry_mut,
+    };
+
+    // Step 1: 초기 상태 확인 — attached_count == 0
+    // SAFETY: BSP 단일 코어 부팅 시퀀스 + REGISTRY 정적 인스턴스 온라인
+    let initial_count = unsafe { with_registry(|r| r.attached_count()) };
+    if initial_count != 0 {
+        // SAFETY: identity-mapped VGA 버퍼(0xB8000), CLI 상태
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (initial count != 0)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 2: attach -> capability 발급 (실제 Hash-DRBG-SHA256 토큰)
+    // SAFETY: capability::init_prng() 완료, BSP 단일 코어
+    let cap = match unsafe {
+        attach_kernel_side(HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE)
+    } {
+        Ok(c) => c,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (attach error)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+
+    // Step 3: is_valid_for 양성/음성 (CT 단일 분기)
+    if !cap.is_valid_for(cap.slot, HsmRights::USE) {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (valid cap rejected)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+    let wrong_slot = HsmSlotIdx(if cap.slot.0 == 0 { 1 } else { 0 });
+    if cap.is_valid_for(wrong_slot, HsmRights::USE) {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (wrong-slot accepted)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 4: enumerate (cap 보유) — 정확히 1개 슬롯 노출
+    let mut info_buf: [HsmSlotInfo; HSM_MAX_SLOTS] = [HsmSlotInfo::empty(); HSM_MAX_SLOTS];
+    // SAFETY: BSP 단일 코어 + REGISTRY 정적 인스턴스 온라인
+    let written = unsafe { with_registry(|r| r.enumerate(&mut info_buf)) };
+    if written != 1 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (enumerate count != 1)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 5: detach 거부 경로 정직 검증 (post-attach CAP-02 정신)
+    //   - 위조된 cap (token=0xDEAD_BEEF_DEAD_BEEF, 동일 slot) 으로 detach 호출 -> 실패 기대
+    //   - 슬롯 상태는 Attached 유지 (변경 없음)
+    let forged = HsmCapability::with_forged_token(0xDEAD_BEEF_DEAD_BEEF, cap.slot, HsmRights::REVOKE);
+    // SAFETY: BSP 단일 코어; detach 진입 가능 시점
+    let forged_result = unsafe { with_registry_mut(|r| r.detach(&forged)) };
+    if forged_result.is_ok() {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (forged cap accepted by detach)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+    // SAFETY: BSP 단일 코어; with_registry 의 invariant 동일
+    let still_attached = unsafe { with_registry(|r| !r.slot_is_empty(cap.slot)) };
+    if !still_attached {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (slot changed despite forged-cap rejection)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+    // SAFETY: identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] HSM_DETACH_NO_CAP_DENIED marker (forged cap rejected, slot unchanged)",
+            vga::Color::Green,
+        );
+    }
+
+    // Step 6: 합법 cap 으로 detach -> 슬롯 Empty 복귀 + zeroize 트리거
+    // SAFETY: BSP 단일 코어
+    let detach_result = unsafe { with_registry_mut(|r| r.detach(&cap)) };
+    if detach_result.is_err() {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (legitimate detach error)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 7: 슬롯 Empty + attached_count == 0 검증 (zeroize 효과 가시화)
+    // SAFETY: BSP 단일 코어
+    let is_empty = unsafe { with_registry(|r| r.slot_is_empty(cap.slot)) };
+    // SAFETY: BSP 단일 코어
+    let post_count = unsafe { with_registry(|r| r.attached_count()) };
+    if !is_empty || post_count != 0 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (slot not zeroized post-detach)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // 성공 마일스톤
+    // SAFETY: identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] HSM_ATTACH_DETACH_ROUNDTRIP_OK marker",
+            vga::Color::Green,
+        );
+        vga::println(
+            b"[iso-light-k0] HsmRegistry smoke: attach -> verify -> detach -> zeroize OK",
             vga::Color::Green,
         );
     }
