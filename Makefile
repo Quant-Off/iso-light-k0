@@ -98,7 +98,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero qemu-smoke ci-phase1
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2
 
 all: iso
 
@@ -203,3 +203,18 @@ qemu-smoke: iso
 ci-phase1: check-alloc-zero qemu-smoke
 	@cd /Library/Quant/Repository/projects/elib-k0-nt && $(CARGO) test -p constant-time --tests
 	@echo "[CI] Phase 1 ci 게이트 전체 통과"
+
+#
+# Phase 2 CI 게이트 (BUS-01..BUS-04 + 부팅 smoke)
+#
+# 3-leg 구조 (ci-phase1 의 패턴을 그대로 답습):
+#   1) check-alloc-zero  — 바이너리 alloc 심볼 0 (재검증; Phase 1 게이트)
+#   2) check-alloc-bus   — src/bus.rs 소스 alloc 의존 0 (BUS-01)
+#   3) qemu-smoke        — QEMU 부팅 + Phase 1 마커 + BUS_PHASE2_OK 마커 (BUS-03)
+#
+check-alloc-bus: build
+	@bash scripts/check-no-alloc-bus.sh
+	@echo "[CI] BUS-01 alloc-zero 게이트 통과"
+
+ci-phase2: check-alloc-zero check-alloc-bus qemu-smoke
+	@echo "[CI] Phase 2 ci 게이트 전체 통과 (BUS-01..BUS-04 + smoke)"

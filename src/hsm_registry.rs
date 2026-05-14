@@ -238,6 +238,17 @@ impl HsmRegistry {
         matches!(self.slots[raw].state, HsmSlotState::Empty)
     }
 
+    // Phase 2 boot smoke 전용 슬롯 bus 접근자 (T-02-03 observability + 루프백 echo 진입점).
+    // 일반 syscall 경로는 attach/detach 만 사용 — 본 메서드는 in-kernel 스모크 전용이며
+    // 릴리스 빌드에서는 컴파일에서 제거됨.
+    #[cfg(debug_assertions)]
+    pub fn slot_bus_mut(&mut self, idx: usize) -> Option<&mut BusInstance> {
+        if idx >= HSM_MAX_SLOTS {
+            return None;
+        }
+        Some(&mut self.slots[idx].bus)
+    }
+
     // SAFETY contract (D-09, D-12): BSP single-core; CAP_DRBG must be initialized
     // via capability::init_prng() before this is entered.
     pub unsafe fn attach(&mut self, bus_kind: BusKind, init_blob: &[u8], rights: HsmRights) -> Result<HsmCapability, HsmCapError> {

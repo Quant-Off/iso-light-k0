@@ -522,6 +522,17 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     }
 
     //
+    // 14.8. 부트 시점 Phase 2 BusDriver 라운드트립 스모크 테스트
+    //
+    // SoftwareBus 루프백 echo (write -> read) + ct_eq 일치 + detach 후 raw bytes==0 (T-02-03).
+    // 성공 시 qemu-test.sh 의 BUS_PHASE2_OK 마커 게이트를 통과시킴 (additive — Phase 1 마커 보존).
+    #[cfg(all(target_arch = "x86_64", debug_assertions))]
+    // SAFETY: Phase 1 smoke 완료 직후 — REGISTRY 비어 있고 BSP 단일 코어 동일.
+    unsafe {
+        bus_phase2_smoke_test();
+    }
+
+    //
     // 15. 인터럽트 활성화 + 커널 메인 이벤트 루프
     //
     // IDT, GDT, TSS, PIC 초기화 완료 후 STI로 인터럽트 수신 시작
@@ -1031,6 +1042,190 @@ unsafe fn hsm_registry_smoke_test() {
         );
         vga::println(
             b"[iso-light-k0] HsmRegistry smoke: attach -> verify -> detach -> zeroize OK",
+            vga::Color::Green,
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", debug_assertions))]
+unsafe fn bus_phase2_smoke_test() {
+    use crate::bus::{BusDriver, BusInstance, BusKind};
+    use hsm_registry::{HsmRights, attach_kernel_side, with_registry, with_registry_mut};
+
+    // Step 1+2: SoftHSM bus_kind 로 attach -> capability 발급
+    // SAFETY: capability::init_prng() 완료, BSP 단일 코어
+    let cap = match unsafe {
+        attach_kernel_side(
+            BusKind::Software,
+            &[],
+            HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE,
+        )
+    } {
+        Ok(c) => c,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (attach error)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let slot_idx = cap.slot.0 as usize;
+
+    // 테스트 페이로드 (16 bytes). 스택-로컬, alloc 없음.
+    let pattern: [u8; 16] = [
+        0xA5, 0x5A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+    ];
+
+    // Step 3: SoftwareBus 에 write
+    // SAFETY: BSP 단일 코어; with_registry_mut 의 invariant 동일
+    let write_result: Result<usize, crate::bus::BusError> = unsafe {
+        with_registry_mut(|r| match r.slot_bus_mut(slot_idx) {
+            Some(bus) => bus.write(&pattern),
+            None => Err(crate::bus::BusError::NotOpen),
+        })
+    };
+    let written = match write_result {
+        Ok(n) => n,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (bus.write error)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    if written != pattern.len() {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (write short)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 4: SoftwareBus 에서 read-back (루프백 echo)
+    let mut readback: [u8; 16] = [0u8; 16];
+    // SAFETY: BSP 단일 코어
+    let read_result: Result<usize, crate::bus::BusError> = unsafe {
+        with_registry_mut(|r| match r.slot_bus_mut(slot_idx) {
+            Some(bus) => bus.read(&mut readback),
+            None => Err(crate::bus::BusError::NotOpen),
+        })
+    };
+    let read_n = match read_result {
+        Ok(n) => n,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (bus.read error)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    if read_n != pattern.len() {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (read short)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 5: 루프백 동치성 검증 — 16바이트 XOR-OR fold (early-return 없는 단일 분기).
+    // CtEqOps 가 [u8] 슬라이스에 미구현 (스칼라 + SecureBuffer 만 지원) 이므로 동일 의미의
+    // O(N) OR-누산 패턴을 직접 작성한다 — 데이터-의존 분기는 발생하지 않음.
+    let mut diff: u8 = 0;
+    let mut i: usize = 0;
+    while i < pattern.len() {
+        diff |= pattern[i] ^ readback[i];
+        i += 1;
+    }
+    if diff != 0 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (loopback ct_eq mismatch)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 6: 합법 cap detach -> D-17 close-before-zeroize cascade 트리거
+    // SAFETY: BSP 단일 코어
+    let detach_result = unsafe { with_registry_mut(|r| r.detach(&cap, HsmRights::REVOKE)) };
+    if detach_result.is_err() {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (legitimate detach error)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 7: T-02-03 observability — detach 후 slot.bus 의 raw 96바이트 가 전부 0 인지 검사.
+    // SoftwareBus::zeroize 가 payload 를 비우고 BusInstance::zeroize 가 *self = Self::Empty
+    // (discriminant 0) 로 reset 한 결과를 가시화.
+    // SAFETY: BSP 단일 코어; slot_bus_mut 는 idx<HSM_MAX_SLOTS 일 때 항상 Some 반환.
+    let raw_all_zero: bool = unsafe {
+        with_registry_mut(|r| match r.slot_bus_mut(slot_idx) {
+            Some(bus) => {
+                let p: *const u8 = bus as *const BusInstance as *const u8;
+                let n: usize = core::mem::size_of::<BusInstance>();
+                // SAFETY: bus 는 유효한 &mut BusInstance — 동일 메모리 영역을 u8 슬라이스로 재해석.
+                let slice = core::slice::from_raw_parts(p, n);
+                slice.iter().all(|&b| b == 0)
+            }
+            None => false,
+        })
+    };
+    if !raw_all_zero {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (slot.bus raw bytes nonzero after detach)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // 추가 보강: registry 카운트 0 + 슬롯 Empty (Phase 1 cascade 와 동일)
+    // SAFETY: BSP 단일 코어
+    let post_count = unsafe { with_registry(|r| r.attached_count()) };
+    if post_count != 0 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (attached_count != 0 post-detach)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 8: 성공 마커 (qemu-test.sh 가 grep 으로 게이트)
+    // SAFETY: identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] BUS_PHASE2_OK marker (SoftwareBus loopback + detach cascade)",
             vga::Color::Green,
         );
     }
