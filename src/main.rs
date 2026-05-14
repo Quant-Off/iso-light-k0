@@ -17,6 +17,7 @@ pub mod crypto_service; // EP_CRYPTO 엔드포인트 암호화 서비스 디스�
 pub mod sign_service;   // EP_SIGN 엔드포인트 ML-DSA PQ 서명 서비스
 pub mod elf; // ELF64 정적 실행 파일 파서
 pub mod hsm; // HSM 추상 트레이트 + NullHsm
+pub mod hsm_registry; // Phase 1: HSM 멀티 슬롯 레지스트리 (capability-backed)
 pub mod idt;
 pub mod ipc; // IPC 메시지 패싱 (동기 rendezvous)
 pub mod keystore; // 소프트 PSK 키 저장소 (HSM 폴백)
@@ -468,6 +469,16 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
         ipc::init();
         vga::println(
             b"[iso-light-k0] IPC Init Done. (EP_SYSTEM, EP_CRYPTO, EP_SIGN)",
+            vga::Color::Green,
+        );
+    }
+
+    // Phase 1: HsmRegistry 정적 인스턴스는 `const fn new()` 로 부팅 instruction 0 시점부터
+    // 온라인 — 별도 init 호출 불필요. VGA 마커는 BSS 배치 + alloc=0 보장을 가시화.
+    // SAFETY: VGA MMIO 단일 코어 부팅 시점 접근 — 기존 println 호출 규약과 동일.
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] HsmRegistry static online (8 slots, alloc=0)",
             vga::Color::Green,
         );
     }
