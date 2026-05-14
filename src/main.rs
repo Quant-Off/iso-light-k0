@@ -959,7 +959,7 @@ unsafe fn hsm_registry_smoke_test() {
     //   - 슬롯 상태는 Attached 유지 (변경 없음)
     let forged = HsmCapability::with_forged_token(0xDEAD_BEEF_DEAD_BEEF, cap.slot, HsmRights::REVOKE);
     // SAFETY: BSP 단일 코어; detach 진입 가능 시점
-    let forged_result = unsafe { with_registry_mut(|r| r.detach(&forged)) };
+    let forged_result = unsafe { with_registry_mut(|r| r.detach(&forged, HsmRights::REVOKE)) };
     if forged_result.is_ok() {
         // SAFETY: identity-mapped VGA 버퍼
         unsafe {
@@ -992,7 +992,7 @@ unsafe fn hsm_registry_smoke_test() {
 
     // Step 6: 합법 cap 으로 detach -> 슬롯 Empty 복귀 + zeroize 트리거
     // SAFETY: BSP 단일 코어
-    let detach_result = unsafe { with_registry_mut(|r| r.detach(&cap)) };
+    let detach_result = unsafe { with_registry_mut(|r| r.detach(&cap, HsmRights::REVOKE)) };
     if detach_result.is_err() {
         // SAFETY: identity-mapped VGA 버퍼
         unsafe {

@@ -264,37 +264,77 @@ impl HsmRegistry {
         Err(HsmCapError::Full)
     }
 
-    // SAFETY contract: BSP single-core.
-    pub unsafe fn detach(&mut self, cap: &HsmCapability) -> Result<(), HsmCapError> {
+    // CR-01/CR-02: cap 을 *레지스트리* 와 대조 인증.
+    //
+    // is_valid_for(cap.slot, ...) 은 user-supplied 필드끼리만 비교하므로 tautology — 본
+    // 메서드만이 "슬롯에 저장된 진본 토큰 + 진본 rights" 와 비교한다. 세 검사를 CT-AND 로
+    // 결합하여 early-return 없음 (Pitfall 1): slot 인덱스 범위, slot 상태 Attached,
+    // 토큰 일치, *저장된* rights ⊇ required, *cap* rights ⊇ required (둘 다 통과해야 함 —
+    // 위조 cap 이 rights 비트를 임의로 세팅했더라도 슬롯이 발급한 권한을 넘지 못함).
+    //
+    // SAFETY: 호출자는 &self 만 빌려주므로 BSP single-core 가정만 충족하면 됨.
+    pub fn authenticate(&self, cap: &HsmCapability, required: HsmRights) -> bool {
         let idx = cap.slot.0 as usize;
-        if idx >= HSM_MAX_SLOTS {
-            return Err(HsmCapError::InvalidSlot);
-        }
-        let slot = &mut self.slots[idx];
-        match slot.state {
-            HsmSlotState::Attached => {
-                // 슬롯의 현재 권한 정보로 비교 cap 을 합성 — 토큰 일치성만 ct 로 검증
-                let cap_in_slot = HsmCapability {
-                    token: slot.token,
-                    slot: HsmSlotIdx(idx as u8),
-                    _pad0: 0,
-                    rights: slot.rights,
-                    _pad: 0,
-                    _pad1: [0; 3],
-                };
-                if cap.ct_token_eq(&cap_in_slot).unwrap_u8() != 1 {
-                    return Err(HsmCapError::InvalidToken);
-                }
-                // D-13: 명시적 Detaching 윈도우 — in-flight 호출자가 stale token 으로
-                // 본 슬롯을 다시 잡으면 Busy 거부됨
-                slot.state = HsmSlotState::Detaching;
-                // 명시적 소거 (Drop 폴백이 아닌 주 경로) — zeroize 가 state 를 Empty 로 되돌림
-                slot.zeroize();
-                Ok(())
+        // slot index out of range → cap 합성 자체가 의미 없음. 단, CT 평면화를 위해 가짜
+        // cap_in_slot 으로 비교는 끝까지 수행하고 마지막에 in_range 비트로 AND.
+        let in_range = idx < HSM_MAX_SLOTS;
+        let safe_idx = if in_range { idx } else { 0 };
+        let slot = &self.slots[safe_idx];
+
+        let state_ok: Choice = CtEqOps::eq(&(slot.state as u8), &(HsmSlotState::Attached as u8));
+
+        let cap_in_slot = HsmCapability {
+            token: slot.token,
+            slot: HsmSlotIdx(safe_idx as u8),
+            _pad0: 0,
+            rights: slot.rights,
+            _pad: 0,
+            _pad1: [0; 3],
+        };
+        let token_eq: Choice = cap.ct_token_eq(&cap_in_slot);
+        // 저장된 rights ⊇ required (위조 cap rights 무시)
+        let stored_masked: u16 = slot.rights.0 & required.0;
+        let stored_rights_ok: Choice = CtEqOps::eq(&stored_masked, &required.0);
+        // cap rights ⊇ required (요청자가 명시한 권한이 부족하면 거부 — REVOKE 비트 누락 차단)
+        let cap_masked: u16 = cap.rights.0 & required.0;
+        let cap_rights_ok: Choice = CtEqOps::eq(&cap_masked, &required.0);
+        // 토큰 != 0 (invalid cap 사전 차단)
+        let token_nonzero: Choice = CtEqOps::ne(&cap.token, &0u64);
+
+        let all_ct = token_nonzero & state_ok & token_eq & stored_rights_ok & cap_rights_ok;
+        // CT-AND 결과를 마지막에만 bool in_range 와 결합 (in_range 가 false 면 결과 false)
+        (all_ct.unwrap_u8() == 1) & in_range
+    }
+
+    // SAFETY contract: BSP single-core. CR-02: required (예: HsmRights::REVOKE) 미보유 시 거부.
+    pub unsafe fn detach(
+        &mut self,
+        cap: &HsmCapability,
+        required: HsmRights,
+    ) -> Result<(), HsmCapError> {
+        // (1) CT 인증 — 슬롯에 저장된 진본 토큰 + 저장된 rights + cap rights 동시 검증
+        if !self.authenticate(cap, required) {
+            // syscall 경계에서 Denied 로 collapse 되므로 어떤 실패 사유이든 InvalidToken 반환
+            // (Pitfall 7: variant 노출 최소화). idx 가 범위 밖이면 별도 처리도 동일 매핑.
+            let idx = cap.slot.0 as usize;
+            if idx >= HSM_MAX_SLOTS {
+                return Err(HsmCapError::InvalidSlot);
             }
-            HsmSlotState::Detaching => Err(HsmCapError::Busy),
-            HsmSlotState::Empty => Err(HsmCapError::NotAttached),
+            match self.slots[idx].state {
+                HsmSlotState::Detaching => return Err(HsmCapError::Busy),
+                HsmSlotState::Empty => return Err(HsmCapError::NotAttached),
+                HsmSlotState::Attached => return Err(HsmCapError::InvalidToken),
+            }
         }
+        // (2) 인증 통과 — Attached 상태 보장됨
+        let idx = cap.slot.0 as usize;
+        let slot = &mut self.slots[idx];
+        // D-13: 명시적 Detaching 윈도우 — in-flight 호출자가 stale token 으로
+        // 본 슬롯을 다시 잡으면 Busy 거부됨
+        slot.state = HsmSlotState::Detaching;
+        // 명시적 소거 (Drop 폴백이 아닌 주 경로) — zeroize 가 state 를 Empty 로 되돌림
+        slot.zeroize();
+        Ok(())
     }
 }
 
@@ -437,15 +477,17 @@ pub fn handle_detach(ctx: &mut SyscallContext) -> u64 {
         crate::cpu::clac();
     }
 
-    // (4) detach — Pitfall 7: capability-거부 variant 전부 Denied 로 통일
+    // (4) detach — CR-02: registry 가 REVOKE 비트 + 저장 토큰 일치 동시 인증
+    // Pitfall 7: capability-거부 variant 전부 Denied 로 collapse
     // SAFETY: BSP single-core
-    let result = unsafe { with_registry_mut(|r| r.detach(&cap)) };
+    let result = unsafe { with_registry_mut(|r| r.detach(&cap, HsmRights::REVOKE)) };
     let rax = match result {
         Ok(()) => 0u64,
         Err(HsmCapError::InvalidToken)
         | Err(HsmCapError::InvalidSlot)
         | Err(HsmCapError::NotAttached)
-        | Err(HsmCapError::Busy) => SyscallError::Denied.as_rax(),
+        | Err(HsmCapError::Busy)
+        | Err(HsmCapError::RightsMissing) => SyscallError::Denied.as_rax(),
         Err(_) => SyscallError::Internal.as_rax(),
     };
 
