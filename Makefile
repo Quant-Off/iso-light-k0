@@ -98,7 +98,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero qemu-smoke ci-phase1
 
 all: iso
 
@@ -188,3 +188,18 @@ clean: clean-user
 	$(CARGO) clean
 	@rm -rf $(ISO_DIR) $(ISO_DEBUG) $(ISO_REL)
 	@echo "[clean] 완료"
+
+#
+# Phase 1 CI 게이트
+#
+check-alloc-zero: build
+	@bash scripts/check-no-alloc.sh
+	@echo "[CI] alloc-zero 게이트 통과"
+
+qemu-smoke: iso
+	@bash scripts/qemu-test.sh
+	@echo "[CI] QEMU 부팅 smoke 통과"
+
+ci-phase1: check-alloc-zero qemu-smoke
+	@cd /Library/Quant/Repository/projects/elib-k0-nt && $(CARGO) test -p constant-time --tests
+	@echo "[CI] Phase 1 ci 게이트 전체 통과"
