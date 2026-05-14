@@ -437,30 +437,85 @@ pub unsafe fn attach_kernel_side(bus_kind: BusKind, init_blob: &[u8], rights: Hs
 //
 
 pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
-    let _bus_kind_hint = ctx.rdi; // Phase 1 ignored; Phase 2 BusKind hint 예약
-    let out_ptr = ctx.rsi;
-    let user_cap_size = ctx.rdx;
+    // Phase 0: D-15 register snapshot — rdi=BusKind, rsi=init_ptr, rdx=init_len, r8=out_ptr.
+    let bus_kind_raw = ctx.rdi;
+    let init_ptr = ctx.rsi;
+    let init_len = ctx.rdx;
+    let out_ptr = ctx.r8;
 
-    // (1) 크기 sanity — HsmCapability ABI 정렬 크기와 정확히 일치
-    if user_cap_size != core::mem::size_of::<HsmCapability>() as u64 {
+    // Phase 1: T-02-04: Usb..Network stub variants 거부 — BusInstance::new() 에 도달 0.
+    let bus_kind: BusKind = match bus_kind_raw {
+        0 => BusKind::Software,
+        1 => BusKind::Ring3Process,
+        2..=6 => return SyscallError::BadArg.as_rax(),
+        _ => return SyscallError::BadArg.as_rax(),
+    };
+
+    // Phase 2: init_len sanity (Pitfall 6 — honest overflow).
+    if init_len > MAX_BUS_INIT_BLOB as u64 {
         return SyscallError::BadArg.as_rax();
     }
-    // (2) user-pointer dual range check (Pitfall 3)
-    if !is_user_address(out_ptr) || !is_user_address(out_ptr.saturating_add(user_cap_size)) {
+
+    // Phase 3: pointer dual range checks (Pitfall 3).
+    // init_ptr: length-aware — init_len == 0 (SoftwareBus 빈 init_blob 허용 — D-10) 면 deref 0.
+    if init_len > 0
+        && (!is_user_address(init_ptr) || !is_user_address(init_ptr.saturating_add(init_len)))
+    {
+        return SyscallError::BadAddress.as_rax();
+    }
+    // out_ptr: unconditional (cap-sized).
+    let cap_size = core::mem::size_of::<HsmCapability>() as u64;
+    if !is_user_address(out_ptr) || !is_user_address(out_ptr.saturating_add(cap_size)) {
         return SyscallError::BadAddress.as_rax();
     }
 
-    // (3) D-16: cap 검사 없이 직접 attach (Phase 5 에서 attestation 게이트가 본 호출 자체를 감쌈)
-    // Task 5 가 본 호출 전체를 D-15 ABI 로 재작성 — 본 패치는 Task 3 build-green 유지용 임시.
+    // Phase 4: stack staging buffer (Pitfall 4: stack-local 32B 버퍼. 함수 종료 직전 zeroize).
+    let mut init_kbuf = [0u8; MAX_BUS_INIT_BLOB];
+
+    // Phase 5: SMAP read window — init_blob copy 만 stac/clac 윈도우 안 (Pitfall 2).
+    if init_len > 0 {
+        // SAFETY: init_ptr / init_ptr+init_len 모두 user range 통과 (Phase 3); init_kbuf 는 stack-local.
+        unsafe {
+            crate::cpu::stac();
+            core::ptr::copy_nonoverlapping(
+                init_ptr as *const u8,
+                init_kbuf.as_mut_ptr(),
+                init_len as usize,
+            );
+            crate::cpu::clac();
+        }
+    }
+
+    // Phase 6: D-16 all-or-nothing delegate (SMAP 윈도우 밖).
+    let init_slice: &[u8] = &init_kbuf[..init_len as usize];
+    // Pitfall 7: BusError → HsmCapError → SyscallError 3 단계 collapse.
     // SAFETY: BSP single-core + capability::init_prng() 완료 가정
-    let cap = match unsafe { with_registry_mut(|r| r.attach(BusKind::Software, &[], HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE)) } {
+    let cap = match unsafe {
+        with_registry_mut(|r| {
+            r.attach(
+                bus_kind,
+                init_slice,
+                HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE,
+            )
+        })
+    } {
         Ok(c) => c,
-        Err(HsmCapError::Full) => return SyscallError::BadArg.as_rax(),
-        Err(_) => return SyscallError::Internal.as_rax(),
+        Err(HsmCapError::Full) => {
+            init_kbuf.zeroize();
+            return SyscallError::BadArg.as_rax();
+        }
+        Err(HsmCapError::BadInit) => {
+            init_kbuf.zeroize();
+            return SyscallError::BadArg.as_rax();
+        }
+        Err(_) => {
+            init_kbuf.zeroize();
+            return SyscallError::Internal.as_rax();
+        }
     };
 
-    // (4) SMAP write window — 단일 copy_nonoverlapping (Pitfall 2)
-    // SAFETY: out_ptr 는 사용자 주소 dual-check 통과; copy 폭은 HsmCapability ABI 크기
+    // Phase 7: SMAP write window — cap copy to out_ptr (별도 stac/clac, Pitfall 2).
+    // SAFETY: out_ptr 는 사용자 주소 dual-check 통과 (Phase 3); copy 폭은 HsmCapability ABI 크기.
     unsafe {
         crate::cpu::stac();
         core::ptr::copy_nonoverlapping(
@@ -471,6 +526,8 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
         crate::cpu::clac();
     }
 
+    // Phase 8: final zeroize (Pitfall 4 — happy path stack staging clean) + RAX=0 success.
+    init_kbuf.zeroize();
     0
 }
 
