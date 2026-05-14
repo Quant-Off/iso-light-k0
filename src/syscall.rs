@@ -141,6 +141,9 @@ pub enum SyscallNum {
     GetRandom = 5,
     /// `cap_request(endpoint_id, rights)` — 커널이 정책 검증 후 발급
     CapRequest = 6,
+    HsmAttach = 7,    // Phase 1: 정적 HSM 슬롯 부착 (비인증; Phase 5 attestation gate 예정)
+    HsmDetach = 8,    // Phase 1: HSM 슬롯 해제 + zeroize (post-attach CAP 검사)
+    HsmEnumerate = 9, // Phase 1: 부착된 슬롯 enumerate (post-attach CAP 검사)
 }
 
 /// 사용자에 노출되는 음수 에러 코드 (Linux errno 와 호환되지 않음, 자체 ABI).
@@ -308,6 +311,9 @@ extern "C" fn dispatch(ctx: &mut SyscallContext) {
         x if x == SyscallNum::Exit as u64 => sys_exit(ctx.rdi),
         x if x == SyscallNum::Write as u64 => sys_write(ctx.rdi, ctx.rsi, ctx.rdx),
         x if x == SyscallNum::GetRandom as u64 => sys_getrandom(ctx.rsi, ctx.rdx),
+        x if x == SyscallNum::HsmAttach as u64 => crate::hsm_registry::handle_attach(ctx),
+        x if x == SyscallNum::HsmDetach as u64 => crate::hsm_registry::handle_detach(ctx),
+        x if x == SyscallNum::HsmEnumerate as u64 => crate::hsm_registry::handle_enumerate(ctx),
         // IpcCall/IpcRecv/IpcReply/CapRequest 는 Phase B 에서 와이어업.
         x if x == SyscallNum::IpcCall as u64
             || x == SyscallNum::IpcRecv as u64
