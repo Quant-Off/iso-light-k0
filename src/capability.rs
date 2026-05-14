@@ -386,42 +386,9 @@ pub unsafe fn generate_capability(
     endpoint_id: EndpointId,
     rights: Rights,
 ) -> Result<Capability, CapError> {
-    // SAFETY: 단일 코어 부팅 초기 접근
-    let drbg_slot = unsafe { &mut *(&raw mut CAP_DRBG) };
-    let drbg = drbg_slot.as_mut().ok_or(CapError::PrngNotInitialized)?;
-
-    // 토큰 생성 루프 (0 출력 회피 + ReseedRequired 자동 재시드)
-    let mut token_bytes = [0u8; 8];
-    loop {
-        match drbg.generate(&mut token_bytes, None) {
-            Ok(()) => {
-                // NIST 출력은 big-endian 스트림으로 해석 (little-endian 이어도 균일성 유지)
-                let token = u64::from_be_bytes(token_bytes);
-                token_bytes.zeroize();
-                if token != 0 {
-                    return Ok(Capability {
-                        token,
-                        endpoint_id,
-                        rights,
-                        _pad: 0,
-                    });
-                }
-                // 0 출력은 무효 토큰 규약과 충돌 -> 재시도 (확률 2^-64)
-                continue;
-            }
-            Err(DrbgError::ReseedRequired) => {
-                // SAFETY: 호출자가 단일 코어 보장 (DRBG 재시드 안전)
-                unsafe {
-                    reseed_drbg(drbg)?;
-                }
-                continue;
-            }
-            Err(_) => {
-                token_bytes.zeroize();
-                return Err(CapError::DrbgInit);
-            }
-        }
-    }
+    // SAFETY: gen_token_u64 의 안전 계약을 호출자가 그대로 만족 (단일 코어 부팅 초기)
+    let token = unsafe { gen_token_u64()? };
+    Ok(Capability { token, endpoint_id, rights, _pad: 0 })
 }
 
 //
@@ -462,6 +429,40 @@ pub unsafe fn rand_bytes(buf: &mut [u8]) -> Result<(), CapError> {
                 unsafe {
                     zeroize::volatile::secure_zero(buf.as_mut_ptr(), buf.len());
                 }
+                return Err(CapError::DrbgInit);
+            }
+        }
+    }
+}
+
+pub unsafe fn gen_token_u64() -> Result<u64, CapError> {
+    // SAFETY: 단일 코어 부팅 초기 접근 (CAP_DRBG 비원자적 갱신)
+    let drbg_slot = unsafe { &mut *(&raw mut CAP_DRBG) };
+    let drbg = drbg_slot.as_mut().ok_or(CapError::PrngNotInitialized)?;
+
+    // 토큰 생성 루프 (0 출력 회피 + ReseedRequired 자동 재시드)
+    let mut token_bytes = [0u8; 8];
+    loop {
+        match drbg.generate(&mut token_bytes, None) {
+            Ok(()) => {
+                // NIST 출력은 big-endian 스트림으로 해석 (little-endian 이어도 균일성 유지)
+                let token = u64::from_be_bytes(token_bytes);
+                token_bytes.zeroize();
+                if token != 0 {
+                    return Ok(token);
+                }
+                // 0 출력은 무효 토큰 규약과 충돌 -> 재시도 (확률 2^-64)
+                continue;
+            }
+            Err(DrbgError::ReseedRequired) => {
+                // SAFETY: 호출자가 단일 코어 보장 (DRBG 재시드 안전)
+                unsafe {
+                    reseed_drbg(drbg)?;
+                }
+                continue;
+            }
+            Err(_) => {
+                token_bytes.zeroize();
                 return Err(CapError::DrbgInit);
             }
         }
