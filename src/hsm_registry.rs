@@ -520,8 +520,12 @@ pub fn handle_enumerate(ctx: &mut SyscallContext) -> u64 {
         crate::cpu::clac();
     }
 
-    // (3) cap 인증 (CT). Pitfall 1: 실패 시 user 출력 버퍼 절대 미수정.
-    if !cap.is_valid_for(cap.slot, HsmRights::ENUMERATE) {
+    // (3) cap 인증 (CT). CR-01: registry 와 대조 — is_valid_for(cap.slot, ...) 은
+    // user-supplied 필드끼리만 비교하는 tautology 이므로 사용 금지.
+    // Pitfall 1: 실패 시 user 출력 버퍼 절대 미수정.
+    // SAFETY: BSP single-core
+    let auth_ok = unsafe { with_registry(|r| r.authenticate(&cap, HsmRights::ENUMERATE)) };
+    if !auth_ok {
         cap.zeroize();
         return SyscallError::Denied.as_rax();
     }
