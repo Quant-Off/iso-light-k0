@@ -347,6 +347,8 @@ impl HsmRegistry {
         // D-13: 명시적 Detaching 윈도우 — in-flight 호출자가 stale token 으로
         // 본 슬롯을 다시 잡으면 Busy 거부됨
         slot.state = HsmSlotState::Detaching;
+        // D-17: bus.close() best-effort (결과 무시) — zeroize 가 어떤 경우라도 cascade 로 BusInstance 비움.
+        let _ = slot.bus.close();
         // 명시적 소거 (Drop 폴백이 아닌 주 경로) — zeroize 가 state 를 Empty 로 되돌림
         slot.zeroize();
         Ok(())
@@ -407,7 +409,12 @@ impl HsmRegistry {
                 out[written] = HsmSlotInfo {
                     slot: i as u8,
                     state: slot.state as u8,
-                    _reserved: [0; 6],
+                    // D-19: _reserved[0] = BusKind octet (HsmSlotInfo 8 바이트 ABI 불변). 1..6 은 Phase 5 attestation summary 자리.
+                    _reserved: {
+                        let mut r = [0u8; 6];
+                        r[0] = slot.bus.kind() as u8;
+                        r
+                    },
                 };
                 written += 1;
             }
