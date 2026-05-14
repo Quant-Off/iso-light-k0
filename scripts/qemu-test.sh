@@ -244,6 +244,11 @@ HAS_TLS_HYBRID=false
 HAS_TLS_CLASSICAL=false
 HAS_TLS_WIPED=false
 HAS_ALL_DONE=false
+# Phase 1 신규 마일스톤 (additive — 기존 플래그 보존, W-1)
+HAS_HSM_STATIC_ONLINE=false
+HAS_HSM_SMOKE=false
+HAS_HSM_ROUNDTRIP=false
+HAS_HSM_DETACH_NOCAP_DENIED=false
 if [ -s "${VGA_TXT}" ]; then
     grep -q "Booted\. Initializing"           "${VGA_TXT}" && HAS_BOOTED=true
     grep -q "Capability DRBG Init Done"       "${VGA_TXT}" && HAS_DRBG=true
@@ -252,6 +257,11 @@ if [ -s "${VGA_TXT}" ]; then
     grep -q "Classical (X25519) OK"           "${VGA_TXT}" && HAS_TLS_CLASSICAL=true
     grep -q "keystore + pool wiped"           "${VGA_TXT}" && HAS_TLS_WIPED=true
     grep -q "All Task Done"                   "${VGA_TXT}" && HAS_ALL_DONE=true
+    # Phase 1 HsmRegistry 마일스톤 (additive)
+    grep -q "HsmRegistry static online (8 slots, alloc=0)"                "${VGA_TXT}" && HAS_HSM_STATIC_ONLINE=true
+    grep -q "HsmRegistry smoke: attach -> verify -> detach -> zeroize OK" "${VGA_TXT}" && HAS_HSM_SMOKE=true
+    grep -q "HSM_ATTACH_DETACH_ROUNDTRIP_OK marker"                       "${VGA_TXT}" && HAS_HSM_ROUNDTRIP=true
+    grep -q "HSM_DETACH_NO_CAP_DENIED marker"                             "${VGA_TXT}" && HAS_HSM_DETACH_NOCAP_DENIED=true
 fi
 
 echo "  [부팅 진입]                    $($HAS_BOOTED && echo PASS || echo MISS)"
@@ -261,6 +271,10 @@ echo "  [TLS PQ-Hybrid 핸드셰이크]      $($HAS_TLS_HYBRID && echo PASS || e
 echo "  [TLS Classical 핸드셰이크]      $($HAS_TLS_CLASSICAL && echo PASS || echo MISS)"
 echo "  [TLS keystore + pool 소거]      $($HAS_TLS_WIPED && echo PASS || echo MISS)"
 echo "  [메인 루프 진입(All Task Done)] $($HAS_ALL_DONE && echo PASS || echo MISS)"
+echo "  [HsmRegistry static online]     $($HAS_HSM_STATIC_ONLINE && echo PASS || echo MISS)"
+echo "  [HsmRegistry smoke OK]          $($HAS_HSM_SMOKE && echo PASS || echo MISS)"
+echo "  [HSM attach->detach roundtrip]  $($HAS_HSM_ROUNDTRIP && echo PASS || echo MISS)"
+echo "  [HSM detach no-cap denied]      $($HAS_HSM_DETACH_NOCAP_DENIED && echo PASS || echo MISS)"
 
 if ! $HAS_SMOKE_OK; then
     PASS=false
@@ -277,6 +291,23 @@ fi
 if ! $HAS_TLS_WIPED; then
     PASS=false
     FAIL_REASONS+=("TLS 종료 후 키 자료 소거 미확인")
+fi
+# Phase 1 HsmRegistry 마일스톤 fail-accumulator (additive)
+if [ "$HAS_HSM_STATIC_ONLINE" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("HsmRegistry static online 마커 없음 (main.rs 모듈 선언 또는 부팅 순서 누락)")
+fi
+if [ "$HAS_HSM_SMOKE" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("HsmRegistry 스모크 테스트 성공 마커 없음 (attach->detach->zeroize 라운드트립 실패)")
+fi
+if [ "$HAS_HSM_ROUNDTRIP" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("HSM_ATTACH_DETACH_ROUNDTRIP_OK 마커 없음")
+fi
+if [ "$HAS_HSM_DETACH_NOCAP_DENIED" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("HSM_DETACH_NO_CAP_DENIED 마커 없음 — post-attach CAP-02 enforcement 실패")
 fi
 
 # (d) QEMU exit 코드 (timeout=124, 모니터 quit=정상)
