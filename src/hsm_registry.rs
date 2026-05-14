@@ -11,8 +11,8 @@ use crate::syscall::{SyscallContext, SyscallError, is_user_address};
 pub const HSM_MAX_SLOTS: usize = 8;
 
 // HsmCapability 의 ABI 정렬 크기는 16바이트 (u64 정렬 강제, prior art `Capability` 와 동일).
-// 필드 합산("논리 크기")은 token(8) + slot(1) + rights(2) + _pad(1) = 12B 이며, _pad 는
-// 정렬 잔여 바이트가 미초기화 스택 자료를 운반하지 않도록 명시적 0 으로 두는 가시 필드 (Pitfall 6).
+// 16 옥텟 전부를 가시 필드로 채워 implicit padding 0 — CR-03 Ring0→Ring3 info-leak 봉쇄.
+// 레이아웃: token(0..8) + slot(8) + _pad0(9) + rights(10..12) + _pad(12) + _pad1(13..16).
 // `#[repr(C, packed)]` 미사용 — 필드 참조 시 unaligned access 위험 회피.
 const _: () = assert!(core::mem::size_of::<HsmCapability>() == 16);
 const _: () = assert!(core::mem::size_of::<HsmSlotState>() == 1);
@@ -95,8 +95,12 @@ pub enum HsmCapError {
 pub struct HsmCapability {
     pub token: u64,
     pub slot: HsmSlotIdx,
+    // CR-03: offset 9 의 align-pad 를 명시 필드로 흡수 (rights u16 정렬 보장)
+    _pad0: u8,
     pub rights: HsmRights,
     _pad: u8,
+    // CR-03: trailing pad (offset 13..16) 를 명시 필드로 흡수 — 16옥텟 전부 가시 필드
+    _pad1: [u8; 3],
 }
 
 impl HsmCapability {
@@ -104,8 +108,10 @@ impl HsmCapability {
         Self {
             token: 0,
             slot: HsmSlotIdx::INVALID,
+            _pad0: 0,
             rights: HsmRights::NONE,
             _pad: 0,
+            _pad1: [0; 3],
         }
     }
 
@@ -114,8 +120,10 @@ impl HsmCapability {
         Self {
             token,
             slot,
+            _pad0: 0,
             rights,
             _pad: 0,
+            _pad1: [0; 3],
         }
     }
 
@@ -141,7 +149,9 @@ impl Zeroize for HsmCapability {
         self.token.zeroize();
         self.rights = HsmRights::NONE;
         self.slot = HsmSlotIdx::INVALID;
+        self._pad0 = 0;
         self._pad = 0;
+        self._pad1 = [0; 3];
     }
 }
 
@@ -240,11 +250,14 @@ impl HsmRegistry {
                 slot.token = token;
                 slot.rights = rights;
                 slot.state = HsmSlotState::Attached;
+                // CR-03: padding 까지 명시 0 (struct literal 이 모든 가시 필드 초기화)
                 return Ok(HsmCapability {
                     token,
                     slot: HsmSlotIdx(i as u8),
+                    _pad0: 0,
                     rights,
                     _pad: 0,
+                    _pad1: [0; 3],
                 });
             }
         }
@@ -264,8 +277,10 @@ impl HsmRegistry {
                 let cap_in_slot = HsmCapability {
                     token: slot.token,
                     slot: HsmSlotIdx(idx as u8),
+                    _pad0: 0,
                     rights: slot.rights,
                     _pad: 0,
+                    _pad1: [0; 3],
                 };
                 if cap.ct_token_eq(&cap_in_slot).unwrap_u8() != 1 {
                     return Err(HsmCapError::InvalidToken);
