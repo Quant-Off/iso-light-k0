@@ -249,6 +249,8 @@ HAS_HSM_STATIC_ONLINE=false
 HAS_HSM_SMOKE=false
 HAS_HSM_ROUNDTRIP=false
 HAS_HSM_DETACH_NOCAP_DENIED=false
+# Phase 2 BusDriver 마일스톤 (additive — Phase 1 게이트는 그대로 유지)
+HAS_BUS_PHASE2_OK=false
 if [ -s "${VGA_TXT}" ]; then
     grep -q "Booted\. Initializing"           "${VGA_TXT}" && HAS_BOOTED=true
     grep -q "Capability DRBG Init Done"       "${VGA_TXT}" && HAS_DRBG=true
@@ -262,6 +264,8 @@ if [ -s "${VGA_TXT}" ]; then
     grep -q "HsmRegistry smoke: attach -> verify -> detach -> zeroize OK" "${VGA_TXT}" && HAS_HSM_SMOKE=true
     grep -q "HSM_ATTACH_DETACH_ROUNDTRIP_OK marker"                       "${VGA_TXT}" && HAS_HSM_ROUNDTRIP=true
     grep -q "HSM_DETACH_NO_CAP_DENIED marker"                             "${VGA_TXT}" && HAS_HSM_DETACH_NOCAP_DENIED=true
+    # Phase 2 BusDriver smoke 마일스톤 (additive)
+    grep -q "BUS_PHASE2_OK marker"                                        "${VGA_TXT}" && HAS_BUS_PHASE2_OK=true
 fi
 
 echo "  [부팅 진입]                    $($HAS_BOOTED && echo PASS || echo MISS)"
@@ -275,6 +279,7 @@ echo "  [HsmRegistry static online]     $($HAS_HSM_STATIC_ONLINE && echo PASS ||
 echo "  [HsmRegistry smoke OK]          $($HAS_HSM_SMOKE && echo PASS || echo MISS)"
 echo "  [HSM attach->detach roundtrip]  $($HAS_HSM_ROUNDTRIP && echo PASS || echo MISS)"
 echo "  [HSM detach no-cap denied]      $($HAS_HSM_DETACH_NOCAP_DENIED && echo PASS || echo MISS)"
+echo "  [BUS_PHASE2_OK marker]          $($HAS_BUS_PHASE2_OK && echo PASS || echo MISS)"
 
 if ! $HAS_SMOKE_OK; then
     PASS=false
@@ -308,6 +313,11 @@ fi
 if [ "$HAS_HSM_DETACH_NOCAP_DENIED" != "true" ]; then
     PASS=false
     FAIL_REASONS+=("HSM_DETACH_NO_CAP_DENIED 마커 없음 — post-attach CAP-02 enforcement 실패")
+fi
+# Phase 2 BusDriver fail-accumulator (additive)
+if [ "$HAS_BUS_PHASE2_OK" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("BUS_PHASE2_OK 마커 없음 — Phase 2 SoftwareBus 루프백 + detach cascade 실패")
 fi
 
 # (d) QEMU exit 코드 (timeout=124, 모니터 quit=정상)
