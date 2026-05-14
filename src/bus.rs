@@ -68,39 +68,208 @@ pub trait BusDriver {
 }
 
 //
-// SoftwareBus — Task 1 placeholder (Task 2 가 본문 + impls 채움).
+// SoftwareBus — 64-byte 루프백 echo (D-10). 비밀 페이로드 아님, 그러나 Phase 1 일관성으로 zeroize 명시.
 //
 
 pub struct SoftwareBus {
-    _phantom: (),
+    ring: [u8; SW_BUS_BUF],
+    write_len: usize,
+    read_pos: usize,
+    open_state: bool,
 }
 
 impl SoftwareBus {
     pub const fn new() -> Self {
-        Self { _phantom: () }
+        Self {
+            ring: [0u8; SW_BUS_BUF],
+            write_len: 0,
+            read_pos: 0,
+            open_state: false,
+        }
+    }
+}
+
+impl BusDriver for SoftwareBus {
+    fn open(&mut self, _init: &[u8]) -> Result<(), BusError> {
+        if self.open_state {
+            return Err(BusError::AlreadyOpen);
+        }
+        // D-10: _init 슬라이스 무시 (loopback echo 는 init 없음).
+        self.ring = [0u8; SW_BUS_BUF];
+        self.write_len = 0;
+        self.read_pos = 0;
+        self.open_state = true;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), BusError> {
+        if !self.open_state {
+            return Err(BusError::NotOpen);
+        }
+        self.ring = [0u8; SW_BUS_BUF];
+        self.write_len = 0;
+        self.read_pos = 0;
+        self.open_state = false;
+        Ok(())
+    }
+
+    fn read(&mut self, out: &mut [u8]) -> Result<usize, BusError> {
+        if !self.open_state {
+            return Err(BusError::NotOpen);
+        }
+        let available = self.write_len.saturating_sub(self.read_pos);
+        let n = available.min(out.len());
+        out[..n].copy_from_slice(&self.ring[self.read_pos..self.read_pos + n]);
+        self.read_pos += n;
+        Ok(n)
+    }
+
+    fn write(&mut self, data: &[u8]) -> Result<usize, BusError> {
+        if !self.open_state {
+            return Err(BusError::NotOpen);
+        }
+        // Pitfall 6 — overflow 는 정직한 에러로 surface, silent drop 금지.
+        if data.len() > SW_BUS_BUF.saturating_sub(self.write_len) {
+            return Err(BusError::BufferTooSmall);
+        }
+        self.ring[self.write_len..self.write_len + data.len()].copy_from_slice(data);
+        self.write_len += data.len();
+        Ok(data.len())
+    }
+
+    fn poll(&mut self) -> Result<BusReady, BusError> {
+        if !self.open_state {
+            return Err(BusError::NotOpen);
+        }
+        let readable = self.write_len > self.read_pos;
+        let writable = self.write_len < SW_BUS_BUF;
+        let closed = false;
+        Ok(BusReady {
+            readable,
+            writable,
+            closed,
+        })
+    }
+
+    fn kind(&self) -> BusKind {
+        BusKind::Software
+    }
+}
+
+impl Zeroize for SoftwareBus {
+    fn zeroize(&mut self) {
+        // bytes-first, metadata-last (I-3 token-first ordering 일관)
+        self.ring.zeroize();
+        self.write_len = 0;
+        self.read_pos = 0;
+        self.open_state = false;
+    }
+}
+
+impl Drop for SoftwareBus {
+    // SAFETY-net: Drop 폴백 (Phase 1 voice). 정상 detach 경로가 우선 호출.
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
 //
-// Ring3ProcessBus — Task 1 placeholder (Task 2 가 endpoint 바인딩 + impls 채움).
+// Ring3ProcessBus — Ring 3 IPC 엔드포인트 바인딩 (D-12). read/write/poll 는 WireNotReady (D-14).
 //
 
 pub struct Ring3ProcessBus {
-    _phantom: (),
+    endpoint: EndpointId,
+    open_state: bool,
 }
 
 impl Ring3ProcessBus {
     pub const fn new() -> Self {
-        Self { _phantom: () }
+        Self {
+            endpoint: EndpointId::INVALID,
+            open_state: false,
+        }
     }
 }
 
-// 본 stub 은 Task 2 에서 실제 endpoint 디코드 로직과 함께 사용됨.
-// Plan 02 가 ipc::endpoint_exists(id) 로 교체.
+// Plan-01 임시 stub — Plan 02 가 ipc::endpoint_exists(id) 로 교체.
 #[inline]
-#[allow(dead_code)]
 fn endpoint_exists_stub(id: EndpointId) -> bool {
     id != EndpointId::INVALID
+}
+
+impl BusDriver for Ring3ProcessBus {
+    fn open(&mut self, init: &[u8]) -> Result<(), BusError> {
+        if self.open_state {
+            return Err(BusError::AlreadyOpen);
+        }
+        // (1) init blob 길이 검증 — endpoint id 는 2 bytes (u16 LE)
+        if init.len() < 2 {
+            return Err(BusError::BadInit);
+        }
+        // (2) decode EndpointId
+        let id_raw = u16::from_le_bytes([init[0], init[1]]);
+        let endpoint = EndpointId(id_raw);
+        // (3) forward-reserve zeros — init_blob[2..] 는 Phase 5 chunk header 헤드룸, Phase 2 에서는 zero 강제
+        let mut i = 2usize;
+        while i < init.len() {
+            if init[i] != 0 {
+                return Err(BusError::BadInit);
+            }
+            i += 1;
+        }
+        // (4) INVALID 거부
+        if endpoint == EndpointId::INVALID {
+            return Err(BusError::BadInit);
+        }
+        // (5) endpoint 존재성만 검증 (caller 권한 게이트는 Phase 5 — Pitfall B + A3)
+        if !endpoint_exists_stub(endpoint) {
+            return Err(BusError::BadInit);
+        }
+        // (6) commit
+        self.endpoint = endpoint;
+        self.open_state = true;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), BusError> {
+        if !self.open_state {
+            return Err(BusError::NotOpen);
+        }
+        self.endpoint = EndpointId::INVALID;
+        self.open_state = false;
+        Ok(())
+    }
+
+    fn read(&mut self, _out: &mut [u8]) -> Result<usize, BusError> {
+        // D-12 / D-14: Phase 4 가 본 메서드 본문을 wire frame decode 로 교체.
+        Err(BusError::WireNotReady)
+    }
+
+    fn write(&mut self, _data: &[u8]) -> Result<usize, BusError> {
+        Err(BusError::WireNotReady)
+    }
+
+    fn poll(&mut self) -> Result<BusReady, BusError> {
+        Err(BusError::WireNotReady)
+    }
+
+    fn kind(&self) -> BusKind {
+        BusKind::Ring3Process
+    }
+}
+
+impl Zeroize for Ring3ProcessBus {
+    fn zeroize(&mut self) {
+        // u16 endpoint id 는 RESEARCH §6 기준 non-secret 이나 INVALID 로 reset 이 cleaner invariant
+        self.endpoint = EndpointId::INVALID;
+        self.open_state = false;
+    }
+}
+
+impl Drop for Ring3ProcessBus {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 //
@@ -218,62 +387,6 @@ impl Drop for BusInstance {
     // panic = abort 환경 — Drop 은 SMP 종료 시점 / stack-local 보호 목적.
     fn drop(&mut self) {
         self.zeroize();
-    }
-}
-
-// Task 1 의 placeholder 페이로드용 Zeroize impl — Task 2 가 실제 본문에 맞춰 교체.
-impl Zeroize for SoftwareBus {
-    fn zeroize(&mut self) {
-        self._phantom = ();
-    }
-}
-
-impl Zeroize for Ring3ProcessBus {
-    fn zeroize(&mut self) {
-        self._phantom = ();
-    }
-}
-
-// Task 1 placeholder BusDriver impls — Task 2 가 실제 본문에 맞춰 교체.
-impl BusDriver for SoftwareBus {
-    fn open(&mut self, _init: &[u8]) -> Result<(), BusError> {
-        Err(BusError::NotImplemented)
-    }
-    fn close(&mut self) -> Result<(), BusError> {
-        Err(BusError::NotImplemented)
-    }
-    fn read(&mut self, _out: &mut [u8]) -> Result<usize, BusError> {
-        Err(BusError::NotImplemented)
-    }
-    fn write(&mut self, _data: &[u8]) -> Result<usize, BusError> {
-        Err(BusError::NotImplemented)
-    }
-    fn poll(&mut self) -> Result<BusReady, BusError> {
-        Err(BusError::NotImplemented)
-    }
-    fn kind(&self) -> BusKind {
-        BusKind::Software
-    }
-}
-
-impl BusDriver for Ring3ProcessBus {
-    fn open(&mut self, _init: &[u8]) -> Result<(), BusError> {
-        Err(BusError::NotImplemented)
-    }
-    fn close(&mut self) -> Result<(), BusError> {
-        Err(BusError::NotImplemented)
-    }
-    fn read(&mut self, _out: &mut [u8]) -> Result<usize, BusError> {
-        Err(BusError::NotImplemented)
-    }
-    fn write(&mut self, _data: &[u8]) -> Result<usize, BusError> {
-        Err(BusError::NotImplemented)
-    }
-    fn poll(&mut self) -> Result<BusReady, BusError> {
-        Err(BusError::NotImplemented)
-    }
-    fn kind(&self) -> BusKind {
-        BusKind::Ring3Process
     }
 }
 
