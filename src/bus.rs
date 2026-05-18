@@ -110,6 +110,8 @@ pub struct SoftwareBus {
     write_len: usize,
     read_pos: usize,
     open_state: bool,
+    role: SoftHsmRole,                       // D-07 active role  Phase 2 backward compat 기본 Echo
+    aes_state: Option<SoftHsmAesGcmState>,   // D-12 AesGcm 만 Some  Echo/Blake3 는 None
 }
 
 impl SoftwareBus {
@@ -119,16 +121,55 @@ impl SoftwareBus {
             write_len: 0,
             read_pos: 0,
             open_state: false,
+            role: SoftHsmRole::Echo,
+            aes_state: None,
         }
     }
 }
 
 impl BusDriver for SoftwareBus {
-    fn open(&mut self, _init: &[u8]) -> Result<(), BusError> {
+    fn open(&mut self, init: &[u8]) -> Result<(), BusError> {
         if self.open_state {
             return Err(BusError::AlreadyOpen);
         }
-        // D-10: _init 슬라이스 무시 (loopback echo 는 init 없음).
+        // init_blob[0] = role discriminant  빈 슬라이스는 Phase 2 호환 Echo
+        let role = if init.is_empty() {
+            SoftHsmRole::Echo
+        } else {
+            match init[0] {
+                0 => SoftHsmRole::Echo,
+                1 => SoftHsmRole::Blake3,
+                2 => SoftHsmRole::AesGcm,
+                _ => return Err(BusError::BadInit),
+            }
+        };
+        // init_blob[1..] trailing zeros 강제  forward-reserve (Phase 5 attestation 헤드룸)
+        let mut i = 1usize;
+        while i < init.len() {
+            if init[i] != 0 {
+                return Err(BusError::BadInit);
+            }
+            i += 1;
+        }
+        // AesGcm 만 capability::rand_bytes 로 32B 키 prime
+        if matches!(role, SoftHsmRole::AesGcm) {
+            let mut key_bytes = [0u8; 32];
+            // SAFETY  BSP 단일 코어  capability::init_prng 는 부팅 시 완료 (Phase 1 D-05)
+            unsafe {
+                rand_bytes(&mut key_bytes).map_err(|_| BusError::Internal)?;
+            }
+            self.aes_state = Some(SoftHsmAesGcmState {
+                key: Secret::new(key_bytes),
+                nonce_counter: 0,
+            });
+            // Pitfall 4  Secret::new 가 소유권을 가져갔어도 스택 슬롯 명시 zeroize
+            key_bytes.zeroize();
+        } else {
+            // Echo / Blake3 는 aes_state 없음  invariant tighten (재-open 방어)
+            self.aes_state = None;
+        }
+        // commit (Phase 2 reset 의미 보존)
+        self.role = role;
         self.ring = [0u8; SW_BUS_BUF];
         self.write_len = 0;
         self.read_pos = 0;
