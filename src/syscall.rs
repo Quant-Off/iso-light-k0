@@ -146,6 +146,7 @@ pub enum SyscallNum {
     HsmEnumerate = 9, // Phase 1: 부착된 슬롯 enumerate (post-attach CAP 검사)
     HsmWrite = 10,    // Phase 3: USE cap → SoftHSM mode-aware write (D-02)
     HsmRelay = 11,    // Phase 3: src(RELAY_SRC) + dst(RELAY_DST) dual-cap kernel-internal transfer (D-03)
+    HsmRead = 12,     // Phase 4: USE cap → wire frame response 회수 (D-06)
 }
 
 /// 사용자에 노출되는 음수 에러 코드 (Linux errno 와 호환되지 않음, 자체 ABI).
@@ -318,6 +319,7 @@ extern "C" fn dispatch(ctx: &mut SyscallContext) {
         x if x == SyscallNum::HsmEnumerate as u64 => crate::hsm_registry::handle_enumerate(ctx),
         x if x == SyscallNum::HsmWrite as u64 => crate::hsm_registry::handle_write(ctx),
         x if x == SyscallNum::HsmRelay as u64 => crate::hsm_registry::handle_relay(ctx),
+        x if x == SyscallNum::HsmRead as u64 => crate::hsm_registry::handle_read(ctx),
         // IpcCall/IpcRecv/IpcReply/CapRequest 는 Phase B 에서 와이어업.
         x if x == SyscallNum::IpcCall as u64
             || x == SyscallNum::IpcRecv as u64
