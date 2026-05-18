@@ -241,10 +241,9 @@ impl HsmRegistry {
         matches!(self.slots[raw].state, HsmSlotState::Empty)
     }
 
-    // Phase 2 boot smoke 전용 슬롯 bus 접근자 (T-02-03 observability + 루프백 echo 진입점).
-    // 일반 syscall 경로는 attach/detach 만 사용 — 본 메서드는 in-kernel 스모크 전용이며
-    // 릴리스 빌드에서는 컴파일에서 제거됨.
-    #[cfg(debug_assertions)]
+    // Phase 3 syscall 슬롯 bus 접근자  handle_write / handle_relay 가 USE / RELAY_SRC / RELAY_DST
+    // 인증 통과 후 slot.bus.read / write 호출하기 위해 release 빌드에서도 활성.
+    // Phase 2 boot smoke (T-02-03 observability) 진입점도 동일 메서드 공용.
     pub fn slot_bus_mut(&mut self, idx: usize) -> Option<&mut BusInstance> {
         if idx >= HSM_MAX_SLOTS {
             return None;
@@ -683,4 +682,14 @@ pub fn handle_enumerate(ctx: &mut SyscallContext) -> u64 {
 
     cap.zeroize();
     n as u64
+}
+
+// Plan-03 Task-1 임시 stub  Task-2 가 실 본문으로 교체
+pub fn handle_write(_ctx: &mut SyscallContext) -> u64 {
+    SyscallError::Internal.as_rax()
+}
+
+// Plan-03 Task-1 임시 stub  Task-2 가 실 본문으로 교체
+pub fn handle_relay(_ctx: &mut SyscallContext) -> u64 {
+    SyscallError::Internal.as_rax()
 }
