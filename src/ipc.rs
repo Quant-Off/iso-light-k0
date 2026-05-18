@@ -18,7 +18,7 @@
 //!   - 페이로드 길이 범위 검사로 버퍼 오버플로 방지
 //!   - 메시지 시퀀스 번호로 재생 공격(replay attack) 기초 방어
 
-use crate::capability::{Capability, EP_CRYPTO, EP_SIGN, EP_SYSTEM, EndpointId, Rights};
+use crate::capability::{Capability, EP_CRYPTO, EP_LUMEN_WIRE, EP_SIGN, EP_SYSTEM, EndpointId, Rights};
 use zeroize::volatile::secure_zero;
 use zeroize::{Secret, Zeroize};
 
@@ -588,6 +588,8 @@ pub unsafe fn init() {
     let _ = reg.register(EP_CRYPTO, Rights::CALL);
     // EP_SIGN: CALL 권한 필요 (ML-DSA PQ 서명 서비스)
     let _ = reg.register(EP_SIGN, Rights::CALL);
+    // EP_LUMEN_WIRE: Phase 4 Ring 3 lumen wire endpoint — Ring3ProcessBus::open endpoint_exists 게이트 통과 (Pitfall 5)
+    let _ = reg.register(EP_LUMEN_WIRE, Rights::CALL);
 }
 
 /// 메시지를 전송하고 응답을 동기적으로 대기함 (Synchronous Call).

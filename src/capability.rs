@@ -76,6 +76,7 @@ impl EndpointId {
 pub const EP_SYSTEM: EndpointId = EndpointId(0x0000); // 커널 시스템 콜
 pub const EP_CRYPTO: EndpointId = EndpointId(0x0001); // 암호화 서비스
 pub const EP_SIGN: EndpointId = EndpointId(0x0002);   // ML-DSA PQ 서명 서비스
+pub const EP_LUMEN_WIRE: EndpointId = EndpointId(0x0003); // Phase 4 Ring 3 lumen wire endpoint (D-13)
 
 //
 // Capability 토큰
