@@ -30,7 +30,7 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 
 use aes::AES256GCM;
-use blake::Blake3;
+use blake::{Blake3, ct_eq_slice};
 
 //
 // syscall 번호 (iso-light-k0 src/syscall.rs::SyscallNum 와 동기 유지)
@@ -68,6 +68,30 @@ unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
             in("rdi") a0,
             in("rsi") a1,
             in("rdx") a2,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    // Phase 4 신규  sys_hsm_attach 의 4번째 인자 (out_ptr) 를 r8 로 전달
+    // src/hsm_registry.rs::handle_attach line 483 `let out_ptr = ctx.r8;` 와 ABI 일관
+    // Linux 의 r10 미사용  iso-light-k0 syscall ABI 가 r8 슬롯 채택 (Phase 1 D-15)
+    let ret: u64;
+    // SAFETY: syscall3 와 동일 RCX/R11 만 clobber sysret 후 정상 복귀
+    unsafe {
+        asm!(
+            "syscall",
+            in("rax") num,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r8") a3,
             lateout("rax") ret,
             lateout("rcx") _,
             lateout("r11") _,
@@ -269,6 +293,170 @@ fn check_aes256_gcm() {
 }
 
 //
+// 검증 #6 Phase 4 Wire Contract 종단 검증 (D-14 8-step)
+//
+/// Phase 4 종단 검증  Ring 3 lumen 이 wire contract 의 실 클라이언트로 동작함을 실증
+///
+/// 8-step 시퀀스:
+///   1) cap_blake3 = sys_hsm_attach(Software, init=[ROLE_BLAKE3=1])
+///   2) cap_wire   = sys_hsm_attach(Ring3Process, init=EP_LUMEN_WIRE.to_le_bytes())
+///   3) wire frame Blake3Hash 빌드 (16B header + 16B cap_blake3 + 12B input)
+///   4) sys_hsm_write(cap_wire, frame, 44)
+///   5) sys_hsm_read(cap_wire, response, 4096)
+///   6) response header parse (magic / cmd / status / payload_len 검증)
+///   7) elib-k0-nt Blake3::hash(input) 직접 호출  expected 32B digest
+///   8) ct_eq_slice 동일 비트 일치 검증  WIRE_PHASE4_OK marker 또는 WIRE_PHASE4_FAIL
+fn wire_blake3_phase4_test() {
+    const SYS_HSM_ATTACH: u64 = 7;
+    const SYS_HSM_WRITE: u64 = 10;
+    const SYS_HSM_READ: u64 = 12;
+    const BUS_SOFTWARE: u64 = 0;
+    const BUS_RING3PROCESS: u64 = 1;
+    const ROLE_BLAKE3: u8 = 1;
+    const EP_LUMEN_WIRE_RAW: u16 = 0x0003;
+    const WIRE_FRAME_MAX_LOCAL: usize = 4096;
+
+    // BSS 거주 buffer  Pitfall 7 회피 (stack 8 KiB 부담 0)
+    static mut FRAME_BUF: [u8; WIRE_FRAME_MAX_LOCAL] = [0u8; WIRE_FRAME_MAX_LOCAL];
+    static mut RESPONSE_BUF: [u8; WIRE_FRAME_MAX_LOCAL] = [0u8; WIRE_FRAME_MAX_LOCAL];
+
+    // (1) cap_blake3 attach
+    let init_blake3 = [ROLE_BLAKE3];
+    let mut cap_blake3 = [0u8; 16];
+    // SAFETY: init_blake3 / cap_blake3 는 stack-local 유효 슬라이스
+    let rax = unsafe {
+        syscall4(
+            SYS_HSM_ATTACH,
+            BUS_SOFTWARE,
+            init_blake3.as_ptr() as u64,
+            init_blake3.len() as u64,
+            cap_blake3.as_mut_ptr() as u64,
+        )
+    };
+    if (rax as i64) < 0 {
+        write_stderr(b"WIRE_PHASE4_FAIL: cap_blake3 attach\n");
+        exit(1);
+    }
+
+    // (2) cap_wire attach  EP_LUMEN_WIRE endpoint_exists 게이트 통과
+    let init_wire = EP_LUMEN_WIRE_RAW.to_le_bytes();
+    let mut cap_wire = [0u8; 16];
+    // SAFETY: 동상  init_wire 는 2 byte stack array
+    let rax = unsafe {
+        syscall4(
+            SYS_HSM_ATTACH,
+            BUS_RING3PROCESS,
+            init_wire.as_ptr() as u64,
+            init_wire.len() as u64,
+            cap_wire.as_mut_ptr() as u64,
+        )
+    };
+    if (rax as i64) < 0 {
+        write_stderr(b"WIRE_PHASE4_FAIL: cap_wire attach\n");
+        exit(1);
+    }
+
+    // (3) Wire frame Blake3Hash build  postcard 우회 수동 byte layout
+    let input: &[u8] = b"PHASE4_INPUT";
+    let payload_len: u16 = 16 + input.len() as u16; // 28
+    let frame_len: usize = 16 + payload_len as usize; // 44
+
+    // SAFETY: BSP 단일 Ring 3 process  FRAME_BUF 동시 접근 없음
+    unsafe {
+        let buf = &mut *(&raw mut FRAME_BUF);
+        buf[0..4].copy_from_slice(b"LWK0");
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes()); // version = 1
+        buf[6..8].copy_from_slice(&0x0010u16.to_le_bytes()); // cmd = Blake3Hash
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // req_id
+        buf[12..14].copy_from_slice(&payload_len.to_le_bytes());
+        buf[14..16].copy_from_slice(&0u16.to_le_bytes()); // request status = 0
+        buf[16..32].copy_from_slice(&cap_blake3);
+        buf[32..32 + input.len()].copy_from_slice(input);
+    }
+
+    // (4) sys_hsm_write(cap_wire, frame, 44)
+    // SAFETY: FRAME_BUF 의 frame_len 길이 슬라이스만 노출  cap_wire 는 16 byte
+    let rax = unsafe {
+        let buf_ptr = (&raw const FRAME_BUF) as *const u8;
+        syscall3(
+            SYS_HSM_WRITE,
+            cap_wire.as_ptr() as u64,
+            buf_ptr as u64,
+            frame_len as u64,
+        )
+    };
+    if (rax as i64) < 0 {
+        write_stderr(b"WIRE_PHASE4_FAIL: hsm_write\n");
+        exit(1);
+    }
+
+    // (5) sys_hsm_read(cap_wire, response, 4096)
+    // SAFETY: RESPONSE_BUF 의 WIRE_FRAME_MAX 윈도우만 노출
+    let n = unsafe {
+        let resp_ptr = (&raw mut RESPONSE_BUF) as *mut u8;
+        syscall3(
+            SYS_HSM_READ,
+            cap_wire.as_ptr() as u64,
+            resp_ptr as u64,
+            WIRE_FRAME_MAX_LOCAL as u64,
+        )
+    };
+    if (n as i64) < 0 {
+        write_stderr(b"WIRE_PHASE4_FAIL: hsm_read\n");
+        exit(1);
+    }
+    let n = n as usize;
+
+    // (6) Response header parse  magic / cmd / status / payload_len 검증
+    // SAFETY: 동상  RESPONSE_BUF 첫 16 byte read-only
+    let (resp_magic, resp_cmd, resp_status, resp_payload_len) = unsafe {
+        let buf = &*(&raw const RESPONSE_BUF);
+        let m = [buf[0], buf[1], buf[2], buf[3]];
+        let c = u16::from_le_bytes([buf[6], buf[7]]);
+        let pl = u16::from_le_bytes([buf[12], buf[13]]);
+        let s = u16::from_le_bytes([buf[14], buf[15]]);
+        (m, c, s, pl)
+    };
+    if &resp_magic != b"LWK0"
+        || resp_cmd != (0x0010u16 | 0x8000u16)
+        || resp_status != 0
+        || resp_payload_len != 32
+        || n != 48
+    {
+        write_stderr(b"WIRE_PHASE4_FAIL: response header mismatch\n");
+        exit(1);
+    }
+
+    // (7) elib-k0-nt::blake::Blake3 직접 호출  expected 32B digest
+    let mut hasher = Blake3::new();
+    hasher.update(input);
+    let expected = match hasher.finalize() {
+        Ok(d) => d,
+        Err(_) => {
+            write_stderr(b"WIRE_PHASE4_FAIL: blake3 host\n");
+            exit(1);
+        }
+    };
+    let exp_slice = expected.as_slice();
+    if exp_slice.len() != 32 {
+        write_stderr(b"WIRE_PHASE4_FAIL: blake3 len\n");
+        exit(1);
+    }
+
+    // (8) ct_eq_slice 동일 비트 일치 검증
+    // SAFETY: RESPONSE_BUF[16..48] read-only 32 byte slice
+    let eq: u8 = unsafe {
+        let buf = &*(&raw const RESPONSE_BUF);
+        ct_eq_slice(&buf[16..48], exp_slice).unwrap_u8()
+    };
+    if eq != 1 {
+        write_stderr(b"WIRE_PHASE4_FAIL: digest mismatch\n");
+        exit(1);
+    }
+    write_stderr(b"WIRE_PHASE4_OK\n");
+}
+
+//
 // 진입점
 //
 /// 사용자 진입점 — `process::enter_ring3()` 가 ELF entry RIP 로 점프함.
@@ -284,6 +472,7 @@ pub unsafe extern "C" fn _start() -> ! {
     check_ed25519();
     check_x25519();
     check_aes256_gcm();
+    wire_blake3_phase4_test();
 
     write_stderr(b"[iso-user-lumen] all wire-compat checks passed\n");
     exit(0);
