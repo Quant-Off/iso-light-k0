@@ -2,6 +2,7 @@ use crate::capability::EndpointId;
 use crate::capability::rand_bytes;
 use aes::{AES256GCM, GCM_NONCE_SIZE, GCM_TAG_SIZE};
 use blake::{BLAKE3_OUT_LEN, Blake3};
+use serde::{Deserialize, Serialize};
 use zeroize::Secret;
 use zeroize::Zeroize;
 
@@ -9,9 +10,82 @@ use zeroize::Zeroize;
 // 상수 / 컴파일-타임 불변식
 //
 
-pub const BUS_INSTANCE_MAX: usize = 160; // Phase 3 Plan-01  SoftwareBus + role(1) + Option<SoftHsmAesGcmState>(~48) fit  16B headroom for Phase 5 attestation
+// Phase 3 Plan-01 SoftwareBus + role(1) + Option<SoftHsmAesGcmState>(~48) 수용
+// Phase 4 Plan 01 Ring3ProcessBus 가 WIRE_FRAME_MAX (4096) + response_len(2) + endpoint(2) + open_state(1) + padding 을
+// 인라인 보유하므로 4224 로 확장 (RESEARCH Pitfall 2 + Pattern 3)
+pub const BUS_INSTANCE_MAX: usize = 4224;
 pub const MAX_BUS_INIT_BLOB: usize = 32; // PLANNER CHOICE Plan-01 (RESEARCH §12 #2)
 pub const SW_BUS_BUF: usize = 64; // PLANNER CHOICE Plan-01 (RESEARCH §12 #3)
+
+//
+// Phase 4 Plan 01 Lumen Wire Contract ABI 표면 (D-01, D-02, D-03, D-17)
+//
+
+/// 와이어 프레임 최대 크기 (D-02, RESEARCH Pattern 1)
+pub const WIRE_FRAME_MAX: usize = 4096;
+
+/// 와이어 페이로드 최대 크기 (= WIRE_FRAME_MAX - 16B 헤더)
+pub const WIRE_PAYLOAD_MAX: usize = WIRE_FRAME_MAX - 16;
+
+/// 와이어 프레임 magic 4 bytes (D-01)
+pub const WIRE_MAGIC: [u8; 4] = *b"LWK0";
+
+/// 와이어 프로토콜 버전 (D-01)
+pub const WIRE_VERSION: u16 = 0x0001;
+
+/// 응답 프레임을 가리키는 cmd MSB (RESEARCH Pattern 2)
+pub const WIRE_CMD_RESPONSE_BIT: u16 = 0x8000;
+
+/// 16-byte fixed wire frame 헤더 (D-01)
+///
+/// `#[repr(C)]` 으로 ABI 고정, postcard 의 varint 함정 회피를 위해 모든 정수 필드는
+/// `postcard::fixint::le` 어댑터로 little-endian 정수 직렬화를 강제한다 (RESEARCH Pitfall 1)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireFrameHeader {
+    pub magic: [u8; 4],
+    #[serde(with = "postcard::fixint::le")]
+    pub version: u16,
+    #[serde(with = "postcard::fixint::le")]
+    pub cmd: u16,
+    #[serde(with = "postcard::fixint::le")]
+    pub req_id: u32,
+    #[serde(with = "postcard::fixint::le")]
+    pub payload_len: u16,
+    #[serde(with = "postcard::fixint::le")]
+    pub status: u16,
+}
+
+/// 와이어 cmd 카탈로그 5 종 (D-03)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
+#[non_exhaustive]
+pub enum WireCmd {
+    Ping = 0x0001,
+    Blake3Hash = 0x0010,
+    AttestSubmit = 0x0040,
+    Status = 0x0080,
+    Error = 0xFFFF,
+}
+
+/// 와이어 status 코드 5 종 (D-17)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
+#[non_exhaustive]
+pub enum WireStatus {
+    Ok = 0,
+    BadFrame = 1,
+    UnknownCmd = 2,
+    Denied = 3,
+    Internal = 4,
+}
+
+// 컴파일-타임 size/align 핀 (RESEARCH Pattern 1 + PATTERNS SH-4)
+const _: () = assert!(core::mem::size_of::<WireFrameHeader>() == 16);
+const _: () = assert!(core::mem::align_of::<WireFrameHeader>() == 4);
+const _: () = assert!(core::mem::size_of::<WireCmd>() == 2);
+const _: () = assert!(core::mem::size_of::<WireStatus>() == 2);
+const _: () = assert!(WIRE_PAYLOAD_MAX + 16 == WIRE_FRAME_MAX);
 
 //
 // BusKind — 외부 HSM 트랜스포트 분류 (BUS-02). #[non_exhaustive] 으로 후속 페이즈 variant 추가 backward-compat.
@@ -327,6 +401,10 @@ impl Drop for SoftwareBus {
 pub struct Ring3ProcessBus {
     endpoint: EndpointId,
     open_state: bool,
+    // Phase 4 Plan 01 single-flight 응답 버퍼 (D-08, Pattern 3)
+    // raw [u8; N] 사용 — Secret::new 가 non-const 라 BusInstance::new const fn 깨짐 회피 (Pitfall 4)
+    pending_response: [u8; WIRE_FRAME_MAX],
+    response_len: u16,
 }
 
 impl Ring3ProcessBus {
@@ -334,6 +412,8 @@ impl Ring3ProcessBus {
         Self {
             endpoint: EndpointId::INVALID,
             open_state: false,
+            pending_response: [0u8; WIRE_FRAME_MAX],
+            response_len: 0,
         }
     }
 }
@@ -401,6 +481,10 @@ impl BusDriver for Ring3ProcessBus {
 
 impl Zeroize for Ring3ProcessBus {
     fn zeroize(&mut self) {
+        // Phase 4 Plan 01 bytes-first 순서 — 민감할 수 있는 응답 페이로드를 먼저 비운 뒤
+        // 메타데이터를 reset (PATTERNS SH-3, T-04-04 mitigation)
+        self.pending_response.zeroize();
+        self.response_len = 0;
         // u16 endpoint id 는 RESEARCH §6 기준 non-secret 이나 INVALID 로 reset 이 cleaner invariant
         self.endpoint = EndpointId::INVALID;
         self.open_state = false;
