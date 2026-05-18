@@ -49,10 +49,8 @@ impl HsmRights {
     pub const USE: Self = Self(1 << 0);
     pub const ENUMERATE: Self = Self(1 << 1);
     pub const REVOKE: Self = Self(1 << 2);
-    #[allow(dead_code)]
-    pub const RELAY_SRC: Self = Self(1 << 3); // Phase 3 reserved
-    #[allow(dead_code)]
-    pub const RELAY_DST: Self = Self(1 << 4); // Phase 3 reserved
+    pub const RELAY_SRC: Self = Self(1 << 3); // Phase 3 active (handle_attach 사용 개시)
+    pub const RELAY_DST: Self = Self(1 << 4); // Phase 3 active (handle_attach 사용 개시)
     #[allow(dead_code)]
     pub const NETWORK_ATTACH: Self = Self(1 << 5); // Phase 6 reserved
 }
@@ -537,7 +535,8 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
             r.attach(
                 bus_kind,
                 init_slice,
-                HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE,
+                // Phase 3 Risk #7  RELAY_SRC/RELAY_DST 비트 활성화  Phase 1 D-03 reserved 비트 사용 개시
+                HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE | HsmRights::RELAY_SRC | HsmRights::RELAY_DST,
             )
         })
     } {
