@@ -203,13 +203,67 @@ impl BusDriver for SoftwareBus {
         if !self.open_state {
             return Err(BusError::NotOpen);
         }
-        // Pitfall 6 — overflow 는 정직한 에러로 surface, silent drop 금지.
-        if data.len() > SW_BUS_BUF.saturating_sub(self.write_len) {
-            return Err(BusError::BufferTooSmall);
+        match self.role {
+            // Echo  Phase 2 loopback echo 본문 verbatim 보존 (INV-3 regression guard)
+            SoftHsmRole::Echo => {
+                // Pitfall 6  overflow 는 정직한 에러로 surface, silent drop 금지
+                if data.len() > SW_BUS_BUF.saturating_sub(self.write_len) {
+                    return Err(BusError::BufferTooSmall);
+                }
+                self.ring[self.write_len..self.write_len + data.len()].copy_from_slice(data);
+                self.write_len += data.len();
+                Ok(data.len())
+            }
+            // Blake3  hasher 빌더 → 32B digest → ring overwrite  digest 는 SecureBuffer Drop 으로 zeroize
+            SoftHsmRole::Blake3 => {
+                // Pitfall 6  컴파일-타임 assert 가 보장하지만 defense-in-depth
+                if SW_BUS_BUF < BLAKE3_OUT_LEN {
+                    return Err(BusError::BufferTooSmall);
+                }
+                let mut hasher = Blake3::new();
+                hasher.update(data);
+                let digest = hasher.finalize().map_err(|_| BusError::Internal)?;
+                self.ring[..BLAKE3_OUT_LEN]
+                    .copy_from_slice(&digest.as_slice()[..BLAKE3_OUT_LEN]);
+                self.write_len = BLAKE3_OUT_LEN;
+                self.read_pos = 0;
+                Ok(BLAKE3_OUT_LEN)
+            }
+            // AesGcm  counter 증가 → encrypt out-param → ring 에 nonce||ct||tag 직렬화  stack nonce/tag 명시 zeroize
+            SoftHsmRole::AesGcm => {
+                let state = self.aes_state.as_mut().ok_or(BusError::Internal)?;
+                // D-12 fail-stop  counter overflow = (key, nonce) 재사용 차단
+                if state.nonce_counter == u64::MAX {
+                    return Err(BusError::Internal);
+                }
+                // Pitfall 6  ring fit honest surface
+                let total = data.len() + GCM_NONCE_SIZE + GCM_TAG_SIZE;
+                if total > SW_BUS_BUF {
+                    return Err(BusError::BufferTooSmall);
+                }
+                // counter 단조 증가  위 == u64::MAX 가드로 wrap 미발생
+                state.nonce_counter = state.nonce_counter.wrapping_add(1);
+                let mut nonce = [0u8; GCM_NONCE_SIZE];
+                nonce[..8].copy_from_slice(&state.nonce_counter.to_le_bytes());
+                let cipher = AES256GCM::new(state.key.expose());
+                let mut tag = [0u8; GCM_TAG_SIZE];
+                cipher.encrypt(
+                    &nonce,
+                    &[],
+                    data,
+                    &mut self.ring[GCM_NONCE_SIZE..GCM_NONCE_SIZE + data.len()],
+                    &mut tag,
+                );
+                self.ring[..GCM_NONCE_SIZE].copy_from_slice(&nonce);
+                self.ring[GCM_NONCE_SIZE + data.len()..total].copy_from_slice(&tag);
+                self.write_len = total;
+                self.read_pos = 0;
+                // Pitfall 4  stack-local 명시 zeroize
+                nonce.zeroize();
+                tag.zeroize();
+                Ok(total)
+            }
         }
-        self.ring[self.write_len..self.write_len + data.len()].copy_from_slice(data);
-        self.write_len += data.len();
-        Ok(data.len())
     }
 
     fn poll(&mut self) -> Result<BusReady, BusError> {
@@ -231,9 +285,15 @@ impl BusDriver for SoftwareBus {
     }
 }
 
+// Zeroize cascade (D-15)  secrets-first  key → discriminant reset → ring → metadata
 impl Zeroize for SoftwareBus {
     fn zeroize(&mut self) {
-        // bytes-first, metadata-last (I-3 token-first ordering 일관)
+        if let Some(state) = self.aes_state.as_mut() {
+            state.key.zeroize();
+            state.nonce_counter = 0;
+        }
+        self.aes_state = None;
+        self.role = SoftHsmRole::Echo;
         self.ring.zeroize();
         self.write_len = 0;
         self.read_pos = 0;
