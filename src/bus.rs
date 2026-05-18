@@ -1,11 +1,15 @@
 use crate::capability::EndpointId;
+use crate::capability::rand_bytes;
+use aes::{AES256GCM, GCM_NONCE_SIZE, GCM_TAG_SIZE};
+use blake::{BLAKE3_OUT_LEN, Blake3};
+use zeroize::Secret;
 use zeroize::Zeroize;
 
 //
 // 상수 / 컴파일-타임 불변식
 //
 
-pub const BUS_INSTANCE_MAX: usize = 96; // PLANNER CHOICE Plan-01 (RESEARCH §2: SoftwareBus exact fit)
+pub const BUS_INSTANCE_MAX: usize = 160; // Phase 3 Plan-01  SoftwareBus + role(1) + Option<SoftHsmAesGcmState>(~48) fit  16B headroom for Phase 5 attestation
 pub const MAX_BUS_INIT_BLOB: usize = 32; // PLANNER CHOICE Plan-01 (RESEARCH §12 #2)
 pub const SW_BUS_BUF: usize = 64; // PLANNER CHOICE Plan-01 (RESEARCH §12 #3)
 
@@ -65,6 +69,36 @@ pub trait BusDriver {
     fn write(&mut self, data: &[u8]) -> Result<usize, BusError>;
     fn poll(&mut self) -> Result<BusReady, BusError>;
     fn kind(&self) -> BusKind;
+}
+
+//
+// SoftHsmRole — SoftwareBus 의 mode-aware 디스패치 키 (D-07)  Echo 는 Phase 2 호환, Blake3/AesGcm 가 Phase 3 신규
+//
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum SoftHsmRole {
+    Echo = 0,
+    Blake3 = 1,
+    AesGcm = 2,
+}
+
+//
+// SoftHsmAesGcmState — AesGcm 모드 비밀 상태 (D-12)  key 는 attach 시점 fresh, nonce_counter 는 매 write 단조 증가
+//
+
+pub struct SoftHsmAesGcmState {
+    pub key: Secret<[u8; 32]>,
+    pub nonce_counter: u64,
+}
+
+impl Zeroize for SoftHsmAesGcmState {
+    // secrets-first  key zeroize 먼저 (Pitfall 4), counter 는 단순 평문 metadata
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+        self.nonce_counter = 0;
+    }
 }
 
 //
@@ -390,3 +424,11 @@ impl Drop for BusInstance {
 
 const _: () = assert!(core::mem::size_of::<BusKind>() == 1);
 const _: () = assert!(core::mem::size_of::<BusInstance>() <= BUS_INSTANCE_MAX);
+
+//
+// Phase 3 신규 size pin
+//
+
+const _: () = assert!(core::mem::size_of::<SoftHsmRole>() == 1);
+const _: () = assert!(SW_BUS_BUF >= BLAKE3_OUT_LEN);
+const _: () = assert!(SW_BUS_BUF >= GCM_NONCE_SIZE + GCM_TAG_SIZE);
