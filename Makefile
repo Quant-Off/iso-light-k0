@@ -98,7 +98,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 chan-dudect
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect
 
 all: iso
 
@@ -239,3 +239,15 @@ chan-dudect:
 #
 ci-phase3: check-alloc-zero check-alloc-bus qemu-smoke chan-dudect
 	@echo "[CI] Phase 3 ci 게이트 전체 통과 (CHAN-01..CHAN-04 + smoke + dudect)"
+
+#
+# Phase 4 CI 게이트 (WIRE-01..WIRE-05 + smoke + Phase 3 dudect 재사용)
+#
+# 4-leg 구조 (ci-phase3 mirror):
+#   1) check-alloc-zero  바이너리 alloc 심볼 0 (Phase 1 게이트 + postcard 4 패턴 추가)
+#   2) check-alloc-bus   src/bus.rs 소스 alloc 의존 0 (BUS-01 재검증)
+#   3) qemu-smoke        QEMU 부팅 + Phase 1/2/3 마커 + WIRE_PHASE4_OK 마커
+#   4) chan-dudect       elib-k0-nt chan_* CT timing balance (Phase 3 leg 재사용)
+#
+ci-phase4: check-alloc-zero check-alloc-bus qemu-smoke chan-dudect
+	@echo "[CI] Phase 4 ci 게이트 전체 통과 (WIRE-01..WIRE-05 + smoke + dudect)"
