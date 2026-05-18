@@ -1,7 +1,7 @@
 use constant_time::{Choice, CtEqOps, CtLess};
 use zeroize::Zeroize;
 
-use crate::bus::{BusDriver, BusInstance, BusKind, MAX_BUS_INIT_BLOB};
+use crate::bus::{BusDriver, BusInstance, BusKind, MAX_BUS_INIT_BLOB, WIRE_FRAME_MAX};
 use crate::capability::{self, CapError};
 use crate::syscall::{SyscallContext, SyscallError, is_user_address};
 
@@ -899,4 +899,107 @@ pub fn handle_relay(ctx: &mut SyscallContext) -> u64 {
         Ok(()) => 0u64,
         Err(_) => SyscallError::Internal.as_rax(),
     }
+}
+
+/// sys_hsm_read syscall 핸들러 — USE cap 으로 Ring3ProcessBus 의 pending wire frame 회수 (D-06)
+///
+/// # ABI
+/// `rdi` cap_ptr 16B HsmCapability
+/// `rsi` out_ptr 사용자 공간 회수 버퍼
+/// `rdx` out_len 16..=WIRE_FRAME_MAX
+///
+/// # Errors
+/// `SyscallError::BadArg` out_len 범위 위반
+/// `SyscallError::BadAddress` cap_ptr 또는 out_ptr 가 사용자 영역 외부
+/// `SyscallError::Denied` authenticate USE 실패
+/// `SyscallError::Internal` BusError 전 variant collapse (Pitfall 7)
+///
+/// 7-step shape (handle_detach SMAP-1 + handle_enumerate SMAP-2 + handle_write authenticate 합성):
+///   (1) Argument 추출
+///   (2) out_len CT 범위 검증 (16..=WIRE_FRAME_MAX, '<' / '==' 금지 — Pitfall 2 CT)
+///   (3) dual range — cap_ptr + out_ptr 양쪽 16B / out_len 범위 (Pitfall 3)
+///   (4) SMAP-1 cap copy (단일 stac/clac 윈도우, Pitfall 2)
+///   (5) authenticate(USE) (Phase 1 CT-AND, Pitfall 1 early-return 없음)
+///   (6) with_registry_mut → slot.bus.read(staging[..out_len]) — BusError 전 variant Internal collapse
+///   (7) SMAP-2 staging → user out_ptr (별도 stac/clac 윈도우) + 모든 exit path zeroize
+pub fn handle_read(ctx: &mut SyscallContext) -> u64 {
+    // (1) Argument 추출
+    let cap_ptr_va = ctx.rdi;
+    let out_ptr_va = ctx.rsi;
+    let out_len = ctx.rdx as usize;
+
+    // (2) out_len ∈ [16, WIRE_FRAME_MAX] CT 분기 — handle_write line 707-708 패턴 일관
+    //     ge_min  CtLess::lt(&15, &out_len)  ↔  out_len > 15  ↔  out_len ≥ 16
+    //     lt_max  CtLess::lt(&out_len, &(WIRE_FRAME_MAX + 1))  ↔  out_len ≤ WIRE_FRAME_MAX
+    let lt_max: u8 = CtLess::lt(&out_len, &(WIRE_FRAME_MAX + 1)).unwrap_u8();
+    let ge_min: u8 = CtLess::lt(&15usize, &out_len).unwrap_u8();
+    if (lt_max & ge_min) != 1 {
+        return SyscallError::BadArg.as_rax();
+    }
+
+    // (3) dual range — cap_ptr 16B + out_ptr 의 out_len byte 양쪽 (Pitfall 3)
+    let cap_size = core::mem::size_of::<HsmCapability>() as u64;
+    if !is_user_address(cap_ptr_va) || !is_user_address(cap_ptr_va.saturating_add(cap_size)) {
+        return SyscallError::BadAddress.as_rax();
+    }
+    if !is_user_address(out_ptr_va) || !is_user_address(out_ptr_va.saturating_add(out_len as u64))
+    {
+        return SyscallError::BadAddress.as_rax();
+    }
+
+    // (4) SMAP-1 cap copy — 단일 stac/clac 윈도우 (Pitfall 2, handle_detach line 588-598 미러)
+    let mut cap = HsmCapability::invalid();
+    // SAFETY: cap_ptr_va dual-range 검증 통과  copy 폭은 HsmCapability ABI 크기 16B
+    unsafe {
+        crate::cpu::stac();
+        core::ptr::copy_nonoverlapping(
+            cap_ptr_va as *const u8,
+            &mut cap as *mut HsmCapability as *mut u8,
+            core::mem::size_of::<HsmCapability>(),
+        );
+        crate::cpu::clac();
+    }
+
+    // (5) USE 인증 (Pitfall 1)  실패 시 user out 버퍼 미접근 + cap zeroize 후 Denied
+    // SAFETY: BSP single-core
+    let auth_ok = unsafe { with_registry(|r| r.authenticate(&cap, HsmRights::USE)) };
+    if !auth_ok {
+        cap.zeroize();
+        return SyscallError::Denied.as_rax();
+    }
+
+    // (6) staging + slot.bus.read — stack-local [u8; WIRE_FRAME_MAX]
+    //     RELAY_BUF 와 책임 분리 (RELAY_BUF 는 ingress write/relay 전용 D-13)
+    //     out_len ≤ WIRE_FRAME_MAX 가 step 2 에서 보장됨
+    let slot_idx = cap.slot.0 as usize;
+    let mut staging = [0u8; WIRE_FRAME_MAX];
+    // SAFETY: BSP single-core
+    let read_result = unsafe {
+        with_registry_mut(|r| match r.slot_bus_mut(slot_idx) {
+            Some(bus) => bus.read(&mut staging[..out_len]),
+            None => Err(crate::bus::BusError::Internal),
+        })
+    };
+    let bytes_read = match read_result {
+        Ok(n) => n,
+        Err(_) => {
+            // Pitfall 7  BusError 의 NotOpen / WireNotReady / BufferTooSmall / Internal 전 variant collapse
+            cap.zeroize();
+            staging.zeroize();
+            return SyscallError::Internal.as_rax();
+        }
+    };
+
+    // (7) SMAP-2 staging → user out_ptr  별도 stac/clac 윈도우 (Pitfall 2, handle_enumerate line 670-680 미러)
+    // SAFETY: out_ptr_va dual-range 검증 통과 (step 3)  bytes_read ≤ out_len ≤ WIRE_FRAME_MAX
+    unsafe {
+        crate::cpu::stac();
+        core::ptr::copy_nonoverlapping(staging.as_ptr(), out_ptr_va as *mut u8, bytes_read);
+        crate::cpu::clac();
+    }
+
+    // 모든 exit path zeroize (SH-3)  Ok path 도 cap + staging 명시 소거
+    cap.zeroize();
+    staging.zeroize();
+    bytes_read as u64
 }
