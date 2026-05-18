@@ -1,11 +1,15 @@
 use crate::capability::EndpointId;
+use crate::capability::rand_bytes;
+use aes::{AES256GCM, GCM_NONCE_SIZE, GCM_TAG_SIZE};
+use blake::{BLAKE3_OUT_LEN, Blake3};
+use zeroize::Secret;
 use zeroize::Zeroize;
 
 //
 // 상수 / 컴파일-타임 불변식
 //
 
-pub const BUS_INSTANCE_MAX: usize = 96; // PLANNER CHOICE Plan-01 (RESEARCH §2: SoftwareBus exact fit)
+pub const BUS_INSTANCE_MAX: usize = 160; // Phase 3 Plan-01  SoftwareBus + role(1) + Option<SoftHsmAesGcmState>(~48) fit  16B headroom for Phase 5 attestation
 pub const MAX_BUS_INIT_BLOB: usize = 32; // PLANNER CHOICE Plan-01 (RESEARCH §12 #2)
 pub const SW_BUS_BUF: usize = 64; // PLANNER CHOICE Plan-01 (RESEARCH §12 #3)
 
@@ -68,6 +72,36 @@ pub trait BusDriver {
 }
 
 //
+// SoftHsmRole — SoftwareBus 의 mode-aware 디스패치 키 (D-07)  Echo 는 Phase 2 호환, Blake3/AesGcm 가 Phase 3 신규
+//
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum SoftHsmRole {
+    Echo = 0,
+    Blake3 = 1,
+    AesGcm = 2,
+}
+
+//
+// SoftHsmAesGcmState — AesGcm 모드 비밀 상태 (D-12)  key 는 attach 시점 fresh, nonce_counter 는 매 write 단조 증가
+//
+
+pub struct SoftHsmAesGcmState {
+    pub key: Secret<[u8; 32]>,
+    pub nonce_counter: u64,
+}
+
+impl Zeroize for SoftHsmAesGcmState {
+    // secrets-first  key zeroize 먼저 (Pitfall 4), counter 는 단순 평문 metadata
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+        self.nonce_counter = 0;
+    }
+}
+
+//
 // SoftwareBus — 64-byte 루프백 echo (D-10). 비밀 페이로드 아님, 그러나 Phase 1 일관성으로 zeroize 명시.
 //
 
@@ -76,6 +110,8 @@ pub struct SoftwareBus {
     write_len: usize,
     read_pos: usize,
     open_state: bool,
+    role: SoftHsmRole,                       // D-07 active role  Phase 2 backward compat 기본 Echo
+    aes_state: Option<SoftHsmAesGcmState>,   // D-12 AesGcm 만 Some  Echo/Blake3 는 None
 }
 
 impl SoftwareBus {
@@ -85,16 +121,55 @@ impl SoftwareBus {
             write_len: 0,
             read_pos: 0,
             open_state: false,
+            role: SoftHsmRole::Echo,
+            aes_state: None,
         }
     }
 }
 
 impl BusDriver for SoftwareBus {
-    fn open(&mut self, _init: &[u8]) -> Result<(), BusError> {
+    fn open(&mut self, init: &[u8]) -> Result<(), BusError> {
         if self.open_state {
             return Err(BusError::AlreadyOpen);
         }
-        // D-10: _init 슬라이스 무시 (loopback echo 는 init 없음).
+        // init_blob[0] = role discriminant  빈 슬라이스는 Phase 2 호환 Echo
+        let role = if init.is_empty() {
+            SoftHsmRole::Echo
+        } else {
+            match init[0] {
+                0 => SoftHsmRole::Echo,
+                1 => SoftHsmRole::Blake3,
+                2 => SoftHsmRole::AesGcm,
+                _ => return Err(BusError::BadInit),
+            }
+        };
+        // init_blob[1..] trailing zeros 강제  forward-reserve (Phase 5 attestation 헤드룸)
+        let mut i = 1usize;
+        while i < init.len() {
+            if init[i] != 0 {
+                return Err(BusError::BadInit);
+            }
+            i += 1;
+        }
+        // AesGcm 만 capability::rand_bytes 로 32B 키 prime
+        if matches!(role, SoftHsmRole::AesGcm) {
+            let mut key_bytes = [0u8; 32];
+            // SAFETY  BSP 단일 코어  capability::init_prng 는 부팅 시 완료 (Phase 1 D-05)
+            unsafe {
+                rand_bytes(&mut key_bytes).map_err(|_| BusError::Internal)?;
+            }
+            self.aes_state = Some(SoftHsmAesGcmState {
+                key: Secret::new(key_bytes),
+                nonce_counter: 0,
+            });
+            // Pitfall 4  Secret::new 가 소유권을 가져갔어도 스택 슬롯 명시 zeroize
+            key_bytes.zeroize();
+        } else {
+            // Echo / Blake3 는 aes_state 없음  invariant tighten (재-open 방어)
+            self.aes_state = None;
+        }
+        // commit (Phase 2 reset 의미 보존)
+        self.role = role;
         self.ring = [0u8; SW_BUS_BUF];
         self.write_len = 0;
         self.read_pos = 0;
@@ -128,13 +203,67 @@ impl BusDriver for SoftwareBus {
         if !self.open_state {
             return Err(BusError::NotOpen);
         }
-        // Pitfall 6 — overflow 는 정직한 에러로 surface, silent drop 금지.
-        if data.len() > SW_BUS_BUF.saturating_sub(self.write_len) {
-            return Err(BusError::BufferTooSmall);
+        match self.role {
+            // Echo  Phase 2 loopback echo 본문 verbatim 보존 (INV-3 regression guard)
+            SoftHsmRole::Echo => {
+                // Pitfall 6  overflow 는 정직한 에러로 surface, silent drop 금지
+                if data.len() > SW_BUS_BUF.saturating_sub(self.write_len) {
+                    return Err(BusError::BufferTooSmall);
+                }
+                self.ring[self.write_len..self.write_len + data.len()].copy_from_slice(data);
+                self.write_len += data.len();
+                Ok(data.len())
+            }
+            // Blake3  hasher 빌더 → 32B digest → ring overwrite  digest 는 SecureBuffer Drop 으로 zeroize
+            SoftHsmRole::Blake3 => {
+                // Pitfall 6  컴파일-타임 assert 가 보장하지만 defense-in-depth
+                if SW_BUS_BUF < BLAKE3_OUT_LEN {
+                    return Err(BusError::BufferTooSmall);
+                }
+                let mut hasher = Blake3::new();
+                hasher.update(data);
+                let digest = hasher.finalize().map_err(|_| BusError::Internal)?;
+                self.ring[..BLAKE3_OUT_LEN]
+                    .copy_from_slice(&digest.as_slice()[..BLAKE3_OUT_LEN]);
+                self.write_len = BLAKE3_OUT_LEN;
+                self.read_pos = 0;
+                Ok(BLAKE3_OUT_LEN)
+            }
+            // AesGcm  counter 증가 → encrypt out-param → ring 에 nonce||ct||tag 직렬화  stack nonce/tag 명시 zeroize
+            SoftHsmRole::AesGcm => {
+                let state = self.aes_state.as_mut().ok_or(BusError::Internal)?;
+                // D-12 fail-stop  counter overflow = (key, nonce) 재사용 차단
+                if state.nonce_counter == u64::MAX {
+                    return Err(BusError::Internal);
+                }
+                // Pitfall 6  ring fit honest surface
+                let total = data.len() + GCM_NONCE_SIZE + GCM_TAG_SIZE;
+                if total > SW_BUS_BUF {
+                    return Err(BusError::BufferTooSmall);
+                }
+                // counter 단조 증가  위 == u64::MAX 가드로 wrap 미발생
+                state.nonce_counter = state.nonce_counter.wrapping_add(1);
+                let mut nonce = [0u8; GCM_NONCE_SIZE];
+                nonce[..8].copy_from_slice(&state.nonce_counter.to_le_bytes());
+                let cipher = AES256GCM::new(state.key.expose());
+                let mut tag = [0u8; GCM_TAG_SIZE];
+                cipher.encrypt(
+                    &nonce,
+                    &[],
+                    data,
+                    &mut self.ring[GCM_NONCE_SIZE..GCM_NONCE_SIZE + data.len()],
+                    &mut tag,
+                );
+                self.ring[..GCM_NONCE_SIZE].copy_from_slice(&nonce);
+                self.ring[GCM_NONCE_SIZE + data.len()..total].copy_from_slice(&tag);
+                self.write_len = total;
+                self.read_pos = 0;
+                // Pitfall 4  stack-local 명시 zeroize
+                nonce.zeroize();
+                tag.zeroize();
+                Ok(total)
+            }
         }
-        self.ring[self.write_len..self.write_len + data.len()].copy_from_slice(data);
-        self.write_len += data.len();
-        Ok(data.len())
     }
 
     fn poll(&mut self) -> Result<BusReady, BusError> {
@@ -156,9 +285,15 @@ impl BusDriver for SoftwareBus {
     }
 }
 
+// Zeroize cascade (D-15)  secrets-first  key → discriminant reset → ring → metadata
 impl Zeroize for SoftwareBus {
     fn zeroize(&mut self) {
-        // bytes-first, metadata-last (I-3 token-first ordering 일관)
+        if let Some(state) = self.aes_state.as_mut() {
+            state.key.zeroize();
+            state.nonce_counter = 0;
+        }
+        self.aes_state = None;
+        self.role = SoftHsmRole::Echo;
         self.ring.zeroize();
         self.write_len = 0;
         self.read_pos = 0;
@@ -390,3 +525,11 @@ impl Drop for BusInstance {
 
 const _: () = assert!(core::mem::size_of::<BusKind>() == 1);
 const _: () = assert!(core::mem::size_of::<BusInstance>() <= BUS_INSTANCE_MAX);
+
+//
+// Phase 3 신규 size pin
+//
+
+const _: () = assert!(core::mem::size_of::<SoftHsmRole>() == 1);
+const _: () = assert!(SW_BUS_BUF >= BLAKE3_OUT_LEN);
+const _: () = assert!(SW_BUS_BUF >= GCM_NONCE_SIZE + GCM_TAG_SIZE);
