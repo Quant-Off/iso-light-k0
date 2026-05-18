@@ -98,7 +98,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 chan-dudect
 
 all: iso
 
@@ -218,3 +218,24 @@ check-alloc-bus: build
 
 ci-phase2: check-alloc-zero check-alloc-bus qemu-smoke
 	@echo "[CI] Phase 2 ci 게이트 전체 통과 (BUS-01..BUS-04 + smoke)"
+
+#
+# Phase 3 host-side dudect leg
+#
+# elib-k0-nt sibling 크레이트의 chan_* CT 회귀 테스트  Welch t < 4.5 게이트
+#
+chan-dudect:
+	@cd /Library/Quant/Repository/projects/elib-k0-nt && $(CARGO) test -p constant-time --tests --release -- --ignored chan_
+	@echo "[CI] Phase 3 chan-dudect 게이트 통과"
+
+#
+# Phase 3 CI 게이트 (CHAN-01..CHAN-04 + smoke + dudect)
+#
+# 4-leg 구조 (ci-phase2 mirror + dudect leg):
+#   1) check-alloc-zero  바이너리 alloc 심볼 0 (Phase 1 게이트 재검증)
+#   2) check-alloc-bus   src/bus.rs 소스 alloc 의존 0 (BUS-01 재검증)
+#   3) qemu-smoke        QEMU 부팅 + Phase 1/2 마커 + CHAN_PHASE3_OK 마커
+#   4) chan-dudect       elib-k0-nt chan_* CT timing balance (Pitfall 1 + CHAN-04)
+#
+ci-phase3: check-alloc-zero check-alloc-bus qemu-smoke chan-dudect
+	@echo "[CI] Phase 3 ci 게이트 전체 통과 (CHAN-01..CHAN-04 + smoke + dudect)"
