@@ -11,6 +11,11 @@ use crate::syscall::{SyscallContext, SyscallError, is_user_address};
 
 pub const HSM_MAX_SLOTS: usize = 8;
 
+// CHAN_MAX — sys_hsm_write / sys_hsm_relay 의 단일 호출 data 길이 한도 (D-13)  4 KiB BSS 풋프린트
+pub const CHAN_MAX: usize = 4096; // PLANNER CHOICE Plan-02  ROADMAP SC #3 예시값  Phase 4 wire frame 도입 시 재검토
+const _: () = assert!(CHAN_MAX > 0);
+const _: () = assert!(CHAN_MAX <= 65536);
+
 // HsmCapability 의 ABI 정렬 크기는 16바이트 (u64 정렬 강제, prior art `Capability` 와 동일).
 // 16 옥텟 전부를 가시 필드로 채워 implicit padding 0 — CR-03 Ring0→Ring3 info-leak 봉쇄.
 // 레이아웃: token(0..8) + slot(8) + _pad0(9) + rights(10..12) + _pad(12) + _pad1(13..16).
@@ -44,10 +49,8 @@ impl HsmRights {
     pub const USE: Self = Self(1 << 0);
     pub const ENUMERATE: Self = Self(1 << 1);
     pub const REVOKE: Self = Self(1 << 2);
-    #[allow(dead_code)]
-    pub const RELAY_SRC: Self = Self(1 << 3); // Phase 3 reserved
-    #[allow(dead_code)]
-    pub const RELAY_DST: Self = Self(1 << 4); // Phase 3 reserved
+    pub const RELAY_SRC: Self = Self(1 << 3); // Phase 3 active (handle_attach 사용 개시)
+    pub const RELAY_DST: Self = Self(1 << 4); // Phase 3 active (handle_attach 사용 개시)
     #[allow(dead_code)]
     pub const NETWORK_ATTACH: Self = Self(1 << 5); // Phase 6 reserved
 }
@@ -385,6 +388,32 @@ pub unsafe fn with_registry_mut<R>(f: impl FnOnce(&mut HsmRegistry) -> R) -> R {
 }
 
 //
+// RELAY_BUF — sys_hsm_relay / sys_hsm_write 의 단일 인스턴스 staging buffer (D-13)
+//
+// D-13: Option B per RESEARCH §Risk #1  raw [u8; CHAN_MAX] + 명시 zeroize
+// Option B per RESEARCH §Open Q Risk #1  raw [u8; CHAN_MAX] + 명시 zeroize
+// Reason  Secret<T> 의 Drop 은 static lifetime 으로 절대 호출되지 않으므로 명시 zeroize 가 유일 보장
+// (zeroize::Zeroize for [u8; N] 는 volatile_write + memory_barrier 보장 — RESEARCH §zeroize)
+// BSP single-core + FMASK 재진입 차단 가정  SMP 도입 시 per-core RELAY_BUF 또는 spinlock 필요
+pub static mut RELAY_BUF: [u8; CHAN_MAX] = [0u8; CHAN_MAX];
+
+/// RELAY_BUF 에 대한 안전 래퍼  진입+이탈 양면 zeroize 보장 (D-14)
+///
+/// # Safety
+/// BSP single-core 진입점에서만 호출 가능  FMASK 재진입 차단으로 syscall dispatch 의 단일 진입을 invariant 로 가정
+/// SMP 도입 시 per-core RELAY_BUF 또는 spinlock 필요 (Pitfall 6)
+pub unsafe fn with_relay_buf<R>(f: impl FnOnce(&mut [u8; CHAN_MAX]) -> R) -> R {
+    // SAFETY: BSP single-core; with_registry_mut 와 동일 invariant
+    let buf = unsafe { &mut *(&raw mut RELAY_BUF) };
+    // D-14 entry zeroize  이전 호출자 잔재 차단 (Pitfall 4 pre-entry)
+    buf.zeroize();
+    let r = f(buf);
+    // D-14 exit zeroize  다음 호출자 진입 안전 + 본 호출 결과 청결
+    buf.zeroize();
+    r
+}
+
+//
 // 슬롯 정보 ABI (enumerate 출력 — 8바이트, _reserved 는 Phase 2/5 확장 슬롯)
 //
 
@@ -506,7 +535,8 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
             r.attach(
                 bus_kind,
                 init_slice,
-                HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE,
+                // Phase 3 Risk #7  RELAY_SRC/RELAY_DST 비트 활성화  Phase 1 D-03 reserved 비트 사용 개시
+                HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE | HsmRights::RELAY_SRC | HsmRights::RELAY_DST,
             )
         })
     } {
