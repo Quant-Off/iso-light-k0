@@ -533,6 +533,17 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     }
 
     //
+    // 14.9. 부트 시점 Phase 3 In-Kernel Inter-HSM Channel 스모크 테스트
+    //
+    // Blake3 src → AesGcm dst relay + ciphertext in-kernel 재계산 동치성
+    // 성공 시 qemu-test.sh 의 CHAN_PHASE3_OK 마커 게이트 통과 (Phase 1/2 마커 보존)
+    #[cfg(all(target_arch = "x86_64", debug_assertions))]
+    // SAFETY: Phase 2 smoke 완료 후 detach cascade 가 REGISTRY 를 비웠음
+    unsafe {
+        chan_phase3_smoke_test();
+    }
+
+    //
     // 15. 인터럽트 활성화 + 커널 메인 이벤트 루프
     //
     // IDT, GDT, TSS, PIC 초기화 완료 후 STI로 인터럽트 수신 시작
@@ -1228,6 +1239,215 @@ unsafe fn bus_phase2_smoke_test() {
             b"[iso-light-k0] BUS_PHASE2_OK marker (SoftwareBus loopback + detach cascade)",
             vga::Color::Green,
         );
+    }
+}
+
+// chan_phase3_smoke_test  Phase 3 in-kernel relay 라운드트립 검증  H4 모델 (D-22)  marker CHAN_PHASE3_OK
+#[cfg(all(target_arch = "x86_64", debug_assertions))]
+unsafe fn chan_phase3_smoke_test() {
+    use crate::bus::{BusDriver, BusInstance, BusKind, SoftHsmRole};
+    use aes::{AES256GCM, GCM_NONCE_SIZE, GCM_TAG_SIZE};
+    use blake::{BLAKE3_OUT_LEN, Blake3};
+    use hsm_registry::{HsmRights, attach_kernel_side, with_registry, with_registry_mut, with_relay_buf};
+
+    // (1) Blake3 src 슬롯 attach  rights = USE | REVOKE | RELAY_SRC
+    // SAFETY: capability::init_prng / REGISTRY static 모두 온라인  BSP 단일 코어
+    let cap_src = match unsafe {
+        attach_kernel_side(
+            BusKind::Software,
+            &[SoftHsmRole::Blake3 as u8],
+            HsmRights::USE | HsmRights::REVOKE | HsmRights::RELAY_SRC,
+        )
+    } {
+        Ok(c) => c,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (attach Blake3 src)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let src_slot = cap_src.slot.0 as usize;
+
+    // (2) AesGcm dst 슬롯 attach  rights = USE | REVOKE | RELAY_DST
+    // SAFETY: Phase 2 와 동일 invariant
+    let cap_dst = match unsafe {
+        attach_kernel_side(
+            BusKind::Software,
+            &[SoftHsmRole::AesGcm as u8],
+            HsmRights::USE | HsmRights::REVOKE | HsmRights::RELAY_DST,
+        )
+    } {
+        Ok(c) => c,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (attach AesGcm dst)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let dst_slot = cap_dst.slot.0 as usize;
+
+    // (3) src.write(b"PHASE3_INPUT")  Role::Blake3 → src.ring 에 32B digest 저장
+    let write_input: &[u8; 12] = b"PHASE3_INPUT";
+    // SAFETY: BSP 단일 코어; with_registry_mut 의 invariant 동일
+    let write_ok = unsafe {
+        with_registry_mut(|r| match r.slot_bus_mut(src_slot) {
+            Some(bus) => bus.write(write_input).is_ok(),
+            None => false,
+        })
+    };
+    if !write_ok {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (src.write)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (4) kernel-side relay  with_relay_buf 안에서 src.read 32B → dst.write 32B
+    // D-22 H4  syscall ABI 우회  with_relay_buf direct 진입  RELAY_BUF entry+exit zeroize 보장 (D-14)
+    // SAFETY: BSP single-core; with_relay_buf + with_registry_mut 는 disjoint static borrow
+    let relay_ok = unsafe {
+        with_relay_buf(|buf| {
+            let read_n = with_registry_mut(|r| match r.slot_bus_mut(src_slot) {
+                Some(bus) => bus.read(&mut buf[..BLAKE3_OUT_LEN]).unwrap_or(0),
+                None => 0,
+            });
+            if read_n != BLAKE3_OUT_LEN {
+                return false;
+            }
+            let write_n = with_registry_mut(|r| match r.slot_bus_mut(dst_slot) {
+                Some(bus) => bus.write(&buf[..BLAKE3_OUT_LEN]).unwrap_or(0),
+                None => 0,
+            });
+            // dst.write 의 AesGcm arm 은 32B input + 28B overhead = 60B 반환
+            write_n == BLAKE3_OUT_LEN + GCM_NONCE_SIZE + GCM_TAG_SIZE
+        })
+    };
+    if !relay_ok {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (relay)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (5) in-kernel 재계산 + slice ct_eq  dst.ring[..60] == AES256GCM(key, nonce_1, BLAKE3(input))
+    // RESEARCH §Risk #6  debug_aes_state / debug_ring 는 #[cfg(debug_assertions)] 노출  release 빌드 부재
+    // 5a — BLAKE3(b"PHASE3_INPUT") 직접 호출
+    let mut hasher = Blake3::new();
+    hasher.update(write_input);
+    let digest = match hasher.finalize() {
+        Ok(d) => d,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (blake3 recompute)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let mut blake3_out = [0u8; BLAKE3_OUT_LEN];
+    blake3_out.copy_from_slice(&digest.as_slice()[..BLAKE3_OUT_LEN]);
+
+    // 5b — dst 의 fresh key + counter==1 직접 노출 + expected ciphertext 합성 + dst.ring 와 비교
+    let mut expected: [u8; 60] = [0u8; 60]; // nonce(12) || ct(32) || tag(16)
+    let mut got: [u8; 60] = [0u8; 60];
+    // SAFETY: BSP 단일 코어; debug_assertions 만 진입 가능
+    let mismatch: u8 = unsafe {
+        with_registry_mut(|r| -> u8 {
+            let bus = match r.slot_bus_mut(dst_slot) {
+                Some(b) => b,
+                None => return 1,
+            };
+            // BusInstance::Software 케이스 직접 매치  Phase 2 BUS-04 enum-dispatch 일관
+            let sw = match bus {
+                BusInstance::Software(sw) => sw,
+                _ => return 1,
+            };
+            let state = match sw.debug_aes_state() {
+                Some(s) => s,
+                None => return 1,
+            };
+            // nonce 직렬화 (counter == 1; D-12)
+            let mut nonce = [0u8; GCM_NONCE_SIZE];
+            nonce[..8].copy_from_slice(&state.nonce_counter.to_le_bytes());
+            // expected: encrypt(key, nonce, blake3_out)
+            let cipher = AES256GCM::new(state.key.expose());
+            let mut tag = [0u8; GCM_TAG_SIZE];
+            expected[..GCM_NONCE_SIZE].copy_from_slice(&nonce);
+            cipher.encrypt(
+                &nonce,
+                &[],
+                &blake3_out,
+                &mut expected[GCM_NONCE_SIZE..GCM_NONCE_SIZE + BLAKE3_OUT_LEN],
+                &mut tag,
+            );
+            expected[GCM_NONCE_SIZE + BLAKE3_OUT_LEN..].copy_from_slice(&tag);
+            // got: dst.ring[..60]
+            got.copy_from_slice(&sw.debug_ring()[..60]);
+            // slice CT-eq via XOR-OR fold (Phase 2 main.rs:1149-1157 패턴, RESEARCH §Risk #8)
+            let mut diff: u8 = 0;
+            let mut i = 0;
+            while i < 60 {
+                diff |= expected[i] ^ got[i];
+                i += 1;
+            }
+            diff
+        })
+    };
+    if mismatch != 0 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (ciphertext mismatch)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (6) 성공 마커  qemu-test.sh CHAN_PHASE3_OK 게이트
+    // SAFETY: identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] CHAN_PHASE3_OK marker (Blake3 src -> AesGcm dst relay)",
+            vga::Color::Green,
+        );
+    }
+
+    // (7) detach 두 슬롯  registry 정리 후 다음 부팅 invariant 보존
+    // SAFETY: BSP 단일 코어
+    let _ = unsafe { with_registry_mut(|r| r.detach(&cap_src, HsmRights::REVOKE)) };
+    let _ = unsafe { with_registry_mut(|r| r.detach(&cap_dst, HsmRights::REVOKE)) };
+    let n_attached = unsafe { with_registry(|r| r.attached_count()) };
+    if n_attached != 0 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (detach cascade)",
+                vga::Color::Red,
+            );
+        }
+        return;
     }
 }
 
