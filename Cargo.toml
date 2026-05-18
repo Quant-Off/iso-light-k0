@@ -47,3 +47,6 @@ sha3 = { path = "../elib-k0-nt/sha3", version = "1.0.0" }
 blake = { path = "../elib-k0-nt/blake", version = "1.0.0" }
 constant-time = { path = "../elib-k0-nt/constant-time", version = "1.0.0" }
 rng = { path = "../elib-k0-nt/rng", version = "1.0.0" }
+# Phase 4 Plan 01 postcard 와이어 프레임 alloc-free 의존성 (D-15)
+postcard = { version = "1", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"] }

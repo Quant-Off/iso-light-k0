@@ -27,6 +27,9 @@ x25519        = { path = "../../../elib-k0-nt/x25519", version = "1.0.0" }
 aes           = { path = "../../../elib-k0-nt/aes", version = "1.0.0" }
 sha2          = { path = "../../../elib-k0-nt/sha2", version = "1.0.0" }
 sha3          = { path = "../../../elib-k0-nt/sha3", version = "1.0.0" }
+# Phase 4 Plan 01 postcard 와이어 프레임 alloc-free 의존성 (D-15)
+postcard      = { version = "1", default-features = false }
+serde         = { version = "1", default-features = false, features = ["derive"] }
 
 [profile.dev]
 panic = "abort"

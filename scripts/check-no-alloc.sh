@@ -36,6 +36,11 @@ EXPECTED_ABSENT=(
     "alloc::boxed::"
     "dlmalloc"
     "__rdl_alloc"
+    # Phase 4 Plan 01 postcard alloc 회귀 차단 (D-15, RESEARCH Pitfall 3)
+    "postcard::to_allocvec"
+    "postcard::to_stdvec"
+    "postcard::to_vec"
+    "serde::std::"
 )
 
 PASS=true
