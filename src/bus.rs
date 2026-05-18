@@ -2,6 +2,7 @@ use crate::capability::EndpointId;
 use crate::capability::rand_bytes;
 use aes::{AES256GCM, GCM_NONCE_SIZE, GCM_TAG_SIZE};
 use blake::{BLAKE3_OUT_LEN, Blake3};
+use constant_time::CtEqOps;
 use serde::{Deserialize, Serialize};
 use zeroize::Secret;
 use zeroize::Zeroize;
@@ -86,6 +87,140 @@ const _: () = assert!(core::mem::align_of::<WireFrameHeader>() == 4);
 const _: () = assert!(core::mem::size_of::<WireCmd>() == 2);
 const _: () = assert!(core::mem::size_of::<WireStatus>() == 2);
 const _: () = assert!(WIRE_PAYLOAD_MAX + 16 == WIRE_FRAME_MAX);
+
+//
+// Phase 4 Plan 02 Wire 헬퍼 6 함수 (D-08 / D-11 / D-16 / D-17 / D-18)
+//
+// parse_header / write_header 는 postcard varint 함정을 우회한 수동 byte parse (Pitfall 1)
+// build_response_frame / build_error_frame_inplace 는 Ring3ProcessBus::pending_response 적재 진입점
+// handle_blake3 / handle_ping 은 Tier 3 cmd dispatch 의 실 본문 (handle_blake3 는 Phase 1 authenticate + Phase 3 SoftHsmRole::Blake3 재사용)
+//
+
+/// 16 byte raw frame 헤더를 6 필드 WireFrameHeader 로 디코드한다
+pub fn parse_header(bytes: &[u8; 16]) -> WireFrameHeader {
+    WireFrameHeader {
+        magic: [bytes[0], bytes[1], bytes[2], bytes[3]],
+        version: u16::from_le_bytes([bytes[4], bytes[5]]),
+        cmd: u16::from_le_bytes([bytes[6], bytes[7]]),
+        req_id: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+        payload_len: u16::from_le_bytes([bytes[12], bytes[13]]),
+        status: u16::from_le_bytes([bytes[14], bytes[15]]),
+    }
+}
+
+/// WireFrameHeader 6 필드를 little-endian 으로 16 byte raw 슬롯에 인코드한다
+pub fn write_header(h: &WireFrameHeader, out: &mut [u8; 16]) {
+    out[0..4].copy_from_slice(&h.magic);
+    out[4..6].copy_from_slice(&h.version.to_le_bytes());
+    out[6..8].copy_from_slice(&h.cmd.to_le_bytes());
+    out[8..12].copy_from_slice(&h.req_id.to_le_bytes());
+    out[12..14].copy_from_slice(&h.payload_len.to_le_bytes());
+    out[14..16].copy_from_slice(&h.status.to_le_bytes());
+}
+
+/// 응답 프레임을 pending_response 슬롯에 적재한다  cmd 필드는 WIRE_CMD_RESPONSE_BIT OR
+pub fn build_response_frame(
+    req_id: u32,
+    cmd: WireCmd,
+    status: WireStatus,
+    payload: &[u8],
+    out: &mut [u8; WIRE_FRAME_MAX],
+) -> usize {
+    let payload_len = payload.len() as u16;
+    let hdr = WireFrameHeader {
+        magic: WIRE_MAGIC,
+        version: WIRE_VERSION,
+        cmd: (cmd as u16) | WIRE_CMD_RESPONSE_BIT,
+        req_id,
+        payload_len,
+        status: status as u16,
+    };
+    let mut hdr_bytes = [0u8; 16];
+    write_header(&hdr, &mut hdr_bytes);
+    out[..16].copy_from_slice(&hdr_bytes);
+    out[16..16 + payload.len()].copy_from_slice(payload);
+    16 + payload.len()
+}
+
+/// 에러 프레임을 적재한다  D-18 — payload_len = 0 으로 size-side-channel 제거
+pub fn build_error_frame_inplace(
+    req_id: u32,
+    status: WireStatus,
+    out: &mut [u8; WIRE_FRAME_MAX],
+) -> usize {
+    let hdr = WireFrameHeader {
+        magic: WIRE_MAGIC,
+        version: WIRE_VERSION,
+        cmd: WireCmd::Error as u16,
+        req_id,
+        payload_len: 0,
+        status: status as u16,
+    };
+    let mut hdr_bytes = [0u8; 16];
+    write_header(&hdr, &mut hdr_bytes);
+    out[..16].copy_from_slice(&hdr_bytes);
+    16
+}
+
+/// Blake3Hash 디스패치  payload 첫 16B = cap_blake3, 이후 input  Phase 1 authenticate + Phase 3 SoftwareBus::write/read 재사용
+fn handle_blake3(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) -> usize {
+    // (1) cap_token slot 미달은 BadFrame 으로 surface  payload_len = 0
+    if payload.len() < 16 {
+        return build_error_frame_inplace(req_id, WireStatus::BadFrame, out);
+    }
+    // (2) 위조 cap 도 일단 stack 으로 복사  authenticate CT-AND 가 무력화 책임
+    let mut cap = crate::hsm_registry::HsmCapability::invalid();
+    // SAFETY  payload[..16] 는 kernel internal 영역 (handle_write 가 RELAY_BUF 로 SMAP 통과 후 진입)  cap 16B 정확 복사
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            &mut cap as *mut crate::hsm_registry::HsmCapability as *mut u8,
+            16,
+        );
+    }
+    // (3) Phase 1 CT-AND 5 invariant (token_nonzero & state_ok & token_eq & stored_rights_ok & cap_rights_ok)
+    // SAFETY  BSP 단일 코어  syscall 진입은 preempt-disable
+    let auth_ok = unsafe {
+        crate::hsm_registry::with_registry(|r| {
+            r.authenticate(&cap, crate::hsm_registry::HsmRights::USE)
+        })
+    };
+    if !auth_ok {
+        cap.zeroize();
+        return build_error_frame_inplace(req_id, WireStatus::Denied, out);
+    }
+    // (4) Phase 3 SoftHsmRole::Blake3 슬롯의 SoftwareBus 가 hash 계산 + 32B ring 저장
+    let slot_idx = cap.slot.0 as usize;
+    let input = &payload[16..];
+    let mut digest = [0u8; 32];
+    // SAFETY  with_registry 와 동일 단일 코어 invariant
+    let ok = unsafe {
+        crate::hsm_registry::with_registry_mut(|r| match r.slot_bus_mut(slot_idx) {
+            Some(bus) => {
+                if bus.write(input).is_err() {
+                    return false;
+                }
+                matches!(bus.read(&mut digest), Ok(32))
+            }
+            None => false,
+        })
+    };
+    // (5) cap 회수  Pitfall 4 zeroize 모든 경로에서 적용
+    cap.zeroize();
+    if !ok {
+        digest.zeroize();
+        return build_error_frame_inplace(req_id, WireStatus::Internal, out);
+    }
+    // (6) digest 응답 프레임 적재 후 stack-local digest zeroize
+    let n = build_response_frame(req_id, WireCmd::Blake3Hash, WireStatus::Ok, &digest, out);
+    digest.zeroize();
+    n
+}
+
+/// Ping 디스패치  빈 payload 의 Ok 응답 프레임 (D-Discretion)
+fn handle_ping(req_id: u32, out: &mut [u8; WIRE_FRAME_MAX]) -> usize {
+    build_response_frame(req_id, WireCmd::Ping, WireStatus::Ok, &[], out)
+}
 
 //
 // BusKind — 외부 HSM 트랜스포트 분류 (BUS-02). #[non_exhaustive] 으로 후속 페이즈 variant 추가 backward-compat.
@@ -461,17 +596,89 @@ impl BusDriver for Ring3ProcessBus {
         Ok(())
     }
 
-    fn read(&mut self, _out: &mut [u8]) -> Result<usize, BusError> {
-        // D-12 / D-14: Phase 4 가 본 메서드 본문을 wire frame decode 로 교체.
-        Err(BusError::WireNotReady)
+    // 응답 회수 (D-09)  happy path 직후 pending_response 명시 zeroize + response_len = 0
+    fn read(&mut self, out: &mut [u8]) -> Result<usize, BusError> {
+        if !self.open_state {
+            return Err(BusError::NotOpen);
+        }
+        if self.response_len == 0 {
+            return Err(BusError::WireNotReady);
+        }
+        let n = self.response_len as usize;
+        // out 슬롯 부족은 BufferTooSmall 부재로 Internal 로 collapse (Plan 02 의 BusError variant 보존 결정)
+        if out.len() < n {
+            return Err(BusError::Internal);
+        }
+        out[..n].copy_from_slice(&self.pending_response[..n]);
+        // SH-3  회수 직후 stale 자료 cascade 차단 (T-04-10 mitigation)
+        self.pending_response.zeroize();
+        self.response_len = 0;
+        Ok(n)
     }
 
-    fn write(&mut self, _data: &[u8]) -> Result<usize, BusError> {
-        Err(BusError::WireNotReady)
+    // Tier 1/2/3 3 단계 wire dispatcher (D-07 / D-08 / D-16) 본문
+    fn write(&mut self, data: &[u8]) -> Result<usize, BusError> {
+        if !self.open_state {
+            return Err(BusError::NotOpen);
+        }
+        // Tier 1  oversize / undersize  handle_write 가 BadArg 로 collapse (D-16 Tier 1)
+        if data.len() < 16 || data.len() > WIRE_FRAME_MAX {
+            return Err(BusError::Internal);
+        }
+        // D-08 single-flight  response_len != 0 시 pending_response/response_len 모두 미변경
+        // (덮어쓰기 차단  frame parse / cap auth / cmd dispatch 어떤 것도 수행 X)
+        // handle_write 의 BusError → SyscallError::Internal collapse 로 RAX 매핑 (Pitfall 7)
+        if self.response_len != 0 {
+            return Err(BusError::Internal);
+        }
+        // Tier 2  header 수동 parse (Pitfall 1)  postcard varint 함정 우회
+        let mut hdr_bytes = [0u8; 16];
+        hdr_bytes.copy_from_slice(&data[..16]);
+        let hdr = parse_header(&hdr_bytes);
+
+        // Tier 2 invariant 4 종  어느 것이 실패했는지 변별 0 (단일 collapse, D-16 Tier 2)
+        // [u8; 4] 는 CtEqOps 미구현  u32 LE 로 평탄화 후 동일 CT 비교
+        let magic_u32 = u32::from_le_bytes(hdr.magic);
+        let wire_magic_u32 = u32::from_le_bytes(WIRE_MAGIC);
+        let magic_ok = CtEqOps::eq(&magic_u32, &wire_magic_u32).unwrap_u8() == 1;
+        let version_ok = CtEqOps::eq(&hdr.version, &WIRE_VERSION).unwrap_u8() == 1;
+        let len_ok = (hdr.payload_len as usize) + 16 <= data.len()
+            && (hdr.payload_len as usize) <= WIRE_PAYLOAD_MAX;
+        // Pitfall 6  cmd 가 request 인지 검증  0x8000+ 와 WireCmd::Error 거부
+        let cmd_is_request =
+            (hdr.cmd & WIRE_CMD_RESPONSE_BIT) == 0 && hdr.cmd != WireCmd::Error as u16;
+
+        if !(magic_ok && version_ok && len_ok && cmd_is_request) {
+            return Err(BusError::Internal);
+        }
+
+        // Tier 3  cmd dispatch (D-11 — Blake3Hash 단일 실 dispatch, AttestSubmit/Status 는 UnknownCmd)
+        let payload = &data[16..16 + hdr.payload_len as usize];
+        let resp_frame_len = match hdr.cmd {
+            x if x == WireCmd::Ping as u16 => handle_ping(hdr.req_id, &mut self.pending_response),
+            x if x == WireCmd::Blake3Hash as u16 => {
+                handle_blake3(hdr.req_id, payload, &mut self.pending_response)
+            }
+            _ => build_error_frame_inplace(
+                hdr.req_id,
+                WireStatus::UnknownCmd,
+                &mut self.pending_response,
+            ),
+        };
+        self.response_len = resp_frame_len as u16;
+        Ok(data.len())
     }
 
+    // readable/writable 시그널 (D-10)  response_len 단일 source-of-truth
     fn poll(&mut self) -> Result<BusReady, BusError> {
-        Err(BusError::WireNotReady)
+        if !self.open_state {
+            return Err(BusError::NotOpen);
+        }
+        Ok(BusReady {
+            readable: self.response_len != 0,
+            writable: self.response_len == 0,
+            closed: false,
+        })
     }
 
     fn kind(&self) -> BusKind {
