@@ -251,6 +251,7 @@ HAS_HSM_ROUNDTRIP=false
 HAS_HSM_DETACH_NOCAP_DENIED=false
 # Phase 2 BusDriver 마일스톤 (additive — Phase 1 게이트는 그대로 유지)
 HAS_BUS_PHASE2_OK=false
+HAS_CHAN_PHASE3_OK=false  # Phase 3 marker  ci-phase3 게이트
 if [ -s "${VGA_TXT}" ]; then
     grep -q "Booted\. Initializing"           "${VGA_TXT}" && HAS_BOOTED=true
     grep -q "Capability DRBG Init Done"       "${VGA_TXT}" && HAS_DRBG=true
@@ -266,6 +267,8 @@ if [ -s "${VGA_TXT}" ]; then
     grep -q "HSM_DETACH_NO_CAP_DENIED marker"                             "${VGA_TXT}" && HAS_HSM_DETACH_NOCAP_DENIED=true
     # Phase 2 BusDriver smoke 마일스톤 (additive)
     grep -q "BUS_PHASE2_OK marker"                                        "${VGA_TXT}" && HAS_BUS_PHASE2_OK=true
+    # Phase 3 In-Kernel Inter-HSM Channel smoke 마일스톤 (additive)
+    grep -q "CHAN_PHASE3_OK marker"                                       "${VGA_TXT}" && HAS_CHAN_PHASE3_OK=true
 fi
 
 echo "  [부팅 진입]                    $($HAS_BOOTED && echo PASS || echo MISS)"
@@ -280,6 +283,7 @@ echo "  [HsmRegistry smoke OK]          $($HAS_HSM_SMOKE && echo PASS || echo MI
 echo "  [HSM attach->detach roundtrip]  $($HAS_HSM_ROUNDTRIP && echo PASS || echo MISS)"
 echo "  [HSM detach no-cap denied]      $($HAS_HSM_DETACH_NOCAP_DENIED && echo PASS || echo MISS)"
 echo "  [BUS_PHASE2_OK marker]          $($HAS_BUS_PHASE2_OK && echo PASS || echo MISS)"
+echo "  [CHAN_PHASE3_OK marker]         $($HAS_CHAN_PHASE3_OK && echo PASS || echo MISS)"
 
 if ! $HAS_SMOKE_OK; then
     PASS=false
@@ -318,6 +322,11 @@ fi
 if [ "$HAS_BUS_PHASE2_OK" != "true" ]; then
     PASS=false
     FAIL_REASONS+=("BUS_PHASE2_OK 마커 없음 — Phase 2 SoftwareBus 루프백 + detach cascade 실패")
+fi
+# Phase 3 In-Kernel Inter-HSM Channel fail-accumulator (additive)
+if [ "$HAS_CHAN_PHASE3_OK" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("CHAN_PHASE3_OK 마커 없음 — Phase 3 Blake3 src -> AesGcm dst relay 라운드트립 실패")
 fi
 
 # (d) QEMU exit 코드 (timeout=124, 모니터 quit=정상)
