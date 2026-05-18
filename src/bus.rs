@@ -285,6 +285,18 @@ impl BusDriver for SoftwareBus {
     }
 }
 
+// debug-only 접근자  Plan 04 chan_phase3_smoke_test (H4 검증 모델, RESEARCH §Risk #6)
+// release 빌드에서는 본 두 메서드 모두 부재  외부 가시 surface 0
+#[cfg(debug_assertions)]
+impl SoftwareBus {
+    pub fn debug_aes_state(&self) -> Option<&SoftHsmAesGcmState> {
+        self.aes_state.as_ref()
+    }
+    pub fn debug_ring(&self) -> &[u8; SW_BUS_BUF] {
+        &self.ring
+    }
+}
+
 // Zeroize cascade (D-15)  secrets-first  key → discriminant reset → ring → metadata
 impl Zeroize for SoftwareBus {
     fn zeroize(&mut self) {
