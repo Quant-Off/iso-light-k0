@@ -252,6 +252,7 @@ HAS_HSM_DETACH_NOCAP_DENIED=false
 # Phase 2 BusDriver 마일스톤 (additive — Phase 1 게이트는 그대로 유지)
 HAS_BUS_PHASE2_OK=false
 HAS_CHAN_PHASE3_OK=false  # Phase 3 marker  ci-phase3 게이트
+HAS_WIRE_PHASE4_OK=false  # Phase 4 marker  ci-phase4 게이트
 if [ -s "${VGA_TXT}" ]; then
     grep -q "Booted\. Initializing"           "${VGA_TXT}" && HAS_BOOTED=true
     grep -q "Capability DRBG Init Done"       "${VGA_TXT}" && HAS_DRBG=true
@@ -269,6 +270,8 @@ if [ -s "${VGA_TXT}" ]; then
     grep -q "BUS_PHASE2_OK marker"                                        "${VGA_TXT}" && HAS_BUS_PHASE2_OK=true
     # Phase 3 In-Kernel Inter-HSM Channel smoke 마일스톤 (additive)
     grep -q "CHAN_PHASE3_OK marker"                                       "${VGA_TXT}" && HAS_CHAN_PHASE3_OK=true
+    # Phase 4 Wire Contract Ring 3 lumen smoke 마일스톤 (additive)
+    grep -q "WIRE_PHASE4_OK"                                              "${VGA_TXT}" && HAS_WIRE_PHASE4_OK=true
 fi
 
 echo "  [부팅 진입]                    $($HAS_BOOTED && echo PASS || echo MISS)"
@@ -284,6 +287,7 @@ echo "  [HSM attach->detach roundtrip]  $($HAS_HSM_ROUNDTRIP && echo PASS || ech
 echo "  [HSM detach no-cap denied]      $($HAS_HSM_DETACH_NOCAP_DENIED && echo PASS || echo MISS)"
 echo "  [BUS_PHASE2_OK marker]          $($HAS_BUS_PHASE2_OK && echo PASS || echo MISS)"
 echo "  [CHAN_PHASE3_OK marker]         $($HAS_CHAN_PHASE3_OK && echo PASS || echo MISS)"
+echo "  [WIRE_PHASE4_OK marker]         $($HAS_WIRE_PHASE4_OK && echo PASS || echo MISS)"
 
 if ! $HAS_SMOKE_OK; then
     PASS=false
@@ -327,6 +331,11 @@ fi
 if [ "$HAS_CHAN_PHASE3_OK" != "true" ]; then
     PASS=false
     FAIL_REASONS+=("CHAN_PHASE3_OK 마커 없음 — Phase 3 Blake3 src -> AesGcm dst relay 라운드트립 실패")
+fi
+# Phase 4 Wire Contract fail-accumulator (additive)
+if [ "$HAS_WIRE_PHASE4_OK" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("WIRE_PHASE4_OK 마커 없음  Phase 4 lumen Ring 3 wire Blake3Hash contract 실패")
 fi
 
 # (d) QEMU exit 코드 (timeout=124, 모니터 quit=정상)
