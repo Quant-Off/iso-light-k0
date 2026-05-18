@@ -1,4 +1,4 @@
-use constant_time::{Choice, CtEqOps};
+use constant_time::{Choice, CtEqOps, CtLess};
 use zeroize::Zeroize;
 
 use crate::bus::{BusDriver, BusInstance, BusKind, MAX_BUS_INIT_BLOB};
@@ -684,12 +684,219 @@ pub fn handle_enumerate(ctx: &mut SyscallContext) -> u64 {
     n as u64
 }
 
-// Plan-03 Task-1 임시 stub  Task-2 가 실 본문으로 교체
-pub fn handle_write(_ctx: &mut SyscallContext) -> u64 {
-    SyscallError::Internal.as_rax()
+// handle_write — sys_hsm_write 핸들러 (D-02 / CHAN-01)  USE cap 검증 + user data SMAP copy → slot.bus.write
+//
+// ABI (D-02):  rdi = cap_ptr (16B HsmCapability)
+//              rsi = data_ptr (user-space)
+//              rdx = data_len (≤ CHAN_MAX, > 0)
+//
+// 6-step shape (handle_detach 미러):
+//   (1) data_len CT 범위 (0 < data_len ≤ CHAN_MAX  CtLess::lt / CtEqOps::ne — Pitfall 2)
+//   (2) (cap_ptr, 16B) + (data_ptr, data_len) dual-range (Pitfall 3)
+//   (3) SMAP-1 cap copy (단일 stac/clac, Pitfall 2)
+//   (4) authenticate(USE) (Pitfall 1) — 실패 시 cap.zeroize + Denied
+//   (5) with_relay_buf 진입 → SMAP-2 data copy → slot.bus.write
+//   (6) Pitfall 4 cap.zeroize  Pitfall 7 BusError → Internal collapse
+pub fn handle_write(ctx: &mut SyscallContext) -> u64 {
+    let cap_ptr_va = ctx.rdi;
+    let data_ptr_va = ctx.rsi;
+    let data_len = ctx.rdx as usize;
+
+    // (1) data_len ∈ (0, CHAN_MAX]  CT 분기 (CtLess::lt / CtEqOps::ne) — '<' / '==' direct 금지 (Pitfall 2 CT)
+    //     상한은 CHAN_MAX 포함  D-13 4 KiB 정확 등호도 허용  CtLess::lt(&len, &(CHAN_MAX+1)) 로 ≤ CHAN_MAX 표현
+    let lt_max: u8 = CtLess::lt(&data_len, &(CHAN_MAX + 1)).unwrap_u8();
+    let nonzero: u8 = CtEqOps::ne(&data_len, &0usize).unwrap_u8();
+    if (lt_max & nonzero) != 1 {
+        return SyscallError::BadArg.as_rax();
+    }
+
+    // (2) user-pointer dual range check (Pitfall 3)  is_user_address 는 u64 인자
+    let cap_size = core::mem::size_of::<HsmCapability>() as u64;
+    if !is_user_address(cap_ptr_va) || !is_user_address(cap_ptr_va.saturating_add(cap_size)) {
+        return SyscallError::BadAddress.as_rax();
+    }
+    if !is_user_address(data_ptr_va)
+        || !is_user_address(data_ptr_va.saturating_add(data_len as u64))
+    {
+        return SyscallError::BadAddress.as_rax();
+    }
+
+    // (3) SMAP-1 cap copy — 단일 stac/clac 윈도우 (Pitfall 2)
+    let mut cap = HsmCapability::invalid();
+    // SAFETY: cap_ptr_va dual-range 검증 통과  copy 폭은 HsmCapability ABI 크기 (16B)
+    unsafe {
+        crate::cpu::stac();
+        core::ptr::copy_nonoverlapping(
+            cap_ptr_va as *const u8,
+            &mut cap as *mut HsmCapability as *mut u8,
+            core::mem::size_of::<HsmCapability>(),
+        );
+        crate::cpu::clac();
+    }
+
+    // (4) USE 인증 (Pitfall 1)  실패 시 RELAY_BUF 미진입 + cap zeroize 후 Denied
+    // SAFETY: BSP single-core
+    let auth_ok = unsafe { with_registry(|r| r.authenticate(&cap, HsmRights::USE)) };
+    if !auth_ok {
+        cap.zeroize();
+        return SyscallError::Denied.as_rax();
+    }
+
+    // (5) with_relay_buf 진입  SMAP-2 data copy → slot.bus.write
+    //     RELAY_BUF 은 with_relay_buf 의 진입+이탈 양면 zeroize (D-14) 가 보장
+    let slot_idx = cap.slot.0 as usize;
+    // SAFETY: BSP single-core; with_relay_buf + with_registry_mut 는 disjoint static borrow
+    let closure_result: Result<(), SyscallError> = unsafe {
+        with_relay_buf(|buf| {
+            // SMAP-2 — user data → RELAY_BUF (단일 stac/clac, Pitfall 2)
+            // SAFETY: data_ptr_va dual-range 통과 + data_len ≤ CHAN_MAX
+            crate::cpu::stac();
+            core::ptr::copy_nonoverlapping(
+                data_ptr_va as *const u8,
+                buf.as_mut_ptr(),
+                data_len,
+            );
+            crate::cpu::clac();
+            // slot.bus.write 는 with_registry_mut 안에서 (PATTERNS A-2 borrow disjoint)
+            with_registry_mut(|r| match r.slot_bus_mut(slot_idx) {
+                Some(bus) => match bus.write(&buf[..data_len]) {
+                    Ok(_n) => Ok(()),
+                    // Pitfall 7  BusError 전 variant 를 Internal 로 collapse
+                    Err(_) => Err(SyscallError::Internal),
+                },
+                None => Err(SyscallError::Internal),
+            })
+        })
+    };
+
+    // (6) cap zeroize (Pitfall 4) — 모든 경로 마지막 단계
+    cap.zeroize();
+    match closure_result {
+        Ok(()) => 0u64,
+        Err(SyscallError::Internal) => SyscallError::Internal.as_rax(),
+        Err(_) => SyscallError::Internal.as_rax(),
+    }
 }
 
-// Plan-03 Task-1 임시 stub  Task-2 가 실 본문으로 교체
-pub fn handle_relay(_ctx: &mut SyscallContext) -> u64 {
-    SyscallError::Internal.as_rax()
+// handle_relay — sys_hsm_relay 핸들러 (D-03 / CHAN-01)  ZERO user data pointer  kernel-internal transfer 전용
+//
+// ABI (D-03):  rdi = src_cap_ptr (16B)
+//              rsi = dst_cap_ptr (16B)
+//              rdx = byte_len (≤ CHAN_MAX, > 0)
+//
+// 6-step shape:
+//   (1) byte_len CT 범위 (0 < byte_len ≤ CHAN_MAX)
+//   (2) (src_cap_ptr, 16B) + (dst_cap_ptr, 16B) dual-range (Pitfall 3)  data ptr 없음 (CHAN-01)
+//   (3) SMAP-1 src_cap + SMAP-2 dst_cap (두 개 분리 윈도우, Pitfall 2)
+//   (4) Dual authenticate  (src_ok as u8) & (dst_ok as u8)  bitand  Pitfall 1 (&& 절대 금지)
+//   (5) with_relay_buf 진입 → src.read → dst.write atomic (D-20/D-21 CtEqOps::eq)
+//   (6) src_cap + dst_cap zeroize (Pitfall 4) + Pitfall 7 collapse
+pub fn handle_relay(ctx: &mut SyscallContext) -> u64 {
+    let src_cap_ptr_va = ctx.rdi;
+    let dst_cap_ptr_va = ctx.rsi;
+    let byte_len = ctx.rdx as usize;
+
+    // (1) byte_len ∈ (0, CHAN_MAX]  CT 분기 (CtLess::lt / CtEqOps::ne)
+    let lt_max: u8 = CtLess::lt(&byte_len, &(CHAN_MAX + 1)).unwrap_u8();
+    let nonzero: u8 = CtEqOps::ne(&byte_len, &0usize).unwrap_u8();
+    if (lt_max & nonzero) != 1 {
+        return SyscallError::BadArg.as_rax();
+    }
+
+    // (2) 두 cap 포인터 dual-range (Pitfall 3)  data pointer 없음 (CHAN-01 핵심 보장)
+    let cap_size = core::mem::size_of::<HsmCapability>() as u64;
+    if !is_user_address(src_cap_ptr_va)
+        || !is_user_address(src_cap_ptr_va.saturating_add(cap_size))
+    {
+        return SyscallError::BadAddress.as_rax();
+    }
+    if !is_user_address(dst_cap_ptr_va)
+        || !is_user_address(dst_cap_ptr_va.saturating_add(cap_size))
+    {
+        return SyscallError::BadAddress.as_rax();
+    }
+
+    // (3) SMAP-1 src_cap + SMAP-2 dst_cap  두 분리 stac/clac 윈도우 (Pitfall 2)
+    let mut src_cap = HsmCapability::invalid();
+    let mut dst_cap = HsmCapability::invalid();
+    // SAFETY: src_cap_ptr_va dual-range 통과  16B copy
+    unsafe {
+        crate::cpu::stac();
+        core::ptr::copy_nonoverlapping(
+            src_cap_ptr_va as *const u8,
+            &mut src_cap as *mut HsmCapability as *mut u8,
+            core::mem::size_of::<HsmCapability>(),
+        );
+        crate::cpu::clac();
+    }
+    // SAFETY: dst_cap_ptr_va dual-range 통과  16B copy
+    unsafe {
+        crate::cpu::stac();
+        core::ptr::copy_nonoverlapping(
+            dst_cap_ptr_va as *const u8,
+            &mut dst_cap as *mut HsmCapability as *mut u8,
+            core::mem::size_of::<HsmCapability>(),
+        );
+        crate::cpu::clac();
+    }
+
+    // (4) Dual-cap authenticate CT-AND  bitand 사용  short-circuit (&&) 금지
+    //     양쪽 authenticate 가 무조건 실행되어야 D-18 변이 누설 0 유지
+    // SAFETY: BSP single-core
+    let src_ok = unsafe { with_registry(|r| r.authenticate(&src_cap, HsmRights::RELAY_SRC)) };
+    // SAFETY: BSP single-core
+    let dst_ok = unsafe { with_registry(|r| r.authenticate(&dst_cap, HsmRights::RELAY_DST)) };
+    // 어느 한쪽 fail 도 Denied 단일 매핑 (D-18)  variant 누설 0
+    let both_ok: u8 = (src_ok as u8) & (dst_ok as u8);
+    if both_ok != 1 {
+        src_cap.zeroize();
+        dst_cap.zeroize();
+        return SyscallError::Denied.as_rax();
+    }
+
+    // (5) with_relay_buf 진입 → src.read → dst.write atomic
+    //     D-20/D-21  CtEqOps::eq 로 returned/accepted 가 byte_len 과 일치하지 않으면 Internal
+    let src_slot = src_cap.slot.0 as usize;
+    let dst_slot = dst_cap.slot.0 as usize;
+    // SAFETY: BSP single-core; with_relay_buf + with_registry_mut 는 disjoint static borrow
+    let closure_result: Result<(), SyscallError> = unsafe {
+        with_relay_buf(|buf| {
+            with_registry_mut(|r| {
+                // src.read  destructive read of src.ring → buf[..byte_len]
+                let n = match r.slot_bus_mut(src_slot) {
+                    Some(bus) => match bus.read(&mut buf[..byte_len]) {
+                        Ok(n) => n,
+                        // Pitfall 7  BusError → Internal
+                        Err(_) => return Err(SyscallError::Internal),
+                    },
+                    None => return Err(SyscallError::Internal),
+                };
+                // D-20  atomic relay  CtEqOps::eq 로 partial 거부
+                if CtEqOps::eq(&n, &byte_len).unwrap_u8() != 1 {
+                    return Err(SyscallError::Internal);
+                }
+                // dst.write  buf[..byte_len] → dst.ring
+                let m = match r.slot_bus_mut(dst_slot) {
+                    Some(bus) => match bus.write(&buf[..byte_len]) {
+                        Ok(m) => m,
+                        Err(_) => return Err(SyscallError::Internal),
+                    },
+                    None => return Err(SyscallError::Internal),
+                };
+                // D-21  atomic relay  CtEqOps::eq 로 accepted 가 byte_len 과 일치 보장
+                if CtEqOps::eq(&m, &byte_len).unwrap_u8() != 1 {
+                    return Err(SyscallError::Internal);
+                }
+                Ok(())
+            })
+        })
+    };
+
+    // (6) 두 cap zeroize (Pitfall 4) + Pitfall 7 variant collapse
+    src_cap.zeroize();
+    dst_cap.zeroize();
+    match closure_result {
+        Ok(()) => 0u64,
+        Err(_) => SyscallError::Internal.as_rax(),
+    }
 }
