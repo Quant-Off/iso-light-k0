@@ -98,7 +98,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1
 
 all: iso
 
@@ -291,7 +291,7 @@ qemu-smoke-smoke:
 	@mkdir -p $(BOOT_DIR)
 	@cp $(KERNEL_DEBUG) $(BOOT_DIR)/kernel.bin
 	@$(GRUB_MKRES) -o $(ISO_DEBUG) $(ISO_DIR)
-	@REQUIRE_ATTEST_PHASE5_OK=1 bash scripts/qemu-test.sh
+	@REQUIRE_ATTEST_PHASE5_OK=1 REQUIRE_ATTEST_PHASE5_1_OK=1 bash scripts/qemu-test.sh
 	@echo "[CI] Phase 5 QEMU smoke (feature smoke) 통과"
 
 #
@@ -306,3 +306,17 @@ qemu-smoke-smoke:
 #
 ci-phase5: check-alloc-zero check-alloc-bus check-no-dev-sk qemu-smoke-smoke chan-dudect
 	@echo "[CI] Phase 5 ci 게이트 전체 통과 (ENROLL-01..ENROLL-04 + CAP-02 + smoke + dudect + dev sk leak 가드)"
+
+#
+# Phase 5.1 CI 게이트 (ENROLL-01/02/04 + CAP-02 + DOC-01 + 기존 phase 5 5-leg + wire host test)
+#
+# 6-leg 구조 (ci-phase5 + wire-attest-host-test 확장):
+#   1) check-alloc-zero       handle_attest_submit / handle_status alloc 0 회귀
+#   2) check-alloc-bus        bus.rs alloc 의존 0 회귀
+#   3) check-no-dev-sk        closed 프로필 dev sk K 시드 16 옥텟 부재 (Phase 5 D-19 보존)
+#   4) qemu-smoke-smoke       ATTEST_PHASE5_OK + 신규 ATTEST_PHASE5_1_OK 두 마커 강제
+#   5) chan-dudect            elib-k0-nt chan_* CT timing balance (Phase 3 leg 재사용)
+#   6) wire-attest-host-test  elib-k0-nt wire_attest_* / wire_status_* 4 sibling host tests
+#
+ci-phase5_1: check-alloc-zero check-alloc-bus check-no-dev-sk qemu-smoke-smoke chan-dudect wire-attest-host-test
+	@echo "[CI] Phase 5.1 ci 게이트 전체 통과 (ENROLL-01/02/04 + CAP-02 + DOC-01 + wire-attest-host-test)"

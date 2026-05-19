@@ -254,6 +254,7 @@ HAS_BUS_PHASE2_OK=false
 HAS_CHAN_PHASE3_OK=false  # Phase 3 marker  ci-phase3 게이트
 HAS_WIRE_PHASE4_OK=false  # Phase 4 marker  ci-phase4 게이트
 HAS_ATTEST_PHASE5_OK=false  # Phase 5 marker  ci-phase5 게이트
+HAS_ATTEST_PHASE5_1_OK=false  # Phase 5.1 marker  ci-phase5_1 게이트
 if [ -s "${VGA_TXT}" ]; then
     grep -q "Booted\. Initializing"           "${VGA_TXT}" && HAS_BOOTED=true
     grep -q "Capability DRBG Init Done"       "${VGA_TXT}" && HAS_DRBG=true
@@ -275,6 +276,8 @@ if [ -s "${VGA_TXT}" ]; then
     grep -q "WIRE_PHASE4_OK"                                              "${VGA_TXT}" && HAS_WIRE_PHASE4_OK=true
     # Phase 5 Attestation Gate kernel-side smoke 마일스톤 (additive  feature smoke 한정)
     grep -q "ATTEST_PHASE5_OK"                                            "${VGA_TXT}" && HAS_ATTEST_PHASE5_OK=true
+    # Phase 5.1 wire AttestSubmit / Status / lumen smoke 마일스톤 (additive  feature smoke 한정)
+    grep -q "ATTEST_PHASE5_1_OK"                                          "${VGA_TXT}" && HAS_ATTEST_PHASE5_1_OK=true
 fi
 
 echo "  [부팅 진입]                    $($HAS_BOOTED && echo PASS || echo MISS)"
@@ -292,6 +295,7 @@ echo "  [BUS_PHASE2_OK marker]          $($HAS_BUS_PHASE2_OK && echo PASS || ech
 echo "  [CHAN_PHASE3_OK marker]         $($HAS_CHAN_PHASE3_OK && echo PASS || echo MISS)"
 echo "  [WIRE_PHASE4_OK marker]         $($HAS_WIRE_PHASE4_OK && echo PASS || echo MISS)"
 echo "  [ATTEST_PHASE5_OK marker]       $($HAS_ATTEST_PHASE5_OK && echo PASS || echo MISS)"
+echo "  [ATTEST_PHASE5_1_OK marker]     $($HAS_ATTEST_PHASE5_1_OK && echo PASS || echo MISS)"
 
 if ! $HAS_SMOKE_OK; then
     PASS=false
@@ -346,6 +350,12 @@ fi
 if [ "${REQUIRE_ATTEST_PHASE5_OK:-0}" = "1" ] && [ "$HAS_ATTEST_PHASE5_OK" != "true" ]; then
     PASS=false
     FAIL_REASONS+=("ATTEST_PHASE5_OK 마커 없음  Phase 5 attach with attestation Leg 1 valid sig 또는 Leg 2 mutated reject 실패")
+fi
+# Phase 5.1 Wire AttestSubmit / Status / lumen leg fail-accumulator  feature smoke 활성 빌드에서만 강제
+# REQUIRE_ATTEST_PHASE5_1_OK=1 인 경우에만 marker 부재를 실패로 누적 (qemu-smoke-smoke Makefile 타겟이 셋)
+if [ "${REQUIRE_ATTEST_PHASE5_1_OK:-0}" = "1" ] && [ "$HAS_ATTEST_PHASE5_1_OK" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("ATTEST_PHASE5_1_OK 마커 없음 — Phase 5.1 wire AttestSubmit / Status / lumen leg 실패")
 fi
 
 # (d) QEMU exit 코드 (timeout=124, 모니터 quit=정상)
