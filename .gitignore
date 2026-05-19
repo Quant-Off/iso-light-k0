@@ -6,8 +6,9 @@ Cargo.lock
 isodir/boot/kernel.bin
 AIR-GAP.md
 
-# GSD planning artifacts (commit_docs: false)
+# GSD (Claude Code)
 .planning/
+.claude/
 
 # Phase 5 D-02 dev trust root secret keys
 keys/*.sk*
