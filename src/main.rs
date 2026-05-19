@@ -557,6 +557,17 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     }
 
     //
+    // 14.10. 부트 시점 Phase 5 Attestation Gate 2-leg 스모크 테스트  feature smoke 한정
+    //
+    // Leg 1 valid sig 흐름 attach 성공  Leg 2 mutated sig 흐름 reject + 슬롯 변동 0
+    // 성공 시 qemu-test.sh ATTEST_PHASE5_OK 마커 게이트 통과 closed 프로필 부재
+    #[cfg(all(target_arch = "x86_64", debug_assertions, feature = "smoke"))]
+    // SAFETY Phase 3 smoke 완료 후 detach cascade 가 REGISTRY 를 비웠음 hsm_attest::init_trust_root 가 BSS 채움
+    unsafe {
+        attest_phase5_smoke_test();
+    }
+
+    //
     // 15. 인터럽트 활성화 + 커널 메인 이벤트 루프
     //
     // IDT, GDT, TSS, PIC 초기화 완료 후 STI로 인터럽트 수신 시작
@@ -1462,6 +1473,159 @@ unsafe fn chan_phase3_smoke_test() {
         }
         return;
     }
+}
+
+//
+// attest_phase5_smoke_test  Phase 5 attach with attestation gate 2-leg 검증  marker ATTEST_PHASE5_OK
+//
+// Leg 1 valid sig 흐름  dev sk 로 BLAKE3(pk||bus||BOOT_CHALLENGE) 서명 후
+//                       attach_kernel_side_with_attest Ok(cap) 슬롯 1 개 부착
+// Leg 2 mutated sig 흐름  sig[0] ^= 0xFF 후 동일 호출 Err(AttestFailed)
+//                         attached_count 변동 0 RESEARCH 6.2 atomicity 회귀 가드
+//
+// 본 smoke 는 feature smoke 게이트 아래에서만 컴파일 closed 프로필 dev sk leak 0 보장
+#[cfg(all(target_arch = "x86_64", debug_assertions, feature = "smoke"))]
+unsafe fn attest_phase5_smoke_test() {
+    use crate::bus::BusKind;
+    use blake::Blake3;
+    use hsm_attest::{ACTIVE_TRUST_ROOT_PK, BOOT_CHALLENGE};
+    use hsm_registry::{HsmRights, attach_kernel_side_with_attest, with_registry, with_registry_mut};
+    use mldsa::MLDSA44;
+
+    // Phase 5 D-02 dev sk 자료는 feature smoke 한정 include_bytes 로만 임베드
+    // closed 프로필 빌드는 본 함수 자체가 cfg-out 되어 sk44 자료 leak 0
+    const DEV_SK: &[u8; MLDSA44::SK_LEN] = include_bytes!("../keys/dev_trust_root.sk44");
+
+    // (1) BOOT_CHALLENGE 와 ACTIVE_TRUST_ROOT_PK 스냅샷  init_trust_root 가 부팅 시 이미 채움
+    // SAFETY BSP single-core 부팅 후 두 BSS static 의 단일 진입 read
+    let pk: [u8; MLDSA44::PK_LEN] = unsafe { *(&raw const ACTIVE_TRUST_ROOT_PK) };
+    let challenge: [u8; 32] = unsafe { *(&raw const BOOT_CHALLENGE) };
+
+    // (2) Pre-image 재구성  hsm_attest 의 verify_attest body 와 byte-exact mirror
+    // layout pk(1312) || bus_kind_octet(1) || BOOT_CHALLENGE(32) = 1345 옥텟
+    let bus_kind = BusKind::Software;
+    let mut pre = [0u8; MLDSA44::PK_LEN + 1 + 32];
+    pre[..MLDSA44::PK_LEN].copy_from_slice(&pk);
+    pre[MLDSA44::PK_LEN] = bus_kind as u8;
+    pre[MLDSA44::PK_LEN + 1..].copy_from_slice(&challenge);
+
+    // (3) BLAKE3 digest  서명 평문은 32 옥텟 digest (D-07 amendment)
+    let mut hasher = Blake3::new();
+    hasher.update(&pre);
+    let digest_buf = match hasher.finalize() {
+        Ok(d) => d,
+        Err(_) => {
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (blake3 digest)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&digest_buf.as_slice()[..32]);
+
+    // (4) ML-DSA-44 sign  ctx b"ISO-K0-ENROLL-V1" 16 옥텟 D-08 도메인 분리 verify_attest 와 동일 ctx
+    // rnd 인자는 결정적 smoke 회귀 일관성을 위해 고정 nonce [0xBB;32] 사용
+    let rnd = [0xBB_u8; 32];
+    let sig: [u8; MLDSA44::SIG_LEN] = match MLDSA44::sign(DEV_SK, &digest, b"ISO-K0-ENROLL-V1", &rnd) {
+        Ok(s) => s,
+        Err(_) => {
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (mldsa44 sign)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+
+    // (5) attest_payload 직렬화  pk(1312) || sig(2420) = 3732 옥텟 ATTEST_EXACT
+    const ATTEST_LEN: usize = MLDSA44::PK_LEN + MLDSA44::SIG_LEN;
+    let mut attest_payload = [0u8; ATTEST_LEN];
+    attest_payload[..MLDSA44::PK_LEN].copy_from_slice(&pk);
+    attest_payload[MLDSA44::PK_LEN..].copy_from_slice(&sig);
+
+    // (6) Leg 1 valid sig  attach 성공 Ok(cap) 슬롯 1 개 부착
+    let baseline_attached = unsafe { with_registry(|r| r.attached_count()) };
+    // SAFETY BSP single-core attach_kernel_side_with_attest 가 verify gate 활성
+    let cap_leg1 = match unsafe {
+        attach_kernel_side_with_attest(
+            BusKind::Software,
+            &[crate::bus::SoftHsmRole::Blake3 as u8],
+            &attest_payload,
+            HsmRights::USE | HsmRights::REVOKE,
+        )
+    } {
+        Ok(c) => c,
+        Err(_) => {
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (Leg 1 attach rejected)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let after_leg1_attached = unsafe { with_registry(|r| r.attached_count()) };
+    if after_leg1_attached != baseline_attached + 1 {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (Leg 1 slot count delta != 1)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (7) Leg 2 mutated sig  sig[0] ^= 0xFF 후 attach 실패 슬롯 변동 0 atomicity 회귀
+    let mut tampered_payload = attest_payload;
+    tampered_payload[MLDSA44::PK_LEN] ^= 0xFF;
+    let before_leg2_attached = unsafe { with_registry(|r| r.attached_count()) };
+    let leg2_result = unsafe {
+        attach_kernel_side_with_attest(
+            BusKind::Software,
+            &[crate::bus::SoftHsmRole::Blake3 as u8],
+            &tampered_payload,
+            HsmRights::USE | HsmRights::REVOKE,
+        )
+    };
+    if leg2_result.is_ok() {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (Leg 2 mutated sig accepted)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+    let after_leg2_attached = unsafe { with_registry(|r| r.attached_count()) };
+    if after_leg2_attached != before_leg2_attached {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (Leg 2 slot count changed)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (8) 성공 마커  qemu-test.sh ATTEST_PHASE5_OK 게이트
+    // SAFETY identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] ATTEST_PHASE5_OK marker (Leg 1 valid sig + Leg 2 mutated reject)",
+            vga::Color::Green,
+        );
+    }
+
+    // (9) Leg 1 슬롯 detach  registry 정리 다음 smoke 또는 Ring 3 spawn invariant 보존
+    // SAFETY BSP 단일 코어
+    let _ = unsafe { with_registry_mut(|r| r.detach(&cap_leg1, HsmRights::REVOKE)) };
 }
 
 /// 마이크로커널 메인 이벤트 루프.
