@@ -14,6 +14,11 @@ tls-external = []
 # Phase 5 D-02: kernel-side smoke 전용 dev sk include 게이트 closed 프로필 부재
 smoke = []
 
+# Phase 5.1 D-01 trust root dual-path build.rs 가 K0_TRUST_ROOT_KEYSTORE env →
+# cargo:rustc-cfg=k0_trust_root_keystore 노출 (Rust 1.80+ unexpected_cfgs lint 명시)
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(k0_trust_root_keystore)'] }
+
 # `cargo clippy --all-targets`가 bare-metal(no_std) 커널 바이너리에 대해
 # test/bench/doctest harness를 합성하면 `extern crate test;`를 주입하여
 # `x86_64-unknown-none` 타깃에서 E0463(test 크레이트 없음)으로 실패함
