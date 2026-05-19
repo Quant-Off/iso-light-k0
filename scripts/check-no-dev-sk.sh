@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Phase 5 D-19 closed 프로필 dev sk leak 가드
-# closed 프로필 빌드 산출물에서 dev_trust_root.sk44 의 첫 16 옥텟 자료 부재 +
+# ML-DSA-44 SK 의 secret-only window (offset 32 의 K 시드 16 옥텟) 자료 부재 +
 # dev_trust_root 심볼 부재 (objdump → gobjdump → nm fallback chain) 두 가지를 동시 검증
+#
+# Plan 05-05 Rule 1 보정 SK[0..32] = rho 는 PK 의 첫 32 옥텟과 동일하므로
+# 기존 SK[0..16] hex prefix 추출은 PK include_bytes 자료와 충돌하여 false positive
+# SK[32..48] (K seed 16 옥텟) 은 비밀 자료이며 PK 에 부재하므로 leak 시그니처로 안전
 set -euo pipefail
 
 KERNEL_BIN="${KERNEL_BIN:-target/x86_64-unknown-none/release/iso-light-k0}"
@@ -19,20 +23,20 @@ if [ ! -f "$DEV_SK" ]; then
     exit 0
 fi
 
-# (1) dev sk 첫 16 옥텟 hex 추출
+# (1) dev sk 의 K 시드 (SK 오프셋 32 부터 16 옥텟) hex 추출  ML-DSA-44 비밀 자료
 if ! command -v xxd >/dev/null 2>&1; then
-    echo "[CI] FAIL: xxd 미설치 (dev sk hex prefix 추출 불가)" >&2
+    echo "[CI] FAIL: xxd 미설치 (dev sk hex window 추출 불가)" >&2
     exit 1
 fi
-DEV_SK_PREFIX=$(xxd -p -l 16 "$DEV_SK" | tr -d '\n')
-if [ -z "$DEV_SK_PREFIX" ]; then
-    echo "[CI] FAIL: dev sk hex prefix 추출 실패" >&2
+DEV_SK_SECRET=$(xxd -p -s 32 -l 16 "$DEV_SK" | tr -d '\n')
+if [ -z "$DEV_SK_SECRET" ]; then
+    echo "[CI] FAIL: dev sk K seed 16 옥텟 추출 실패" >&2
     exit 1
 fi
 
-# (2) 빌드 산출물 hex dump 후 prefix 부재 grep
-if xxd -p "$KERNEL_BIN" | tr -d '\n' | grep -q "$DEV_SK_PREFIX"; then
-    echo "[CI] FAIL: closed 프로필 빌드에 dev sk 자료 leak 검출 ($DEV_SK_PREFIX)" >&2
+# (2) 빌드 산출물 hex dump 후 K 시드 부재 grep  rho 와 무관한 비밀-only window
+if xxd -p "$KERNEL_BIN" | tr -d '\n' | grep -q "$DEV_SK_SECRET"; then
+    echo "[CI] FAIL: closed 프로필 빌드에 dev sk 자료 leak 검출 ($DEV_SK_SECRET)" >&2
     exit 1
 fi
 
