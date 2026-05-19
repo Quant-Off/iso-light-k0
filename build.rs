@@ -44,6 +44,19 @@ fn main() {
         );
     }
     println!("cargo:rerun-if-changed={}", trust_root_pk.display());
+
+    // Phase 5.1 D-01 K0_TRUST_ROOT_KEYSTORE env → cargo:rustc-cfg=k0_trust_root_keystore
+    //
+    // 설정 값이 "1" | "true" | "yes" (trim 후) 중 하나면 cfg 활성 그 외는 비활성 (const 폴백)
+    // Pitfall 5 회피 trailing newline trim + 다중 truthy 표현 허용
+    println!("cargo:rerun-if-env-changed=K0_TRUST_ROOT_KEYSTORE");
+    let keystore_env = std::env::var("K0_TRUST_ROOT_KEYSTORE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if matches!(keystore_env.as_str(), "1" | "true" | "yes") {
+        println!("cargo:rustc-cfg=k0_trust_root_keystore");
+    }
 }
 
 /// 사용자 크레이트의 release ELF 를 OUT_DIR 로 복사하고 환경변수로 노출.

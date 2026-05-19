@@ -151,21 +151,38 @@ pub unsafe fn with_attest_buf<R>(f: impl FnOnce(&mut [u8; ATTEST_BUF_MAX]) -> R)
 /// 부팅 시 단일 코어에서 1 회만 호출 호출자가 `capability::init_prng` 완료를 보장해야 함
 /// 본 함수가 ACTIVE_TRUST_ROOT_PK 와 BOOT_CHALLENGE 두 static 의 비원자적 갱신을 단일 진입으로 수행
 pub unsafe fn init_trust_root() {
-    // (1) keystore override 경로 RESEARCH §14.2 Option (iii) 채택 시 단순 false
-    let from_keystore = false;
-
-    // (2) const 폴백 → ACTIVE_TRUST_ROOT_PK 채움
-    let pk_src: &[u8; MLDSA44::PK_LEN] = if from_keystore {
-        unreachable!("§14.2 (iii) stub")
-    } else {
-        &HSM_TRUST_ROOT_PK_CONST
+    // (1) Phase 5.1 D-01 dual-path K0_TRUST_ROOT_KEYSTORE cfg 분기
+    //
+    // cfg 활성 (build.rs 가 K0_TRUST_ROOT_KEYSTORE=1|true|yes 인식)
+    //   keystore slot 0xFE 의 raw 1312-옥텟 PK 로드 시도 None 폴백 시 const + audit_enqueue 경고
+    // cfg 비활성 (closed 기본)
+    //   HSM_TRUST_ROOT_PK_CONST 컴파일타임 임베드 직접 사용
+    //
+    // 두 분기 모두 cargo build 통과 + 미선택 경로 unreachable!() 0 회 hit (placeholder 제거)
+    #[cfg(k0_trust_root_keystore)]
+    let pk_owned: [u8; MLDSA44::PK_LEN] = {
+        match crate::keystore::read_trust_root_pk() {
+            Some(pk) => pk,
+            None => {
+                // keystore 분기 활성인데 slot 0xFE 미공급 const 폴백 + 경고 event
+                // result code = 8 (TrustRootKeystoreMissing Phase 5 D-13 reserved 7..=255 활용)
+                audit_enqueue(0xFE, 8u8, 0u8, [0u8; 4]);
+                HSM_TRUST_ROOT_PK_CONST
+            }
+        }
     };
+    #[cfg(k0_trust_root_keystore)]
+    let pk_src: &[u8; MLDSA44::PK_LEN] = &pk_owned;
+    #[cfg(not(k0_trust_root_keystore))]
+    let pk_src: &[u8; MLDSA44::PK_LEN] = &HSM_TRUST_ROOT_PK_CONST;
+
+    // (2) ACTIVE_TRUST_ROOT_PK copy (양 분기 공통)
     // SAFETY 단일 코어 부팅 초기 + ACTIVE_TRUST_ROOT_PK 의 단일 진입 갱신
     unsafe {
         (&mut *(&raw mut ACTIVE_TRUST_ROOT_PK)).copy_from_slice(pk_src);
     }
 
-    // (3) BOOT_CHALLENGE 32 옥텟 채움 4 회 gen_token_u64 의 big-endian 연쇄
+    // (3) BOOT_CHALLENGE 32 옥텟 채움 4 회 gen_token_u64 의 big-endian 연쇄 (Phase 5 D-09 보존)
     let mut challenge = [0u8; 32];
     for i in 0..4 {
         // SAFETY 호출자가 capability::init_prng 완료를 보장
