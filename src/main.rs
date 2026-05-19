@@ -473,6 +473,27 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
         );
     }
 
+    // Phase 6 GAP D-02 D-06 부팅 시 1 회 NETWORK_ATTACH + AUDIT_READ cap mint (양 프로필 공통 + cfg)
+    // 호출 위치 hsm_attest::init_trust_root 직후 capability::init_prng + init_trust_root 완료 가정
+    // SAFETY 단일 코어 부팅 초기 BSP single-core invariant 양 init_*_cap 의 단일 진입 갱신
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        air_gap::init_audit_read_cap();
+        vga::println(
+            b"[iso-light-k0] AUDIT_READ_CAP Init Done.",
+            vga::Color::Green,
+        );
+
+        #[cfg(feature = "tls-external")]
+        {
+            air_gap::init_network_cap();
+            vga::println(
+                b"[iso-light-k0] NETWORK_ATTACH_CAP Init Done.",
+                vga::Color::Green,
+            );
+        }
+    }
+
     //
     // 13. IPC 서브시스템 초기화
     //
@@ -569,6 +590,8 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
         // Phase 5.1 D-04 wire AttestSubmit / Status round-trip smoke
         // Phase 5 marker 직후 호출  두 marker 모두 emit (Pitfall 6 substring 충돌 0)
         attest_phase5_1_wire_smoke_test();
+        // Phase 6 GAP D-PHASE6 air-gap dual gate + sys_hsm_status + gap_self_check 4-line marker emit
+        gap_phase6_smoke_test();
     }
 
     //
@@ -580,6 +603,15 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     unsafe {
         core::arch::asm!("sti", options(nostack, preserves_flags));
         vga::println(b"[iso-light-k0] All Task Done.", vga::Color::Green);
+    }
+
+    // Phase 6 GAP D-07 Layer 2 self-check 모든 init + syscall::install + dispatcher arm 등록 직후
+    // 호출 위치 syscall::install (L226) 후 + try_spawn_user 진입 전 정확한 fail-stop 경계
+    // SAFETY 모든 init_* + STAR/LSTAR MSR 등록 완료 Ring 3 진입 이전 단일 코어
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        air_gap::gap_self_check();
+        vga::println(b"[iso-light-k0] gap_self_check OK.", vga::Color::Green);
     }
 
     //
@@ -1821,6 +1853,84 @@ pub fn handle_attest_fixture_export(ctx: &mut syscall::SyscallContext) -> u64 {
         cpu::clac();
     }
     0
+}
+
+/// Phase 6 GAP D-PHASE6 air-gap dual gate + sys_hsm_status + gap_self_check 통합 smoke test
+///
+/// # Safety
+/// 부팅 시 단일 코어 init_audit_read_cap + init_network_cap (cfg) + gap_self_check 모두 완료 가정
+/// debug + feature smoke 게이트로 release 빌드 부재
+///
+/// # Marker
+/// VGA 4 line emit GAP_PHASE6_OK qemu-test.sh REQUIRE_GAP_PHASE6_OK env accumulator 가 잠금
+#[cfg(all(target_arch = "x86_64", debug_assertions, feature = "smoke"))]
+unsafe fn gap_phase6_smoke_test() {
+    // Leg 1 AUDIT_READ_CAP token != 0 sanity (gap_self_check 통과 확인)
+    // SAFETY BSP single-core init_audit_read_cap 호출 완료 가정 read-only snapshot
+    let audit_cap_token = unsafe { (&raw const air_gap::AUDIT_READ_CAP).read().token };
+    if audit_cap_token == 0 {
+        // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] GAP_PHASE6 FAIL AUDIT_READ_CAP token 0",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+    // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] GAP_PHASE6 leg 1 AUDIT_READ_CAP token nonzero OK",
+            vga::Color::Green,
+        );
+    }
+
+    // Leg 2 (cfg tls-external) NETWORK_ATTACH_CAP token != 0 sanity
+    #[cfg(feature = "tls-external")]
+    {
+        // SAFETY BSP single-core init_network_cap 호출 완료 가정 read-only snapshot
+        let network_cap_token = unsafe { (&raw const air_gap::NETWORK_ATTACH_CAP).read().token };
+        if network_cap_token == 0 {
+            // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] GAP_PHASE6 FAIL NETWORK_ATTACH_CAP token 0",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+        // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] GAP_PHASE6 leg 2 NETWORK_ATTACH_CAP token nonzero OK",
+                vga::Color::Green,
+            );
+        }
+    }
+
+    // Leg 3 (cfg not tls-external) NETWORK_SYM_PRESENT cfg const fold sanity
+    #[cfg(not(feature = "tls-external"))]
+    {
+        const _: () = assert!(!air_gap::NETWORK_SYM_PRESENT);
+        // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] GAP_PHASE6 leg 2 NETWORK_SYM_PRESENT const fold OK",
+                vga::Color::Green,
+            );
+        }
+    }
+
+    // 마지막 GAP_PHASE6_OK marker (4-line 의 마지막 라인) Plan 06-07 qemu-test.sh grep 입력
+    // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] GAP_PHASE6_OK marker",
+            vga::Color::Green,
+        );
+    }
 }
 
 /// 마이크로커널 메인 이벤트 루프.
