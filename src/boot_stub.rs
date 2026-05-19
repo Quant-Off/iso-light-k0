@@ -16,7 +16,7 @@
 //! 페이지 테이블 설계 (부팅 중 활성):
 //!   - PML4[0]   -> boot_pdpt_low  -> 4 x 1 GiB Identity (0..4GiB -> 0..4GiB)
 //!   - PML4[511] -> boot_pdpt_high -> PDPT[510]: 0xFFFFFFFF_8000_0000 -> phys 0
-//!                                    PDPT[511]: 0xFFFFFFFF_C000_0000 -> phys 1GiB
+//!     PML4[511] (cont.)              PDPT[511]: 0xFFFFFFFF_C000_0000 -> phys 1GiB
 //!
 //! Higher-Half 점프 전략:
 //!   `_start64` 는 .boot32(저주소) 에 있으므로 `_kernel_start`(고주소) 로의

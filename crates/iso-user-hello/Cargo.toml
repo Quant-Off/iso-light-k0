@@ -1,0 +1,26 @@
+[package]
+name = "iso-user-hello"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Q. T. Felix NOTE: iso-light-k0 의 Ring 3 진입 검증용 사용자 프로그램입니다.
+#                   별도 워크스페이스로 분리되어 있어 커널 빌드와 독립적으로
+#                   `cargo build --release` 됩니다 (Makefile prerequisite).
+
+[[bin]]
+name = "iso-user-hello"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+codegen-units = 1
+strip = "symbols"

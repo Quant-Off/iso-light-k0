@@ -14,20 +14,44 @@ pub mod boot_stub; // Multiboot2 헤더 + 32-bit 부팅 스텁 (global_asm)
 pub mod capability; // Capability-based Access Control
 pub mod cpu; // CPU 특수 레지스터 / SIMD·FPU 컨텍스트 활성화
 pub mod crypto_service; // EP_CRYPTO 엔드포인트 암호화 서비스 디스패처
+pub mod sign_service;   // EP_SIGN 엔드포인트 ML-DSA PQ 서명 서비스
+pub mod elf; // ELF64 정적 실행 파일 파서
 pub mod hsm; // HSM 추상 트레이트 + NullHsm
+pub mod hsm_registry; // Phase 1: HSM 멀티 슬롯 레지스트리 (capability-backed)
+pub mod hsm_attest; // Phase 5: ML-DSA-44 attest verifier + AUDIT_RING + ATTEST_BUF
+pub mod air_gap; // Phase 6: air-gap 이중 게이트 + sys_hsm_status + 2 층 self-check
+pub mod bus; // Phase 2: 외부 버스 드라이버 추상화 (BusDriver trait + enum-dispatch)
 pub mod idt;
 pub mod ipc; // IPC 메시지 패싱 (동기 rendezvous)
 pub mod keystore; // 소프트 PSK 키 저장소 (HSM 폴백)
 pub mod memory_map;
 pub mod mmu;
 mod panic;
+#[cfg(target_arch = "x86_64")]
+pub mod process; // 정적 프로세스 슬롯 + Ring 3 진입
 pub mod stack; // 커널 스택 + 가드 페이지 레이아웃
+#[cfg(target_arch = "x86_64")]
+pub mod syscall; // syscall/sysret 사용자 ↔ 커널 진입 경로
 pub mod tls; // TLS 1.3 PSK (psk_dhe_ke / psk_pq_hybrid_ke)
 pub mod tss;
 pub mod vga;
 // 보안 메모리 소거는 외부 `zeroize` 크레이트(elib-k0-nt) 사용
 
 use mmu::{AddressSpace, KERNEL_VMA_BASE, Mmu, PageTableFlags, Uninitialized};
+
+//
+// 사용자 ELF 페이로드 (build.rs 가 OUT_DIR 로 복사한 후 환경변수로 노출)
+//
+// Phase C/D 의 사용자 크레이트가 빌드되어 있지 않으면 build.rs 가 4-byte
+// ELF magic placeholder 만 임베드함. 그 경우 elf::parse() 가 `Truncated` /
+// `BadMagic` 으로 거절하여 spawn 시도가 안전하게 fail-stop 됨.
+//
+// Phase E 통합 단계에서 _kernel_start 가 spawn_elf + enter_ring3 를 호출하면
+// dead_code 경고가 자동으로 해소됨. 그 전까지 일시 허용.
+#[allow(dead_code)]
+const USER_HELLO_ELF: &[u8] = include_bytes!(env!("ISO_USER_HELLO_ELF"));
+#[allow(dead_code)]
+const USER_LUMEN_ELF: &[u8] = include_bytes!(env!("ISO_USER_LUMEN_ELF"));
 
 //
 // 링커 스크립트 심볼
@@ -170,6 +194,41 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // SAFETY: IDT가 로드된 이후이므로 XSETBV가 GP를 일으키면 #GP 핸들러로 진입 가능
     unsafe {
         cpu::finalize_simd_fpu();
+    }
+
+    //
+    // 4.6. 사용자/커널 격리 보안 비트 일괄 활성화
+    //
+    // CR0.WP, CR4.SMEP/SMAP/UMIP, IA32_EFER.SCE 를 한 번에 켜서 Ring 3
+    // 사용자 프로세스가 진입하기 전에 격리 경계를 확립함.
+    // SAFETY: enable_simd_fpu() 로 CpuFeatures 가 캐싱됨, IDT 활성, CLI 상태
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        cpu::enable_security_bits();
+        vga::println(
+            b"[iso-light-k0] CR0.WP + CR4.SMEP/SMAP/UMIP + EFER.SCE Ready.",
+            vga::Color::Green,
+        );
+    }
+
+    //
+    // 4.7. syscall/sysret 인프라 설치
+    //
+    // STAR/LSTAR/CSTAR/SFMASK + KernelGsBase 를 BSP 에 설치.
+    // RSP0 는 부트 스택 최상단(boot_stack_top) 으로 설정 — 인터럽트가 사용자
+    // 모드에서 발생하면 자동으로 본 RSP 가 적재됨. syscall stub 은 GS-relative
+    // 로 동일 값을 사용함.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let (_, kstack_top) = stack::boot_stack_range();
+        // 16-byte 정렬 — System V x86_64 ABI 요구사항
+        let kstack_top = kstack_top & !0xF;
+        tss::set_rsp0(kstack_top);
+        syscall::install(kstack_top);
+        vga::println(
+            b"[iso-light-k0] Syscall ABI Installed (STAR/LSTAR/SFMASK).",
+            vga::Color::Green,
+        );
     }
 
     //
@@ -402,6 +461,39 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
         }
     }
 
+    // Phase 5 ENROLL D-01 D-09 부팅 시 1 회 신뢰 루트 dual-path 초기화 + BOOT_CHALLENGE 생성
+    // capability::init_prng 직후 + ipc::init 직전 위치 BOOT_CHALLENGE 생성은 CAP_DRBG 만 의존
+    // SAFETY 단일 코어 부팅 초기 capability::init_prng 완료 가정
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        hsm_attest::init_trust_root();
+        vga::println(
+            b"[iso-light-k0] Trust Root Init Done. (ML-DSA-44 1312B + BOOT_CHALLENGE 32B)",
+            vga::Color::Green,
+        );
+    }
+
+    // Phase 6 GAP D-02 D-06 부팅 시 1 회 NETWORK_ATTACH + AUDIT_READ cap mint (양 프로필 공통 + cfg)
+    // 호출 위치 hsm_attest::init_trust_root 직후 capability::init_prng + init_trust_root 완료 가정
+    // SAFETY 단일 코어 부팅 초기 BSP single-core invariant 양 init_*_cap 의 단일 진입 갱신
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        air_gap::init_audit_read_cap();
+        vga::println(
+            b"[iso-light-k0] AUDIT_READ_CAP Init Done.",
+            vga::Color::Green,
+        );
+
+        #[cfg(feature = "tls-external")]
+        {
+            air_gap::init_network_cap();
+            vga::println(
+                b"[iso-light-k0] NETWORK_ATTACH_CAP Init Done.",
+                vga::Color::Green,
+            );
+        }
+    }
+
     //
     // 13. IPC 서브시스템 초기화
     //
@@ -412,7 +504,17 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     unsafe {
         ipc::init();
         vga::println(
-            b"[iso-light-k0] IPC Init Done. (EP_SYSTEM, EP_CRYPTO)",
+            b"[iso-light-k0] IPC Init Done. (EP_SYSTEM, EP_CRYPTO, EP_SIGN)",
+            vga::Color::Green,
+        );
+    }
+
+    // Phase 1: HsmRegistry 정적 인스턴스는 `const fn new()` 로 부팅 instruction 0 시점부터
+    // 온라인 — 별도 init 호출 불필요. VGA 마커는 BSS 배치 + alloc=0 보장을 가시화.
+    // SAFETY: VGA MMIO 단일 코어 부팅 시점 접근 — 기존 println 호출 규약과 동일.
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] HsmRegistry static online (8 slots, alloc=0)",
             vga::Color::Green,
         );
     }
@@ -444,6 +546,55 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     }
 
     //
+    // 14.7. 부트 시점 HsmRegistry 라운드트립 스모크 테스트 (Phase 1)
+    //
+    // 디버그 빌드에서만 수행. attach -> is_valid_for -> detach -> zeroize 사이클을
+    // in-kernel 경로로 검증하고 qemu-test.sh 가 기대하는 마일스톤 문자열을 출력.
+    #[cfg(all(target_arch = "x86_64", debug_assertions))]
+    // SAFETY: capability::init_prng / ipc::init / HsmRegistry static 모두 온라인. 단일 코어.
+    unsafe {
+        hsm_registry_smoke_test();
+    }
+
+    //
+    // 14.8. 부트 시점 Phase 2 BusDriver 라운드트립 스모크 테스트
+    //
+    // SoftwareBus 루프백 echo (write -> read) + ct_eq 일치 + detach 후 raw bytes==0 (T-02-03).
+    // 성공 시 qemu-test.sh 의 BUS_PHASE2_OK 마커 게이트를 통과시킴 (additive — Phase 1 마커 보존).
+    #[cfg(all(target_arch = "x86_64", debug_assertions))]
+    // SAFETY: Phase 1 smoke 완료 직후 — REGISTRY 비어 있고 BSP 단일 코어 동일.
+    unsafe {
+        bus_phase2_smoke_test();
+    }
+
+    //
+    // 14.9. 부트 시점 Phase 3 In-Kernel Inter-HSM Channel 스모크 테스트
+    //
+    // Blake3 src → AesGcm dst relay + ciphertext in-kernel 재계산 동치성
+    // 성공 시 qemu-test.sh 의 CHAN_PHASE3_OK 마커 게이트 통과 (Phase 1/2 마커 보존)
+    #[cfg(all(target_arch = "x86_64", debug_assertions))]
+    // SAFETY: Phase 2 smoke 완료 후 detach cascade 가 REGISTRY 를 비웠음
+    unsafe {
+        chan_phase3_smoke_test();
+    }
+
+    //
+    // 14.10. 부트 시점 Phase 5 Attestation Gate 2-leg 스모크 테스트  feature smoke 한정
+    //
+    // Leg 1 valid sig 흐름 attach 성공  Leg 2 mutated sig 흐름 reject + 슬롯 변동 0
+    // 성공 시 qemu-test.sh ATTEST_PHASE5_OK 마커 게이트 통과 closed 프로필 부재
+    #[cfg(all(target_arch = "x86_64", debug_assertions, feature = "smoke"))]
+    // SAFETY Phase 3 smoke 완료 후 detach cascade 가 REGISTRY 를 비웠음 hsm_attest::init_trust_root 가 BSS 채움
+    unsafe {
+        attest_phase5_smoke_test();
+        // Phase 5.1 D-04 wire AttestSubmit / Status round-trip smoke
+        // Phase 5 marker 직후 호출  두 marker 모두 emit (Pitfall 6 substring 충돌 0)
+        attest_phase5_1_wire_smoke_test();
+        // Phase 6 GAP D-PHASE6 air-gap dual gate + sys_hsm_status + gap_self_check 4-line marker emit
+        gap_phase6_smoke_test();
+    }
+
+    //
     // 15. 인터럽트 활성화 + 커널 메인 이벤트 루프
     //
     // IDT, GDT, TSS, PIC 초기화 완료 후 STI로 인터럽트 수신 시작
@@ -454,7 +605,80 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
         vga::println(b"[iso-light-k0] All Task Done.", vga::Color::Green);
     }
 
+    // Phase 6 GAP D-07 Layer 2 self-check 모든 init + syscall::install + dispatcher arm 등록 직후
+    // 호출 위치 syscall::install (L226) 후 + try_spawn_user 진입 전 정확한 fail-stop 경계
+    // SAFETY 모든 init_* + STAR/LSTAR MSR 등록 완료 Ring 3 진입 이전 단일 코어
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        air_gap::gap_self_check();
+        vga::println(b"[iso-light-k0] gap_self_check OK.", vga::Color::Green);
+    }
+
+    //
+    // 16. Ring 3 사용자 프로세스 spawn (debug 빌드 + 유효 ELF 한정)
+    //
+    // 우선 lumen 와이어 호환 검증 프로그램(iso-user-lumen) 을 시도. ELF 가
+    // placeholder(4 바이트) 또는 빌드되지 않은 경우 elf::parse 가 거절하므로
+    // 그 다음 iso-user-hello 를 시도. 둘 다 실패하면 커널 메인 루프 진입.
+    //
+    // enter_ring3 는 ! 반환 — 성공 시 본 함수는 결코 메인 루프에 도달하지 않음.
+    // 사용자 프로세스가 sys_exit 하면 syscall::sys_exit 가 cli + hlt 무한
+    // 루프로 정지함.
+    #[cfg(all(target_arch = "x86_64", debug_assertions))]
+    // SAFETY: 위 단계가 모두 완료된 후. activate() 는 호출하지 않으며
+    //         enter_ring3 가 사용자 PML4 로 cr3 전환을 직접 수행함.
+    unsafe {
+        let kernel_space = &*(&raw const KERNEL_ADDR_SPACE);
+        try_spawn_user(USER_LUMEN_ELF, b"iso-user-lumen", kernel_space);
+        try_spawn_user(USER_HELLO_ELF, b"iso-user-hello", kernel_space);
+        vga::println(
+            b"[iso-light-k0] no valid user ELF embedded; entering kernel main loop",
+            vga::Color::Yellow,
+        );
+    }
+
     kernel_main_loop()
+}
+
+/// 임베드된 사용자 ELF 를 spawn 하고 성공 시 Ring 3 으로 진입함.
+///
+/// `elf` 가 placeholder (4-byte ELF magic) 이거나 손상된 경우 elf::parse 가
+/// 거절하며, 본 함수는 단순히 반환되어 호출자가 다음 ELF 를 시도하거나
+/// 메인 루프로 진입하도록 함.
+///
+/// # Safety
+/// 부팅 단계 16 의 모든 사전 조건이 충족된 상태에서만 호출.
+#[cfg(all(target_arch = "x86_64", debug_assertions))]
+unsafe fn try_spawn_user(elf: &[u8], label: &[u8], kernel_space: &AddressSpace) {
+    // 4-byte placeholder 는 ELF 헤더 64 바이트 미만이므로 parse 가 Truncated 로 거절.
+    // 그러나 길이 컷오프로 빠르게 판별하여 vga 메시지 노이즈를 줄임.
+    if elf.len() < 64 {
+        return;
+    }
+
+    // SAFETY: 부팅 단계 16 의 사전조건. spawn_elf 내부에서 ELF 검증 + 페이지 매핑.
+    match unsafe { process::spawn_elf(kernel_space, elf) } {
+        Ok(pid) => {
+            // SAFETY: VGA 직접 접근은 debug 빌드 한정 단일 코어 부팅 경로
+            unsafe {
+                vga::print(b"[iso-light-k0] spawned ", vga::Color::LightGray);
+                vga::print(label, vga::Color::White);
+                vga::println(b", entering Ring 3...", vga::Color::Green);
+            }
+            // SAFETY: 본 함수에서 spawn 직후 즉시 진입 — 다른 코드 끼지 않음.
+            //         enter_ring3 는 ! 반환.
+            unsafe {
+                process::enter_ring3(pid);
+            }
+        }
+        Err(_) => {
+            // SAFETY: VGA 직접 접근은 debug 빌드 한정 단일 코어 부팅 경로
+            unsafe {
+                vga::print(b"[iso-light-k0] spawn rejected ", vga::Color::DarkGray);
+                vga::println(label, vga::Color::DarkGray);
+            }
+        }
+    }
 }
 
 /// EP_CRYPTO 라운드트립 검증용 스모크 테스트 (debug 전용).
@@ -519,7 +743,7 @@ unsafe fn crypto_smoke_test() {
     // 4. 응답 형식 검증: HashResp · algo 에코 · 32바이트 다이제스트
     let payload = reply.payload_bytes();
     let ok = reply.header.msg_type == MessageType::HashResp
-        && payload.len() >= 56
+        && payload.len() >= ipc::CRYPTO_DATA_OFFSET
         && payload[0] == CryptoAlgo::Blake3 as u8
         && u16::from_le_bytes([payload[4], payload[5]]) as usize == 32;
 
@@ -731,6 +955,979 @@ unsafe fn tls_smoke_test() {
         crate::tls::wipe_all();
         vga::println(
             b"[iso-light-k0] tls smoke: keystore + pool wiped",
+            vga::Color::Green,
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", debug_assertions))]
+unsafe fn hsm_registry_smoke_test() {
+    use crate::bus::BusKind;
+    use hsm_registry::{
+        HSM_MAX_SLOTS, HsmCapability, HsmRights, HsmSlotIdx, HsmSlotInfo, attach_kernel_side,
+        with_registry, with_registry_mut,
+    };
+
+    // Step 1: 초기 상태 확인 — attached_count == 0
+    // SAFETY: BSP 단일 코어 부팅 시퀀스 + REGISTRY 정적 인스턴스 온라인
+    let initial_count = unsafe { with_registry(|r| r.attached_count()) };
+    if initial_count != 0 {
+        // SAFETY: identity-mapped VGA 버퍼(0xB8000), CLI 상태
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (initial count != 0)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 2: attach -> capability 발급 (실제 Hash-DRBG-SHA256 토큰)
+    // SAFETY: capability::init_prng() 완료, BSP 단일 코어
+    let cap = match unsafe {
+        attach_kernel_side(BusKind::Software, &[], HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE)
+    } {
+        Ok(c) => c,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (attach error)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+
+    // Step 3: is_valid_for 양성/음성 (CT 단일 분기)
+    if !cap.is_valid_for(cap.slot, HsmRights::USE) {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (valid cap rejected)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+    let wrong_slot = HsmSlotIdx(if cap.slot.0 == 0 { 1 } else { 0 });
+    if cap.is_valid_for(wrong_slot, HsmRights::USE) {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (wrong-slot accepted)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 4: enumerate (cap 보유) — 정확히 1개 슬롯 노출
+    let mut info_buf: [HsmSlotInfo; HSM_MAX_SLOTS] = [HsmSlotInfo::empty(); HSM_MAX_SLOTS];
+    // SAFETY: BSP 단일 코어 + REGISTRY 정적 인스턴스 온라인
+    let written = unsafe { with_registry(|r| r.enumerate(&mut info_buf)) };
+    if written != 1 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (enumerate count != 1)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 5: detach 거부 경로 정직 검증 (post-attach CAP-02 정신)
+    //   - 위조된 cap (token=0xDEAD_BEEF_DEAD_BEEF, 동일 slot) 으로 detach 호출 -> 실패 기대
+    //   - 슬롯 상태는 Attached 유지 (변경 없음)
+    let forged = HsmCapability::with_forged_token(0xDEAD_BEEF_DEAD_BEEF, cap.slot, HsmRights::REVOKE);
+    // SAFETY: BSP 단일 코어; detach 진입 가능 시점
+    let forged_result = unsafe { with_registry_mut(|r| r.detach(&forged, HsmRights::REVOKE)) };
+    if forged_result.is_ok() {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (forged cap accepted by detach)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+    // SAFETY: BSP 단일 코어; with_registry 의 invariant 동일
+    let still_attached = unsafe { with_registry(|r| !r.slot_is_empty(cap.slot)) };
+    if !still_attached {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (slot changed despite forged-cap rejection)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+    // SAFETY: identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] HSM_DETACH_NO_CAP_DENIED marker (forged cap rejected, slot unchanged)",
+            vga::Color::Green,
+        );
+    }
+
+    // Step 6: 합법 cap 으로 detach -> 슬롯 Empty 복귀 + zeroize 트리거
+    // SAFETY: BSP 단일 코어
+    let detach_result = unsafe { with_registry_mut(|r| r.detach(&cap, HsmRights::REVOKE)) };
+    if detach_result.is_err() {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (legitimate detach error)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 7: 슬롯 Empty + attached_count == 0 검증 (zeroize 효과 가시화)
+    // SAFETY: BSP 단일 코어
+    let is_empty = unsafe { with_registry(|r| r.slot_is_empty(cap.slot)) };
+    // SAFETY: BSP 단일 코어
+    let post_count = unsafe { with_registry(|r| r.attached_count()) };
+    if !is_empty || post_count != 0 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: HsmRegistry smoke FAILED (slot not zeroized post-detach)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // 성공 마일스톤
+    // SAFETY: identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] HSM_ATTACH_DETACH_ROUNDTRIP_OK marker",
+            vga::Color::Green,
+        );
+        vga::println(
+            b"[iso-light-k0] HsmRegistry smoke: attach -> verify -> detach -> zeroize OK",
+            vga::Color::Green,
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", debug_assertions))]
+unsafe fn bus_phase2_smoke_test() {
+    use crate::bus::{BusDriver, BusInstance, BusKind};
+    use hsm_registry::{HsmRights, attach_kernel_side, with_registry, with_registry_mut};
+
+    // Step 1+2: SoftHSM bus_kind 로 attach -> capability 발급
+    // SAFETY: capability::init_prng() 완료, BSP 단일 코어
+    let cap = match unsafe {
+        attach_kernel_side(
+            BusKind::Software,
+            &[],
+            HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE,
+        )
+    } {
+        Ok(c) => c,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (attach error)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let slot_idx = cap.slot.0 as usize;
+
+    // 테스트 페이로드 (16 bytes). 스택-로컬, alloc 없음.
+    let pattern: [u8; 16] = [
+        0xA5, 0x5A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+    ];
+
+    // Step 3: SoftwareBus 에 write
+    // SAFETY: BSP 단일 코어; with_registry_mut 의 invariant 동일
+    let write_result: Result<usize, crate::bus::BusError> = unsafe {
+        with_registry_mut(|r| match r.slot_bus_mut(slot_idx) {
+            Some(bus) => bus.write(&pattern),
+            None => Err(crate::bus::BusError::NotOpen),
+        })
+    };
+    let written = match write_result {
+        Ok(n) => n,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (bus.write error)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    if written != pattern.len() {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (write short)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 4: SoftwareBus 에서 read-back (루프백 echo)
+    let mut readback: [u8; 16] = [0u8; 16];
+    // SAFETY: BSP 단일 코어
+    let read_result: Result<usize, crate::bus::BusError> = unsafe {
+        with_registry_mut(|r| match r.slot_bus_mut(slot_idx) {
+            Some(bus) => bus.read(&mut readback),
+            None => Err(crate::bus::BusError::NotOpen),
+        })
+    };
+    let read_n = match read_result {
+        Ok(n) => n,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (bus.read error)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    if read_n != pattern.len() {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (read short)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 5: 루프백 동치성 검증 — 16바이트 XOR-OR fold (early-return 없는 단일 분기).
+    // CtEqOps 가 [u8] 슬라이스에 미구현 (스칼라 + SecureBuffer 만 지원) 이므로 동일 의미의
+    // O(N) OR-누산 패턴을 직접 작성한다 — 데이터-의존 분기는 발생하지 않음.
+    let mut diff: u8 = 0;
+    let mut i: usize = 0;
+    while i < pattern.len() {
+        diff |= pattern[i] ^ readback[i];
+        i += 1;
+    }
+    if diff != 0 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (loopback ct_eq mismatch)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 6: 합법 cap detach -> D-17 close-before-zeroize cascade 트리거
+    // SAFETY: BSP 단일 코어
+    let detach_result = unsafe { with_registry_mut(|r| r.detach(&cap, HsmRights::REVOKE)) };
+    if detach_result.is_err() {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (legitimate detach error)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 7: T-02-03 observability — detach 후 slot.bus 의 raw 96바이트 가 전부 0 인지 검사.
+    // SoftwareBus::zeroize 가 payload 를 비우고 BusInstance::zeroize 가 *self = Self::Empty
+    // (discriminant 0) 로 reset 한 결과를 가시화.
+    // SAFETY: BSP 단일 코어; slot_bus_mut 는 idx<HSM_MAX_SLOTS 일 때 항상 Some 반환.
+    let raw_all_zero: bool = unsafe {
+        with_registry_mut(|r| match r.slot_bus_mut(slot_idx) {
+            Some(bus) => {
+                let p: *const u8 = bus as *const BusInstance as *const u8;
+                let n: usize = core::mem::size_of::<BusInstance>();
+                // SAFETY: bus 는 유효한 &mut BusInstance — 동일 메모리 영역을 u8 슬라이스로 재해석.
+                let slice = core::slice::from_raw_parts(p, n);
+                slice.iter().all(|&b| b == 0)
+            }
+            None => false,
+        })
+    };
+    if !raw_all_zero {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (slot.bus raw bytes nonzero after detach)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // 추가 보강: registry 카운트 0 + 슬롯 Empty (Phase 1 cascade 와 동일)
+    // SAFETY: BSP 단일 코어
+    let post_count = unsafe { with_registry(|r| r.attached_count()) };
+    if post_count != 0 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: bus_phase2 smoke FAILED (attached_count != 0 post-detach)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // Step 8: 성공 마커 (qemu-test.sh 가 grep 으로 게이트)
+    // SAFETY: identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] BUS_PHASE2_OK marker (SoftwareBus loopback + detach cascade)",
+            vga::Color::Green,
+        );
+    }
+}
+
+// chan_phase3_smoke_test  Phase 3 in-kernel relay 라운드트립 검증  H4 모델 (D-22)  marker CHAN_PHASE3_OK
+#[cfg(all(target_arch = "x86_64", debug_assertions))]
+unsafe fn chan_phase3_smoke_test() {
+    use crate::bus::{BusDriver, BusInstance, BusKind, SoftHsmRole};
+    use aes::{AES256GCM, GCM_NONCE_SIZE, GCM_TAG_SIZE};
+    use blake::{BLAKE3_OUT_LEN, Blake3};
+    use hsm_registry::{HsmRights, attach_kernel_side, with_registry, with_registry_mut, with_relay_buf};
+
+    // (1) Blake3 src 슬롯 attach  rights = USE | REVOKE | RELAY_SRC
+    // SAFETY: capability::init_prng / REGISTRY static 모두 온라인  BSP 단일 코어
+    let cap_src = match unsafe {
+        attach_kernel_side(
+            BusKind::Software,
+            &[SoftHsmRole::Blake3 as u8],
+            HsmRights::USE | HsmRights::REVOKE | HsmRights::RELAY_SRC,
+        )
+    } {
+        Ok(c) => c,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (attach Blake3 src)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let src_slot = cap_src.slot.0 as usize;
+
+    // (2) AesGcm dst 슬롯 attach  rights = USE | REVOKE | RELAY_DST
+    // SAFETY: Phase 2 와 동일 invariant
+    let cap_dst = match unsafe {
+        attach_kernel_side(
+            BusKind::Software,
+            &[SoftHsmRole::AesGcm as u8],
+            HsmRights::USE | HsmRights::REVOKE | HsmRights::RELAY_DST,
+        )
+    } {
+        Ok(c) => c,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (attach AesGcm dst)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let dst_slot = cap_dst.slot.0 as usize;
+
+    // (3) src.write(b"PHASE3_INPUT")  Role::Blake3 → src.ring 에 32B digest 저장
+    let write_input: &[u8; 12] = b"PHASE3_INPUT";
+    // SAFETY: BSP 단일 코어; with_registry_mut 의 invariant 동일
+    let write_ok = unsafe {
+        with_registry_mut(|r| match r.slot_bus_mut(src_slot) {
+            Some(bus) => bus.write(write_input).is_ok(),
+            None => false,
+        })
+    };
+    if !write_ok {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (src.write)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (4) kernel-side relay  with_relay_buf 안에서 src.read 32B → dst.write 32B
+    // D-22 H4  syscall ABI 우회  with_relay_buf direct 진입  RELAY_BUF entry+exit zeroize 보장 (D-14)
+    // SAFETY: BSP single-core; with_relay_buf + with_registry_mut 는 disjoint static borrow
+    let relay_ok = unsafe {
+        with_relay_buf(|buf| {
+            let read_n = with_registry_mut(|r| match r.slot_bus_mut(src_slot) {
+                Some(bus) => bus.read(&mut buf[..BLAKE3_OUT_LEN]).unwrap_or(0),
+                None => 0,
+            });
+            if read_n != BLAKE3_OUT_LEN {
+                return false;
+            }
+            let write_n = with_registry_mut(|r| match r.slot_bus_mut(dst_slot) {
+                Some(bus) => bus.write(&buf[..BLAKE3_OUT_LEN]).unwrap_or(0),
+                None => 0,
+            });
+            // dst.write 의 AesGcm arm 은 32B input + 28B overhead = 60B 반환
+            write_n == BLAKE3_OUT_LEN + GCM_NONCE_SIZE + GCM_TAG_SIZE
+        })
+    };
+    if !relay_ok {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (relay)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (5) in-kernel 재계산 + slice ct_eq  dst.ring[..60] == AES256GCM(key, nonce_1, BLAKE3(input))
+    // RESEARCH §Risk #6  debug_aes_state / debug_ring 는 #[cfg(debug_assertions)] 노출  release 빌드 부재
+    // 5a — BLAKE3(b"PHASE3_INPUT") 직접 호출
+    let mut hasher = Blake3::new();
+    hasher.update(write_input);
+    let digest = match hasher.finalize() {
+        Ok(d) => d,
+        Err(_) => {
+            // SAFETY: identity-mapped VGA 버퍼
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (blake3 recompute)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let mut blake3_out = [0u8; BLAKE3_OUT_LEN];
+    blake3_out.copy_from_slice(&digest.as_slice()[..BLAKE3_OUT_LEN]);
+
+    // 5b — dst 의 fresh key + counter==1 직접 노출 + expected ciphertext 합성 + dst.ring 와 비교
+    let mut expected: [u8; 60] = [0u8; 60]; // nonce(12) || ct(32) || tag(16)
+    let mut got: [u8; 60] = [0u8; 60];
+    // SAFETY: BSP 단일 코어; debug_assertions 만 진입 가능
+    let mismatch: u8 = unsafe {
+        with_registry_mut(|r| -> u8 {
+            let bus = match r.slot_bus_mut(dst_slot) {
+                Some(b) => b,
+                None => return 1,
+            };
+            // BusInstance::Software 케이스 직접 매치  Phase 2 BUS-04 enum-dispatch 일관
+            let sw = match bus {
+                BusInstance::Software(sw) => sw,
+                _ => return 1,
+            };
+            let state = match sw.debug_aes_state() {
+                Some(s) => s,
+                None => return 1,
+            };
+            // nonce 직렬화 (counter == 1; D-12)
+            let mut nonce = [0u8; GCM_NONCE_SIZE];
+            nonce[..8].copy_from_slice(&state.nonce_counter.to_le_bytes());
+            // expected: encrypt(key, nonce, blake3_out)
+            let cipher = AES256GCM::new(state.key.expose());
+            let mut tag = [0u8; GCM_TAG_SIZE];
+            expected[..GCM_NONCE_SIZE].copy_from_slice(&nonce);
+            cipher.encrypt(
+                &nonce,
+                &[],
+                &blake3_out,
+                &mut expected[GCM_NONCE_SIZE..GCM_NONCE_SIZE + BLAKE3_OUT_LEN],
+                &mut tag,
+            );
+            expected[GCM_NONCE_SIZE + BLAKE3_OUT_LEN..].copy_from_slice(&tag);
+            // got: dst.ring[..60]
+            got.copy_from_slice(&sw.debug_ring()[..60]);
+            // slice CT-eq via XOR-OR fold (Phase 2 main.rs:1149-1157 패턴, RESEARCH §Risk #8)
+            let mut diff: u8 = 0;
+            let mut i = 0;
+            while i < 60 {
+                diff |= expected[i] ^ got[i];
+                i += 1;
+            }
+            diff
+        })
+    };
+    if mismatch != 0 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (ciphertext mismatch)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (6) 성공 마커  qemu-test.sh CHAN_PHASE3_OK 게이트
+    // SAFETY: identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] CHAN_PHASE3_OK marker (Blake3 src -> AesGcm dst relay)",
+            vga::Color::Green,
+        );
+    }
+
+    // (7) detach 두 슬롯  registry 정리 후 다음 부팅 invariant 보존
+    // SAFETY: BSP 단일 코어
+    let _ = unsafe { with_registry_mut(|r| r.detach(&cap_src, HsmRights::REVOKE)) };
+    let _ = unsafe { with_registry_mut(|r| r.detach(&cap_dst, HsmRights::REVOKE)) };
+    let n_attached = unsafe { with_registry(|r| r.attached_count()) };
+    if n_attached != 0 {
+        // SAFETY: identity-mapped VGA 버퍼
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: chan_phase3 smoke FAILED (detach cascade)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+}
+
+//
+// attest_phase5_smoke_test  Phase 5 attach with attestation gate 2-leg 검증  marker ATTEST_PHASE5_OK
+//
+// Leg 1 valid sig 흐름  dev sk 로 BLAKE3(pk||bus||BOOT_CHALLENGE) 서명 후
+//                       attach_kernel_side_with_attest Ok(cap) 슬롯 1 개 부착
+// Leg 2 mutated sig 흐름  sig[0] ^= 0xFF 후 동일 호출 Err(AttestFailed)
+//                         attached_count 변동 0 RESEARCH 6.2 atomicity 회귀 가드
+//
+// 본 smoke 는 feature smoke 게이트 아래에서만 컴파일 closed 프로필 dev sk leak 0 보장
+#[cfg(all(target_arch = "x86_64", debug_assertions, feature = "smoke"))]
+unsafe fn attest_phase5_smoke_test() {
+    use crate::bus::BusKind;
+    use blake::Blake3;
+    use hsm_attest::{ACTIVE_TRUST_ROOT_PK, BOOT_CHALLENGE};
+    use hsm_registry::{HsmRights, attach_kernel_side_with_attest, with_registry, with_registry_mut};
+    use mldsa::MLDSA44;
+
+    // Phase 5 D-02 dev sk 자료는 feature smoke 한정 include_bytes 로만 임베드
+    // closed 프로필 빌드는 본 함수 자체가 cfg-out 되어 sk44 자료 leak 0
+    const DEV_SK: &[u8; MLDSA44::SK_LEN] = include_bytes!("../keys/dev_trust_root.sk44");
+
+    // (1) BOOT_CHALLENGE 와 ACTIVE_TRUST_ROOT_PK 스냅샷  init_trust_root 가 부팅 시 이미 채움
+    // SAFETY BSP single-core 부팅 후 두 BSS static 의 단일 진입 read
+    let pk: [u8; MLDSA44::PK_LEN] = unsafe { *(&raw const ACTIVE_TRUST_ROOT_PK) };
+    let challenge: [u8; 32] = unsafe { *(&raw const BOOT_CHALLENGE) };
+
+    // (2) Pre-image 재구성  hsm_attest 의 verify_attest body 와 byte-exact mirror
+    // layout pk(1312) || bus_kind_octet(1) || BOOT_CHALLENGE(32) = 1345 옥텟
+    let bus_kind = BusKind::Software;
+    let mut pre = [0u8; MLDSA44::PK_LEN + 1 + 32];
+    pre[..MLDSA44::PK_LEN].copy_from_slice(&pk);
+    pre[MLDSA44::PK_LEN] = bus_kind as u8;
+    pre[MLDSA44::PK_LEN + 1..].copy_from_slice(&challenge);
+
+    // (3) BLAKE3 digest  서명 평문은 32 옥텟 digest (D-07 amendment)
+    let mut hasher = Blake3::new();
+    hasher.update(&pre);
+    let digest_buf = match hasher.finalize() {
+        Ok(d) => d,
+        Err(_) => {
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (blake3 digest)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&digest_buf.as_slice()[..32]);
+
+    // (4) ML-DSA-44 sign  ctx b"ISO-K0-ENROLL-V1" 16 옥텟 D-08 도메인 분리 verify_attest 와 동일 ctx
+    // rnd 인자는 결정적 smoke 회귀 일관성을 위해 고정 nonce [0xBB;32] 사용
+    let rnd = [0xBB_u8; 32];
+    let sig: [u8; MLDSA44::SIG_LEN] = match MLDSA44::sign(DEV_SK, &digest, b"ISO-K0-ENROLL-V1", &rnd) {
+        Ok(s) => s,
+        Err(_) => {
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (mldsa44 sign)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+
+    // (5) attest_payload 직렬화  pk(1312) || sig(2420) = 3732 옥텟 ATTEST_EXACT
+    const ATTEST_LEN: usize = MLDSA44::PK_LEN + MLDSA44::SIG_LEN;
+    let mut attest_payload = [0u8; ATTEST_LEN];
+    attest_payload[..MLDSA44::PK_LEN].copy_from_slice(&pk);
+    attest_payload[MLDSA44::PK_LEN..].copy_from_slice(&sig);
+
+    // (6) Leg 1 valid sig  attach 성공 Ok(cap) 슬롯 1 개 부착
+    let baseline_attached = unsafe { with_registry(|r| r.attached_count()) };
+    // SAFETY BSP single-core attach_kernel_side_with_attest 가 verify gate 활성
+    let cap_leg1 = match unsafe {
+        attach_kernel_side_with_attest(
+            BusKind::Software,
+            &[crate::bus::SoftHsmRole::Blake3 as u8],
+            &attest_payload,
+            HsmRights::USE | HsmRights::REVOKE,
+        )
+    } {
+        Ok(c) => c,
+        Err(_) => {
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (Leg 1 attach rejected)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let after_leg1_attached = unsafe { with_registry(|r| r.attached_count()) };
+    if after_leg1_attached != baseline_attached + 1 {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (Leg 1 slot count delta != 1)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (7) Leg 2 mutated sig  sig[0] ^= 0xFF 후 attach 실패 슬롯 변동 0 atomicity 회귀
+    let mut tampered_payload = attest_payload;
+    tampered_payload[MLDSA44::PK_LEN] ^= 0xFF;
+    let before_leg2_attached = unsafe { with_registry(|r| r.attached_count()) };
+    let leg2_result = unsafe {
+        attach_kernel_side_with_attest(
+            BusKind::Software,
+            &[crate::bus::SoftHsmRole::Blake3 as u8],
+            &tampered_payload,
+            HsmRights::USE | HsmRights::REVOKE,
+        )
+    };
+    if leg2_result.is_ok() {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (Leg 2 mutated sig accepted)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+    let after_leg2_attached = unsafe { with_registry(|r| r.attached_count()) };
+    if after_leg2_attached != before_leg2_attached {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5 smoke FAILED (Leg 2 slot count changed)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (8) 성공 마커  qemu-test.sh ATTEST_PHASE5_OK 게이트
+    // SAFETY identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] ATTEST_PHASE5_OK marker (Leg 1 valid sig + Leg 2 mutated reject)",
+            vga::Color::Green,
+        );
+    }
+
+    // (9) Leg 1 슬롯 detach  registry 정리 다음 smoke 또는 Ring 3 spawn invariant 보존
+    // SAFETY BSP 단일 코어
+    let _ = unsafe { with_registry_mut(|r| r.detach(&cap_leg1, HsmRights::REVOKE)) };
+}
+
+//
+// Phase 5.1 D-04 wire AttestSubmit fixture 정적 슬롯
+//
+// kernel 의 attest_phase5_1_wire_smoke_test 가 채우고
+// lumen 의 SyscallNum AttestFixtureExport(13) 가 사용자 공간으로 복사
+// feature smoke 한정 closed 빌드 BSS leak 0
+//
+// gate 정합  syscall variant / dispatch arm / handler 모두 #[cfg(feature = "smoke")]
+//           smoke test 함수만 추가로 debug_assertions 게이트 release+smoke
+//           빌드 시 fixture 는 BSS 슬롯으로 존재 (0 초기화), 채움 없음
+#[used]
+#[cfg(feature = "smoke")]
+static mut WIRE_ATTEST_FIXTURE: [u8; 3733] = [0u8; 3733];
+
+//
+// attest_phase5_1_wire_smoke_test  Phase 5.1 wire AttestSubmit / Status round-trip 9-step
+//                                  marker ATTEST_PHASE5_1_OK
+//
+// (1) BOOT_CHALLENGE 와 ACTIVE_TRUST_ROOT_PK 스냅샷 Phase 5 mirror
+// (2) Pre-image (pk || bus_kind || challenge) 재구성 + BLAKE3 digest
+// (3) ML-DSA-44 sign  ctx b"ISO-K0-ENROLL-V1"  rnd 결정적 [0xCC; 32]
+// (4) wire AttestSubmit payload 3733 옥텟 조립 (pk || bus_kind || sig)
+// (5) WIRE_ATTEST_FIXTURE 적재  lumen 의 sys_attest_fixture_export 수령 슬롯
+// (6) Leg 1 valid  kernel-direct handle_attest_submit  resp status = Ok 응답 16B
+// (7) Leg 2 mutated sig (sig 첫 옥텟 flip) handle_attest_submit  resp cmd 0xFFFF status 3
+// (8) audit_ring delta == 2 후행 검증 (5 WireReattestOk + 6 WireReattestFail)
+// (9) ATTEST_PHASE5_1_OK marker emit (Pitfall 6 substring 충돌 0)
+#[cfg(all(target_arch = "x86_64", debug_assertions, feature = "smoke"))]
+unsafe fn attest_phase5_1_wire_smoke_test() {
+    use crate::bus::{BusKind, WIRE_FRAME_MAX, handle_attest_submit};
+    use blake::Blake3;
+    use hsm_attest::{ACTIVE_TRUST_ROOT_PK, BOOT_CHALLENGE};
+    use mldsa::MLDSA44;
+    use zeroize::Zeroize;
+
+    // dev sk 자료는 feature smoke 한정 include_bytes 로만 임베드  closed 빌드 leak 0
+    const DEV_SK: &[u8; MLDSA44::SK_LEN] = include_bytes!("../keys/dev_trust_root.sk44");
+
+    // (1) BOOT_CHALLENGE 와 ACTIVE_TRUST_ROOT_PK 스냅샷
+    // SAFETY BSP single-core 부팅 후 두 BSS static 의 단일 진입 read
+    let pk: [u8; MLDSA44::PK_LEN] = unsafe { *(&raw const ACTIVE_TRUST_ROOT_PK) };
+    let challenge: [u8; 32] = unsafe { *(&raw const BOOT_CHALLENGE) };
+    let bus_kind = BusKind::Software;
+
+    // (2) Pre-image 재구성  hsm_attest verify_attest body 와 byte-exact mirror
+    let mut pre = [0u8; MLDSA44::PK_LEN + 1 + 32];
+    pre[..MLDSA44::PK_LEN].copy_from_slice(&pk);
+    pre[MLDSA44::PK_LEN] = bus_kind as u8;
+    pre[MLDSA44::PK_LEN + 1..].copy_from_slice(&challenge);
+
+    let mut hasher = Blake3::new();
+    hasher.update(&pre);
+    let digest_buf = match hasher.finalize() {
+        Ok(d) => d,
+        Err(_) => {
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: attest_phase5_1 wire smoke FAILED (blake3 digest)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&digest_buf.as_slice()[..32]);
+
+    // (3) ML-DSA-44 sign  ctx b"ISO-K0-ENROLL-V1" 16 옥텟 D-08 도메인 분리
+    // rnd 인자 결정적 smoke 회귀 일관성 위해 고정 nonce [0xCC; 32] 사용 (Phase 5 0xBB 와 분리)
+    let rnd = [0xCC_u8; 32];
+    let sig: [u8; MLDSA44::SIG_LEN] = match MLDSA44::sign(DEV_SK, &digest, b"ISO-K0-ENROLL-V1", &rnd) {
+        Ok(s) => s,
+        Err(_) => {
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: attest_phase5_1 wire smoke FAILED (mldsa44 sign)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+
+    // (4) wire AttestSubmit payload 3733 옥텟 조립 (pk(1312) || bus_kind(1) || sig(2420))
+    //     handle_attest_submit 가 기대하는 wire layout (Pitfall 1 회피)
+    const WIRE_ATTEST_LEN: usize = MLDSA44::PK_LEN + 1 + MLDSA44::SIG_LEN;
+    let mut attest_wire = [0u8; WIRE_ATTEST_LEN];
+    attest_wire[..MLDSA44::PK_LEN].copy_from_slice(&pk);
+    attest_wire[MLDSA44::PK_LEN] = bus_kind as u8;
+    attest_wire[MLDSA44::PK_LEN + 1..].copy_from_slice(&sig);
+
+    // (5) WIRE_ATTEST_FIXTURE 적재  lumen smoke 가 sys_attest_fixture_export 로 회수
+    // SAFETY BSP single-core 부팅 초기 본 함수 단일 진입
+    unsafe {
+        (*(&raw mut WIRE_ATTEST_FIXTURE)).copy_from_slice(&attest_wire);
+    }
+
+    // (6) handle_attest_submit kernel-side direct call (Leg 1 valid)
+    let baseline_total = unsafe { (*(&raw const crate::hsm_attest::AUDIT_RING)).total };
+    let mut resp_buf = [0u8; WIRE_FRAME_MAX];
+    let n1 = handle_attest_submit(1, &attest_wire, &mut resp_buf);
+    let resp_status_leg1 = u16::from_le_bytes([resp_buf[14], resp_buf[15]]);
+    if n1 != 16 || resp_status_leg1 != 0 {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5_1 wire smoke FAILED (Leg 1 dispatcher)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (7) Leg 2 mutated sig (sig 첫 옥텟 flip == fixture offset PK_LEN+1 == 1313)
+    let mut tampered = attest_wire;
+    tampered[MLDSA44::PK_LEN + 1] ^= 0xFF;
+    let mut resp_buf2 = [0u8; WIRE_FRAME_MAX];
+    let n2 = handle_attest_submit(2, &tampered, &mut resp_buf2);
+    let resp_cmd_leg2 = u16::from_le_bytes([resp_buf2[6], resp_buf2[7]]);
+    let resp_status_leg2 = u16::from_le_bytes([resp_buf2[14], resp_buf2[15]]);
+    if n2 != 16 || resp_cmd_leg2 != 0xFFFF || resp_status_leg2 != 3 {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5_1 wire smoke FAILED (Leg 2 dispatcher)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (8) audit_ring delta == 2 (5 WireReattestOk + 6 WireReattestFail)
+    let after_total = unsafe { (*(&raw const crate::hsm_attest::AUDIT_RING)).total };
+    if after_total != baseline_total + 2 {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5_1 wire smoke FAILED (audit_ring delta != 2)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (9) ATTEST_PHASE5_1_OK marker  Pitfall 6 substring 충돌 0 검증됨
+    // SAFETY identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] ATTEST_PHASE5_1_OK marker (wire AttestSubmit Leg1 ok + Leg2 denied + audit +2)",
+            vga::Color::Green,
+        );
+    }
+
+    // cleanup  비밀자료 stack-local 흔적 0
+    pre.zeroize();
+    digest.zeroize();
+    attest_wire.zeroize();
+    tampered.zeroize();
+}
+
+/// Phase 5.1 D-04 attest_payload 3733 옥텟 fixture export 핸들러 (feature smoke 한정)
+///
+/// SyscallNum AttestFixtureExport(13) 의 dispatch 본문 ABI
+///   rdi = out_ptr (user-space dst)
+///   rsi = out_len (== 3733 정확 정합)
+///   반환 u64  성공 시 0, 음수 SyscallError as_rax
+///
+/// # Safety
+/// 호출자 (lumen Ring 3) 가 ctx.rsi == 3733 정확 정합 후 호출 권장 본 함수 자체가 검증
+#[cfg(feature = "smoke")]
+pub fn handle_attest_fixture_export(ctx: &mut syscall::SyscallContext) -> u64 {
+    use syscall::{SyscallError, is_user_address};
+    let out_ptr = ctx.rdi;
+    let out_len = ctx.rsi as usize;
+    if out_len != 3733 {
+        return SyscallError::BadArg.as_rax();
+    }
+    if !is_user_address(out_ptr) || !is_user_address(out_ptr.saturating_add(3733)) {
+        return SyscallError::BadAddress.as_rax();
+    }
+    // SAFETY out_ptr 가 user_space dual-range 통과 SMAP stac/clac 윈도우 최소화
+    //        WIRE_ATTEST_FIXTURE 는 BSP single-core 부팅 초기 채워진 BSS read-only 진입
+    unsafe {
+        cpu::stac();
+        core::ptr::copy_nonoverlapping(
+            (&raw const WIRE_ATTEST_FIXTURE) as *const u8,
+            out_ptr as *mut u8,
+            3733,
+        );
+        cpu::clac();
+    }
+    0
+}
+
+/// Phase 6 GAP D-PHASE6 air-gap dual gate + sys_hsm_status + gap_self_check 통합 smoke test
+///
+/// # Safety
+/// 부팅 시 단일 코어 init_audit_read_cap + init_network_cap (cfg) + gap_self_check 모두 완료 가정
+/// debug + feature smoke 게이트로 release 빌드 부재
+///
+/// # Marker
+/// VGA 4 line emit GAP_PHASE6_OK qemu-test.sh REQUIRE_GAP_PHASE6_OK env accumulator 가 잠금
+#[cfg(all(target_arch = "x86_64", debug_assertions, feature = "smoke"))]
+unsafe fn gap_phase6_smoke_test() {
+    // Leg 1 AUDIT_READ_CAP token != 0 sanity (gap_self_check 통과 확인)
+    // SAFETY BSP single-core init_audit_read_cap 호출 완료 가정 read-only snapshot
+    let audit_cap_token = unsafe { (&raw const air_gap::AUDIT_READ_CAP).read().token };
+    if audit_cap_token == 0 {
+        // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] GAP_PHASE6 FAIL AUDIT_READ_CAP token 0",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+    // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] GAP_PHASE6 leg 1 AUDIT_READ_CAP token nonzero OK",
+            vga::Color::Green,
+        );
+    }
+
+    // Leg 2 (cfg tls-external) NETWORK_ATTACH_CAP token != 0 sanity
+    #[cfg(feature = "tls-external")]
+    {
+        // SAFETY BSP single-core init_network_cap 호출 완료 가정 read-only snapshot
+        let network_cap_token = unsafe { (&raw const air_gap::NETWORK_ATTACH_CAP).read().token };
+        if network_cap_token == 0 {
+            // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] GAP_PHASE6 FAIL NETWORK_ATTACH_CAP token 0",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+        // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] GAP_PHASE6 leg 2 NETWORK_ATTACH_CAP token nonzero OK",
+                vga::Color::Green,
+            );
+        }
+    }
+
+    // Leg 3 (cfg not tls-external) NETWORK_SYM_PRESENT cfg const fold sanity
+    #[cfg(not(feature = "tls-external"))]
+    {
+        const _: () = assert!(!air_gap::NETWORK_SYM_PRESENT);
+        // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] GAP_PHASE6 leg 2 NETWORK_SYM_PRESENT const fold OK",
+                vga::Color::Green,
+            );
+        }
+    }
+
+    // 마지막 GAP_PHASE6_OK marker (4-line 의 마지막 라인) Plan 06-07 qemu-test.sh grep 입력
+    // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] GAP_PHASE6_OK marker",
             vga::Color::Green,
         );
     }

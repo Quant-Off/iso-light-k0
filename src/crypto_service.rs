@@ -16,14 +16,18 @@
 use aes::{AES256GCM, GCM_NONCE_SIZE, GCM_TAG_SIZE};
 use blake::Blake3;
 use chacha20::ChaCha20Poly1305;
+use ed25519::{PublicKey as Ed25519Pk, SecretKey as Ed25519Sk, Signature as Ed25519Sig};
+use ed448::{PublicKey as Ed448Pk, SecretKey as Ed448Sk, Signature as Ed448Sig};
 use sha2::{SHA2, SHA256};
+use sha3::{SHA3, SHA3_256, SHA3_512};
+use x448::{PublicKey as X448Pk, SecretKey as X448Sk};
 use zeroize::volatile::secure_zero;
 use zeroize::{Secret, Zeroize};
 
 use crate::capability::EP_CRYPTO;
 use crate::ipc::{
-    CryptoAlgo, CryptoPayload, IPC_MAX_PAYLOAD, IpcError, IpcMessage, MessageType, ipc_recv,
-    ipc_reply,
+    CRYPTO_DATA_LEN, CRYPTO_DATA_OFFSET, CryptoAlgo, CryptoPayload, IPC_MAX_PAYLOAD, IpcError,
+    IpcMessage, MessageType, ipc_recv, ipc_reply,
 };
 
 //
@@ -32,12 +36,22 @@ use crate::ipc::{
 
 pub(crate) const SHA256_BLOCK_SIZE: usize = 64;
 pub(crate) const SHA256_OUTPUT_SIZE: usize = 32;
+const SHA3_256_OUTPUT_SIZE: usize = 32;
+const SHA3_512_OUTPUT_SIZE: usize = 64;
 const BLAKE3_OUTPUT_SIZE: usize = 32;
 const AES256_KEY_SIZE: usize = 32;
 const CHACHA20_KEY_SIZE: usize = 32;
+const ED25519_SK_SIZE: usize = ed25519::SECRET_KEY_LENGTH; // 32
+const ED25519_PK_SIZE: usize = ed25519::PUBLIC_KEY_LENGTH; // 32
+const ED25519_SIG_SIZE: usize = ed25519::SIGNATURE_LENGTH; // 64
+const ED448_SK_SIZE: usize = ed448::SECRET_KEY_LENGTH;     // 57
+const ED448_PK_SIZE: usize = ed448::PUBLIC_KEY_LENGTH;     // 57
+const ED448_SIG_SIZE: usize = ed448::SIGNATURE_LENGTH;     // 114
+const X448_SK_SIZE: usize = 56;
+const X448_PK_SIZE: usize = 56;
 
-/// HKDF-Expand 한 번에 허용되는 최대 출력 (RFC 5869 상한은 255×32, 여기선 페이로드 한계).
-const HKDF_MAX_OUTPUT: usize = 200;
+/// HKDF-Expand 한 번에 허용되는 최대 출력 (RFC 5869 상한은 255×32, 여기선 data 필드 한계).
+const HKDF_MAX_OUTPUT: usize = CRYPTO_DATA_LEN; // 168
 
 //
 // 서비스 에러
@@ -100,21 +114,21 @@ fn write_ok_reply(
     algo: u8,
     data: &[u8],
 ) -> Result<(), CryptoError> {
-    if data.len() > 200 {
+    if data.len() > CRYPTO_DATA_LEN {
         return Err(CryptoError::OutputTooLarge);
     }
     // SAFETY: buf는 align(8) 보장 없음 -> unaligned write 로 CryptoPayload 필드를 채움
-    //         fixed offsets 에 직접 기록함
+    //         fixed offsets 에 직접 기록함 (CRYPTO_DATA_OFFSET = 88)
     buf[0] = algo; // algo
     buf[1] = 0; // key_len (응답엔 키 없음)
     buf[2] = 0; // nonce_len
     buf[3] = 0; // flags (0 = success)
     buf[4..6].copy_from_slice(&(data.len() as u16).to_le_bytes()); // data_len
-    // buf[6..8] reserved
-    // buf[8..40]   key      = 0
-    // buf[40..52]  nonce    = 0
-    // buf[52..56]  pad      = 0
-    buf[56..56 + data.len()].copy_from_slice(data);
+    // buf[6..8]   reserved
+    // buf[8..72]  key[64]  = 0 (이미 Secret::new([0u8;...]) 로 초기화됨)
+    // buf[72..84] nonce    = 0
+    // buf[84..88] pad      = 0
+    buf[CRYPTO_DATA_OFFSET..CRYPTO_DATA_OFFSET + data.len()].copy_from_slice(data);
     Ok(())
 }
 
@@ -243,15 +257,15 @@ fn handle_encrypt(
 ) -> Result<(), CryptoError> {
     let algo = parse_algo(req.algo)?;
     let data_len = req.data_len as usize;
-    if data_len > 200 {
+    if data_len > CRYPTO_DATA_LEN {
         return Err(CryptoError::InvalidDataLength);
     }
 
     // 평문 / 키 / nonce 를 Secret 에 복사 (스택 상의 작업 메모리 자동 소거)
-    let mut plaintext = Secret::new([0u8; 200]);
+    let mut plaintext = Secret::new([0u8; CRYPTO_DATA_LEN]);
     plaintext.expose_mut()[..data_len].copy_from_slice(&req.data[..data_len]);
 
-    let mut ciphertext = Secret::new([0u8; 200]);
+    let mut ciphertext = Secret::new([0u8; CRYPTO_DATA_LEN]);
     let mut tag = [0u8; GCM_TAG_SIZE]; // GCM_TAG_SIZE == Poly1305 태그 == 16
 
     let enc_result: Result<usize, CryptoError> = match algo {
@@ -269,13 +283,13 @@ fn handle_encrypt(
             // 응답: ciphertext ‖ tag (ct_len + 16 bytes)
             // ct_len 은 평문 길이와 동일 (AEAD)
             let total = ct_len + GCM_TAG_SIZE;
-            if total > 200 {
+            if total > CRYPTO_DATA_LEN {
                 // 응답 버퍼 초과 — 실패로 전환 및 소거
                 ciphertext.expose_mut().zeroize();
                 tag.zeroize();
                 return Err(CryptoError::OutputTooLarge);
             }
-            let mut out = Secret::new([0u8; 200]);
+            let mut out = Secret::new([0u8; CRYPTO_DATA_LEN]);
             out.expose_mut()[..ct_len].copy_from_slice(&ciphertext.expose()[..ct_len]);
             out.expose_mut()[ct_len..total].copy_from_slice(&tag);
             let r = write_ok_reply(reply, req.algo, &out.expose()[..total]);
@@ -298,7 +312,7 @@ fn handle_decrypt(
     let algo = parse_algo(req.algo)?;
     let data_len = req.data_len as usize;
     // data = ciphertext ‖ tag
-    if !(GCM_TAG_SIZE..=200).contains(&data_len) {
+    if !(GCM_TAG_SIZE..=CRYPTO_DATA_LEN).contains(&data_len) {
         return Err(CryptoError::InvalidDataLength);
     }
     let ct_len = data_len - GCM_TAG_SIZE;
@@ -306,10 +320,10 @@ fn handle_decrypt(
     let mut tag = [0u8; GCM_TAG_SIZE];
     tag.copy_from_slice(&req.data[ct_len..data_len]);
 
-    let mut ciphertext = Secret::new([0u8; 200]);
+    let mut ciphertext = Secret::new([0u8; CRYPTO_DATA_LEN]);
     ciphertext.expose_mut()[..ct_len].copy_from_slice(&req.data[..ct_len]);
 
-    let mut plaintext = Secret::new([0u8; 200]);
+    let mut plaintext = Secret::new([0u8; CRYPTO_DATA_LEN]);
 
     let dec_result: Result<(), CryptoError> = match algo {
         CryptoAlgo::Aes256Gcm => decrypt_aes256gcm(req, &ciphertext, ct_len, &tag, &mut plaintext),
@@ -336,9 +350,9 @@ fn handle_decrypt(
 
 fn encrypt_aes256gcm(
     req: &CryptoPayload,
-    plaintext: &Secret<[u8; 200]>,
+    plaintext: &Secret<[u8; CRYPTO_DATA_LEN]>,
     pt_len: usize,
-    ciphertext: &mut Secret<[u8; 200]>,
+    ciphertext: &mut Secret<[u8; CRYPTO_DATA_LEN]>,
     tag: &mut [u8; GCM_TAG_SIZE],
 ) -> Result<usize, CryptoError> {
     if req.key_len as usize != AES256_KEY_SIZE {
@@ -369,10 +383,10 @@ fn encrypt_aes256gcm(
 
 fn decrypt_aes256gcm(
     req: &CryptoPayload,
-    ciphertext: &Secret<[u8; 200]>,
+    ciphertext: &Secret<[u8; CRYPTO_DATA_LEN]>,
     ct_len: usize,
     tag: &[u8; GCM_TAG_SIZE],
-    plaintext: &mut Secret<[u8; 200]>,
+    plaintext: &mut Secret<[u8; CRYPTO_DATA_LEN]>,
 ) -> Result<(), CryptoError> {
     if req.key_len as usize != AES256_KEY_SIZE {
         return Err(CryptoError::InvalidKeyLength);
@@ -408,9 +422,9 @@ fn decrypt_aes256gcm(
 
 fn encrypt_chacha20poly(
     req: &CryptoPayload,
-    plaintext: &Secret<[u8; 200]>,
+    plaintext: &Secret<[u8; CRYPTO_DATA_LEN]>,
     pt_len: usize,
-    ciphertext: &mut Secret<[u8; 200]>,
+    ciphertext: &mut Secret<[u8; CRYPTO_DATA_LEN]>,
     tag: &mut [u8; 16],
 ) -> Result<usize, CryptoError> {
     if req.key_len as usize != CHACHA20_KEY_SIZE {
@@ -441,10 +455,10 @@ fn encrypt_chacha20poly(
 
 fn decrypt_chacha20poly(
     req: &CryptoPayload,
-    ciphertext: &Secret<[u8; 200]>,
+    ciphertext: &Secret<[u8; CRYPTO_DATA_LEN]>,
     ct_len: usize,
     tag: &[u8; 16],
-    plaintext: &mut Secret<[u8; 200]>,
+    plaintext: &mut Secret<[u8; CRYPTO_DATA_LEN]>,
 ) -> Result<(), CryptoError> {
     if req.key_len as usize != CHACHA20_KEY_SIZE {
         return Err(CryptoError::InvalidKeyLength);
@@ -486,20 +500,19 @@ fn decrypt_chacha20poly(
 fn handle_hash(req: &CryptoPayload, reply: &mut [u8; IPC_MAX_PAYLOAD]) -> Result<(), CryptoError> {
     let algo = parse_algo(req.algo)?;
     let data_len = req.data_len as usize;
-    if data_len > 200 {
+    if data_len > CRYPTO_DATA_LEN {
         return Err(CryptoError::InvalidDataLength);
     }
     let msg = &req.data[..data_len];
 
     match algo {
         CryptoAlgo::HmacSha256 => {
-            // HMAC-SHA256: 키는 req.key[..key_len]
             let key_len = req.key_len as usize;
-            if key_len > 32 {
+            if key_len > SHA256_BLOCK_SIZE {
                 return Err(CryptoError::InvalidKeyLength);
             }
             let key_secret = {
-                let mut k = Secret::new([0u8; 32]);
+                let mut k = Secret::new([0u8; SHA256_BLOCK_SIZE]);
                 k.expose_mut()[..key_len].copy_from_slice(&req.key[..key_len]);
                 k
             };
@@ -515,6 +528,27 @@ fn handle_hash(req: &CryptoPayload, reply: &mut [u8; IPC_MAX_PAYLOAD]) -> Result
             let digest = h.finalize().map_err(|_| CryptoError::InvalidRequest)?;
             let mut out = [0u8; BLAKE3_OUTPUT_SIZE];
             out.copy_from_slice(&digest.as_slice()[..BLAKE3_OUTPUT_SIZE]);
+            let r = write_ok_reply(reply, req.algo, &out);
+            out.zeroize();
+            r
+        }
+        CryptoAlgo::Sha3_256 => {
+            let mut h = SHA3_256::new();
+            h.update(msg);
+            let digest = h.finalize();
+            let mut out = [0u8; SHA3_256_OUTPUT_SIZE];
+            out.copy_from_slice(&digest.as_bytes()[..SHA3_256_OUTPUT_SIZE]);
+            let r = write_ok_reply(reply, req.algo, &out);
+            out.zeroize();
+            r
+        }
+        CryptoAlgo::Sha3_512 => {
+            let mut h = SHA3_512::new();
+            h.update(msg);
+            let digest = h.finalize();
+            // SHA3-512 출력 64B; CRYPTO_DATA_LEN(168)에 충분히 수용됨
+            let mut out = [0u8; SHA3_512_OUTPUT_SIZE];
+            out.copy_from_slice(&digest.as_bytes()[..SHA3_512_OUTPUT_SIZE]);
             let r = write_ok_reply(reply, req.algo, &out);
             out.zeroize();
             r
@@ -553,7 +587,7 @@ fn handle_kdf(req: &CryptoPayload, reply: &mut [u8; IPC_MAX_PAYLOAD]) -> Result<
     if nonce_len > 12 {
         return Err(CryptoError::InvalidNonceLength);
     }
-    if !(2..=200).contains(&data_len) {
+    if !(2..=CRYPTO_DATA_LEN).contains(&data_len) {
         return Err(CryptoError::InvalidDataLength);
     }
 
@@ -600,7 +634,160 @@ fn parse_algo(byte: u8) -> Result<CryptoAlgo, CryptoError> {
         x if x == CryptoAlgo::ChaCha20Poly as u8 => Ok(CryptoAlgo::ChaCha20Poly),
         x if x == CryptoAlgo::HmacSha256 as u8 => Ok(CryptoAlgo::HmacSha256),
         x if x == CryptoAlgo::Blake3 as u8 => Ok(CryptoAlgo::Blake3),
+        x if x == CryptoAlgo::Sha3_256 as u8 => Ok(CryptoAlgo::Sha3_256),
+        x if x == CryptoAlgo::Sha3_512 as u8 => Ok(CryptoAlgo::Sha3_512),
         x if x == CryptoAlgo::HkdfSha256 as u8 => Ok(CryptoAlgo::HkdfSha256),
+        x if x == CryptoAlgo::Ed25519Sign as u8 => Ok(CryptoAlgo::Ed25519Sign),
+        x if x == CryptoAlgo::Ed25519Verify as u8 => Ok(CryptoAlgo::Ed25519Verify),
+        x if x == CryptoAlgo::Ed448Sign as u8 => Ok(CryptoAlgo::Ed448Sign),
+        x if x == CryptoAlgo::Ed448Verify as u8 => Ok(CryptoAlgo::Ed448Verify),
+        x if x == CryptoAlgo::X448Dh as u8 => Ok(CryptoAlgo::X448Dh),
+        _ => Err(CryptoError::UnknownAlgorithm),
+    }
+}
+
+//
+// 서명 생성 핸들러
+//
+
+fn handle_sign(
+    req: &CryptoPayload,
+    reply: &mut [u8; IPC_MAX_PAYLOAD],
+) -> Result<(), CryptoError> {
+    let algo = parse_algo(req.algo)?;
+    let data_len = req.data_len as usize;
+    if data_len > CRYPTO_DATA_LEN {
+        return Err(CryptoError::InvalidDataLength);
+    }
+
+    match algo {
+        CryptoAlgo::Ed25519Sign => {
+            if req.key_len as usize != ED25519_SK_SIZE {
+                return Err(CryptoError::InvalidKeyLength);
+            }
+            let mut raw = Secret::new([0u8; ED25519_SK_SIZE]);
+            raw.expose_mut().copy_from_slice(&req.key[..ED25519_SK_SIZE]);
+            let sk = Ed25519Sk::from_bytes(raw.expose());
+            let sig = ed25519::sign(&req.data[..data_len], &sk);
+            write_ok_reply(reply, req.algo, sig.as_bytes())
+            // sk, raw 은 Drop 시 자동 소거
+        }
+        CryptoAlgo::Ed448Sign => {
+            if req.key_len as usize != ED448_SK_SIZE {
+                return Err(CryptoError::InvalidKeyLength);
+            }
+            let sk_arr: &[u8; ED448_SK_SIZE] = req.key[..ED448_SK_SIZE]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let sk = Ed448Sk::from_bytes(sk_arr);
+            let sig = ed448::sign(&req.data[..data_len], &sk);
+            write_ok_reply(reply, req.algo, sig.as_bytes())
+        }
+        _ => Err(CryptoError::UnknownAlgorithm),
+    }
+}
+
+//
+// 서명 검증 핸들러
+//
+
+fn handle_verify(
+    req: &CryptoPayload,
+    reply: &mut [u8; IPC_MAX_PAYLOAD],
+) -> Result<(), CryptoError> {
+    let algo = parse_algo(req.algo)?;
+    let data_len = req.data_len as usize;
+
+    match algo {
+        CryptoAlgo::Ed25519Verify => {
+            // data = sig(64B) || message
+            if req.key_len as usize != ED25519_PK_SIZE {
+                return Err(CryptoError::InvalidKeyLength);
+            }
+            if data_len < ED25519_SIG_SIZE {
+                return Err(CryptoError::InvalidDataLength);
+            }
+            if data_len > CRYPTO_DATA_LEN {
+                return Err(CryptoError::InvalidDataLength);
+            }
+            let pk_arr: &[u8; ED25519_PK_SIZE] = req.key[..ED25519_PK_SIZE]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let sig_arr: &[u8; ED25519_SIG_SIZE] = req.data[..ED25519_SIG_SIZE]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidDataLength)?;
+            let pk = Ed25519Pk::from_bytes(pk_arr);
+            let sig = Ed25519Sig::from_bytes(sig_arr);
+            let msg = &req.data[ED25519_SIG_SIZE..data_len];
+            match ed25519::verify(msg, &sig, &pk) {
+                Ok(()) => write_ok_reply(reply, req.algo, &[1u8]),
+                Err(_) => Err(CryptoError::AuthenticationFailed),
+            }
+        }
+        CryptoAlgo::Ed448Verify => {
+            // data = sig(114B) || message (≤54B)
+            if req.key_len as usize != ED448_PK_SIZE {
+                return Err(CryptoError::InvalidKeyLength);
+            }
+            if data_len < ED448_SIG_SIZE {
+                return Err(CryptoError::InvalidDataLength);
+            }
+            if data_len > CRYPTO_DATA_LEN {
+                return Err(CryptoError::InvalidDataLength);
+            }
+            let pk_arr: &[u8; ED448_PK_SIZE] = req.key[..ED448_PK_SIZE]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let sig_arr: &[u8; ED448_SIG_SIZE] = req.data[..ED448_SIG_SIZE]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidDataLength)?;
+            let pk = Ed448Pk::from_bytes(pk_arr);
+            let sig = Ed448Sig::from_bytes(sig_arr);
+            let msg = &req.data[ED448_SIG_SIZE..data_len];
+            match ed448::verify(msg, &sig, &pk) {
+                Ok(()) => write_ok_reply(reply, req.algo, &[1u8]),
+                Err(_) => Err(CryptoError::AuthenticationFailed),
+            }
+        }
+        _ => Err(CryptoError::UnknownAlgorithm),
+    }
+}
+
+//
+// Diffie-Hellman 핸들러
+//
+
+fn handle_dh(
+    req: &CryptoPayload,
+    reply: &mut [u8; IPC_MAX_PAYLOAD],
+) -> Result<(), CryptoError> {
+    let algo = parse_algo(req.algo)?;
+
+    match algo {
+        CryptoAlgo::X448Dh => {
+            // key[0..56] = 자신의 비밀키, data[0..56] = 상대방 공개키
+            if req.key_len as usize != X448_SK_SIZE {
+                return Err(CryptoError::InvalidKeyLength);
+            }
+            if req.data_len as usize != X448_PK_SIZE {
+                return Err(CryptoError::InvalidDataLength);
+            }
+            let sk_arr: [u8; X448_SK_SIZE] = req.key[..X448_SK_SIZE]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidKeyLength)?;
+            let pk_arr: [u8; X448_PK_SIZE] = req.data[..X448_PK_SIZE]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidDataLength)?;
+            let sk = X448Sk::from_bytes(sk_arr);
+            let peer_pk = X448Pk::from_bytes(pk_arr);
+            let shared = sk.diffie_hellman(&peer_pk);
+            // 소그룹 공격 방지: 공유비밀이 0(기여 없음)이면 거부
+            if shared.is_zero() {
+                return Err(CryptoError::AuthenticationFailed);
+            }
+            write_ok_reply(reply, req.algo, shared.as_bytes())
+            // shared: SharedSecret(Secret<[u8;56]>) 은 Drop 시 자동 소거
+        }
         _ => Err(CryptoError::UnknownAlgorithm),
     }
 }
@@ -655,6 +842,18 @@ pub unsafe fn dispatch() -> Result<(), IpcError> {
             MessageType::KeyDeriveReq => (
                 MessageType::KeyDeriveResp,
                 handle_kdf(req.expose(), reply.expose_mut()),
+            ),
+            MessageType::SignReq => (
+                MessageType::SignResp,
+                handle_sign(req.expose(), reply.expose_mut()),
+            ),
+            MessageType::VerifyReq => (
+                MessageType::VerifyResp,
+                handle_verify(req.expose(), reply.expose_mut()),
+            ),
+            MessageType::DhReq => (
+                MessageType::DhResp,
+                handle_dh(req.expose(), reply.expose_mut()),
             ),
             _ => (MessageType::Error, Err(CryptoError::InvalidRequest)),
         },

@@ -18,7 +18,7 @@
 //!   - 페이로드 길이 범위 검사로 버퍼 오버플로 방지
 //!   - 메시지 시퀀스 번호로 재생 공격(replay attack) 기초 방어
 
-use crate::capability::{Capability, EP_CRYPTO, EP_SYSTEM, EndpointId, Rights};
+use crate::capability::{Capability, EP_CRYPTO, EP_LUMEN_WIRE, EP_SIGN, EP_SYSTEM, EndpointId, Rights};
 use zeroize::volatile::secure_zero;
 use zeroize::{Secret, Zeroize};
 
@@ -39,7 +39,7 @@ pub const IPC_MAX_ENDPOINTS: usize = 16;
 /// 메시지 게시 직후 해당 서비스 핸들러를 **동일 호출 스택에서 동기적으로 실행**함.
 /// 이로써 스케줄러 구현 이전에도 round-trip(call-reply) IPC 가 작동함.
 fn is_kernel_service(id: EndpointId) -> bool {
-    id == EP_CRYPTO || id == EP_SYSTEM
+    id == EP_CRYPTO || id == EP_SYSTEM || id == EP_SIGN
 }
 
 //
@@ -67,7 +67,7 @@ pub enum MessageType {
     DecryptReq = 0x1003,
     /// 복호화 응답 (plaintext, 실패 시 Error 반환)
     DecryptResp = 0x1004,
-    /// HMAC-SHA256 / BLAKE3 해시 요청
+    /// HMAC-SHA256 / BLAKE3 / SHA3 해시 요청
     HashReq = 0x1005,
     /// 해시 응답
     HashResp = 0x1006,
@@ -75,6 +75,40 @@ pub enum MessageType {
     KeyDeriveReq = 0x1007,
     /// 키 파생 응답
     KeyDeriveResp = 0x1008,
+    /// 서명 생성 요청 (Ed25519 / Ed448)
+    SignReq = 0x1009,
+    /// 서명 생성 응답
+    SignResp = 0x100A,
+    /// 서명 검증 요청 (Ed25519 / Ed448)
+    VerifyReq = 0x100B,
+    /// 서명 검증 응답
+    VerifyResp = 0x100C,
+    /// Diffie-Hellman 요청 (X448)
+    DhReq = 0x100D,
+    /// Diffie-Hellman 응답
+    DhResp = 0x100E,
+
+    // PQ 서명 서비스 (EP_SIGN) — ML-DSA 청크 프로토콜
+    /// 서명 세션 시작 요청
+    SignBeginReq = 0x2001,
+    /// 서명 세션 시작 응답
+    SignBeginResp = 0x2002,
+    /// 입력 데이터 청크 전송
+    SignInChunkReq = 0x2003,
+    /// 입력 청크 수신 확인
+    SignInChunkResp = 0x2004,
+    /// 연산 실행 요청
+    SignExecReq = 0x2005,
+    /// 연산 실행 응답
+    SignExecResp = 0x2006,
+    /// 출력 청크 요청
+    SignOutChunkReq = 0x2007,
+    /// 출력 청크 응답
+    SignOutChunkResp = 0x2008,
+    /// 세션 종료 요청
+    SignEndReq = 0x2009,
+    /// 세션 종료 응답
+    SignEndResp = 0x200A,
 
     // 에러
     Error = 0xFFFF,
@@ -98,8 +132,22 @@ pub enum CryptoAlgo {
     HmacSha256 = 0x10,
     /// BLAKE3
     Blake3 = 0x11,
+    /// SHA3-256
+    Sha3_256 = 0x12,
+    /// SHA3-512
+    Sha3_512 = 0x13,
     /// HKDF-SHA256 (키 파생)
     HkdfSha256 = 0x20,
+    /// Ed25519 서명 생성 (key=sk 32B, data=message)
+    Ed25519Sign = 0x30,
+    /// Ed25519 서명 검증 (key=pk 32B, data[0..64]=sig, data[64..]=message)
+    Ed25519Verify = 0x31,
+    /// Ed448 서명 생성 (key[0..57]=sk, data=message ≤111B)
+    Ed448Sign = 0x32,
+    /// Ed448 서명 검증 (key[0..57]=pk, data[0..114]=sig, data[114..]=message ≤54B)
+    Ed448Verify = 0x33,
+    /// X448 Diffie-Hellman (key[0..56]=sk, data[0..56]=peer_pk)
+    X448Dh = 0x40,
 }
 
 //
@@ -134,10 +182,21 @@ pub struct MessageHeader {
 ///   [3]      flags (예약)
 ///   [4..5]   data_len (실제 데이터 길이)
 ///   [6..7]   예약
-///   [8..39]  key (최대 32 bytes)
-///   [40..51] nonce (최대 12 bytes)
-///   [52..55] 예약
-///   [56..255] data (최대 200 bytes)
+///   [8..71]  key (최대 64 bytes — Ed448/X448 지원용으로 32→64 확장)
+///   [72..83] nonce (최대 12 bytes)
+///   [84..87] 예약
+///   [88..255] data (최대 168 bytes)
+///
+/// key 필드 알고리즘별 용도:
+///   - AES-256-GCM / ChaCha20: key[0..32] = 대칭키 (32B)
+///   - Ed25519 Sign: key[0..32] = 비밀키 (32B)
+///   - Ed25519 Verify: key[0..32] = 공개키 (32B)
+///   - Ed448 Sign: key[0..57] = 비밀키 (57B)
+///   - Ed448 Verify: key[0..57] = 공개키 (57B)
+///   - X448 DH: key[0..56] = 비밀키 (56B)
+pub const CRYPTO_DATA_OFFSET: usize = 88;
+pub const CRYPTO_DATA_LEN: usize = 168;
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct CryptoPayload {
@@ -147,10 +206,10 @@ pub struct CryptoPayload {
     pub flags: u8,
     pub data_len: u16,
     _reserved: u16,
-    pub key: [u8; 32],   // 키 (민감 데이터)
+    pub key: [u8; 64],   // 키 (민감 데이터, Ed448/X448 지원 위해 64B)
     pub nonce: [u8; 12], // nonce
     _pad: [u8; 4],
-    pub data: [u8; 200], // 평문 또는 암호문
+    pub data: [u8; 168], // 평문 또는 암호문 (key 확장으로 200→168)
 }
 
 impl CryptoPayload {
@@ -162,10 +221,10 @@ impl CryptoPayload {
             flags: 0,
             data_len: 0,
             _reserved: 0,
-            key: [0u8; 32],
+            key: [0u8; 64],
             nonce: [0u8; 12],
             _pad: [0u8; 4],
-            data: [0u8; 200],
+            data: [0u8; 168],
         }
     }
 }
@@ -178,6 +237,63 @@ impl Zeroize for CryptoPayload {
             secure_zero(
                 self as *mut CryptoPayload as *mut u8,
                 core::mem::size_of::<CryptoPayload>(),
+            );
+        }
+    }
+}
+
+/// ML-DSA 청크 프로토콜 페이로드 (EP_SIGN).
+///
+/// 256 bytes:
+///   [0]      phase: 1=Begin, 2=InChunk, 3=Exec, 4=OutChunk, 5=End
+///   [1]      op: 1=Keygen, 2=Sign, 3=Verify
+///   [2]      variant: 1=ML-DSA-44 (현재 지원)
+///   [3]      result: 0=ok, 비-0=에러
+///   [4..7]   offset: 청크 바이트 오프셋 (LE u32)
+///   [8..11]  total: 입출력 총 바이트 수 선언 (LE u32)
+///   [12..13] chunk_len: data 필드 유효 바이트 수
+///   [14..15] 예약
+///   [16..255] data: 청크 데이터 (최대 240B)
+///
+/// Begin 요청 시 data[0..4]=key_len(LE u32), data[4..8]=aux_len, data[8..12]=msg_len.
+/// InChunk: 입력 스트림은 [key || aux || message] 순으로 연속 전송.
+/// OutChunk: 출력 스트림은 [pk || sk](Keygen) 또는 [sig](Sign) 또는 [result](Verify).
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct SignPayload {
+    pub phase: u8,
+    pub op: u8,
+    pub variant: u8,
+    pub result: u8,
+    pub offset: u32,
+    pub total: u32,
+    pub chunk_len: u16,
+    pub _pad: u16,
+    pub data: [u8; 240],
+}
+
+impl SignPayload {
+    pub const fn zeroed() -> Self {
+        Self {
+            phase: 0,
+            op: 0,
+            variant: 0,
+            result: 0,
+            offset: 0,
+            total: 0,
+            chunk_len: 0,
+            _pad: 0,
+            data: [0u8; 240],
+        }
+    }
+}
+
+impl Zeroize for SignPayload {
+    fn zeroize(&mut self) {
+        unsafe {
+            secure_zero(
+                self as *mut SignPayload as *mut u8,
+                core::mem::size_of::<SignPayload>(),
             );
         }
     }
@@ -439,6 +555,19 @@ impl IpcRegistry {
 // SAFETY: 부팅 초기 단일 코어 접근만 허용 (SMP 이후 spinlock 필요)
 static mut IPC_REGISTRY: IpcRegistry = IpcRegistry::empty();
 
+// Phase 2 신규 — Ring3ProcessBus::open 의 endpoint 존재성 검증 진입점 (RESEARCH §3 / Pitfall B).
+pub fn endpoint_exists(id: EndpointId) -> bool {
+    if id == EndpointId::INVALID {
+        return false;
+    }
+    // SAFETY: BSP single-core read-only access; IPC_REGISTRY is initialized by
+    // ipc::init() in boot order before any user-space attach reaches this path.
+    let reg = unsafe { &*(&raw const IPC_REGISTRY) };
+    reg.endpoints
+        .iter()
+        .any(|slot| slot.as_ref().map_or(false, |ep| ep.id == id))
+}
+
 //
 // 공개 IPC API
 //
@@ -457,6 +586,10 @@ pub unsafe fn init() {
     let _ = reg.register(EP_SYSTEM, Rights::CALL);
     // EP_CRYPTO: CALL 권한 필요 (암호화 서비스 진입점)
     let _ = reg.register(EP_CRYPTO, Rights::CALL);
+    // EP_SIGN: CALL 권한 필요 (ML-DSA PQ 서명 서비스)
+    let _ = reg.register(EP_SIGN, Rights::CALL);
+    // EP_LUMEN_WIRE: Phase 4 Ring 3 lumen wire endpoint — Ring3ProcessBus::open endpoint_exists 게이트 통과 (Pitfall 5)
+    let _ = reg.register(EP_LUMEN_WIRE, Rights::CALL);
 }
 
 /// 메시지를 전송하고 응답을 동기적으로 대기함 (Synchronous Call).
@@ -496,6 +629,12 @@ pub unsafe fn ipc_call(
                 // SAFETY: ipc_call 의 호출 조건(단일 코어 / 외부 동기화)을 그대로 상속
                 unsafe {
                     crate::crypto_service::dispatch()?;
+                }
+            }
+            id if id == EP_SIGN => {
+                // SAFETY: ipc_call 의 호출 조건(단일 코어 / 외부 동기화)을 그대로 상속
+                unsafe {
+                    crate::sign_service::dispatch()?;
                 }
             }
             // EP_SYSTEM 핸들러는 추후 구현 (시스템 콜 디스패처)
@@ -575,6 +714,14 @@ pub unsafe fn ipc_reply(
 pub unsafe fn issue_crypto_capability() -> Result<Capability, crate::capability::CapError> {
     // SAFETY: 호출자가 단일 코어 접근을 보장
     unsafe { crate::capability::generate_capability(EP_CRYPTO, Rights::CALL) }
+}
+
+/// PQ 서명 서비스(EP_SIGN)에 대한 CALL Capability를 발급함.
+///
+/// # Safety
+/// [`issue_crypto_capability`] 와 동일.
+pub unsafe fn issue_sign_capability() -> Result<Capability, crate::capability::CapError> {
+    unsafe { crate::capability::generate_capability(EP_SIGN, Rights::CALL) }
 }
 
 /// 시스템 서비스(EP_SYSTEM)에 대한 CALL Capability를 발급함.

@@ -137,6 +137,23 @@ pub fn base_addr() -> u64 {
     (&raw const KERNEL_TSS) as u64
 }
 
+/// Ring 3 → Ring 0 전환 시 자동 로드되는 커널 스택 포인터(RSP0)를 설정함.
+///
+/// 인터럽트/예외가 사용자 모드(CPL=3)에서 발생하거나 IRETQ 가 사용자 모드
+/// 진입을 수행할 때 CPU 가 본 RSP0 값을 RSP 에 자동 적재함. (Intel SDM
+/// Vol.3A §6.14.2). `syscall` 명령은 RSP0 를 사용하지 않으므로 syscall
+/// 진입 stub 은 별도로 GS-relative per-CPU 변수에서 커널 스택을 로드함.
+///
+/// # Safety
+/// 단일 코어 부팅 초기에서 호출하며, `rsp` 는 16-byte 정렬된 유효한 커널
+/// 스택 최상단 VMA 여야 함.
+pub unsafe fn set_rsp0(rsp: u64) {
+    // SAFETY: 부팅 초기 단일 코어 접근
+    unsafe {
+        (*(&raw mut KERNEL_TSS)).rsp[0] = rsp;
+    }
+}
+
 /// TSS 크기 - 1 (GDT 디스크립터 limit 필드에 사용).
 pub fn limit() -> u16 {
     (size_of::<TaskStateSegment>() - 1) as u16

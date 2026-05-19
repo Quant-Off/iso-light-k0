@@ -33,6 +33,49 @@ pub const MAX_PSK_SLOTS: usize = 8;
 /// 더 긴 PSK 가 필요하면 본 풀과 분리된 별도 풀을 추가하여 대응.
 pub const MAX_PSK_LEN: usize = 64;
 
+// Phase 5 D-Discretion 신뢰 루트 PSK slot 네임스페이스 예약
+// RESEARCH §14.2 Option (iii) stub 본 const 는 본 페이즈에서 사용되지 않으며 향후 keystore provisioning 의 자리만 잡음
+#[allow(dead_code)]
+pub const TRUST_ROOT_PSK_SLOT: u8 = 0xFE;
+
+// Phase 5.1 D-03 신뢰 루트 ML-DSA-44 PK 의 raw 1312-옥텟 슬롯
+//
+// `k0_trust_root_keystore` cfg 활성 빌드에서만 부팅 시 채워질 수 있음
+// closed 빌드는 본 정적 자료 + helper 가 cfg-out → binary 심볼 0
+//
+// MAX_PSK_LEN = 64 와 별개의 raw 1312 옥텟 슬롯 책임 경계 분리
+#[cfg(k0_trust_root_keystore)]
+static mut TRUST_ROOT_PK_SLOT: Option<[u8; 1312]> = None;
+
+/// trust root 1312-옥텟 PK 를 raw 복사로 반환
+///
+/// # Safety
+/// BSP single-core 부팅 초기에만 호출 SMP 시 spinlock 필요
+/// 본 helper 는 ACTIVE_TRUST_ROOT_PK 의 staging buffer 역할 단일 read
+#[cfg(k0_trust_root_keystore)]
+pub fn read_trust_root_pk() -> Option<[u8; 1312]> {
+    // SAFETY BSP single-core 부팅 초기 + 단일 read
+    unsafe { (*(&raw const TRUST_ROOT_PK_SLOT)).clone() }
+}
+
+/// trust root 1312-옥텟 PK 의 provision (production 진입점 stub)
+///
+/// # Safety
+/// 호출자가 BSP single-core 부팅 초기 invariant 보장
+/// 본 페이즈는 read 가능 상태만 잠금 실 provisioning 흐름은 향후 phase
+///
+/// # Errors
+/// 현재 항상 Ok(()) 향후 phase 가 validation 추가
+#[cfg(k0_trust_root_keystore)]
+pub unsafe fn provision_trust_root_pk(pk: &[u8; 1312]) -> Result<(), KeystoreError> {
+    // SAFETY 호출자가 invariant 보장 본 함수는 BSP single-core 가정
+    unsafe {
+        let slot = &mut *(&raw mut TRUST_ROOT_PK_SLOT);
+        *slot = Some(*pk);
+    }
+    Ok(())
+}
+
 /// 슬롯 lifecycle.
 ///
 /// `Wiped` 는 단방향 종착 상태 — 같은 슬롯에 새 키를 다시 공급할 수 없음.

@@ -11,9 +11,9 @@
 //!     MasterSecret 에서 "c ap traffic" -> C-AP-TS_0, "s ap traffic" ->
 //!     S-AP-TS_0 가 도출됨.
 //!   - per-direction:
-//!       key          = HKDF-Expand-Label(traffic_secret, "key", "", AEAD_KEY_LEN)
-//!       iv           = HKDF-Expand-Label(traffic_secret, "iv",  "", AEAD_IV_LEN)
-//!       finished_key = HKDF-Expand-Label(traffic_secret, "finished", "", hash_len)
+//!     key          = HKDF-Expand-Label(traffic_secret, "key", "", AEAD_KEY_LEN)
+//!     iv           = HKDF-Expand-Label(traffic_secret, "iv",  "", AEAD_IV_LEN)
+//!     finished_key = HKDF-Expand-Label(traffic_secret, "finished", "", hash_len)
 //!
 //! Hybrid 시 ECDHE_SS = X25519_SS ‖ ML-KEM-768_SS (draft-ietf-tls-hybrid),
 //! Classical 시 ECDHE_SS = X25519_SS 입니다.

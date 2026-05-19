@@ -244,6 +244,18 @@ HAS_TLS_HYBRID=false
 HAS_TLS_CLASSICAL=false
 HAS_TLS_WIPED=false
 HAS_ALL_DONE=false
+# Phase 1 신규 마일스톤 (additive — 기존 플래그 보존, W-1)
+HAS_HSM_STATIC_ONLINE=false
+HAS_HSM_SMOKE=false
+HAS_HSM_ROUNDTRIP=false
+HAS_HSM_DETACH_NOCAP_DENIED=false
+# Phase 2 BusDriver 마일스톤 (additive — Phase 1 게이트는 그대로 유지)
+HAS_BUS_PHASE2_OK=false
+HAS_CHAN_PHASE3_OK=false  # Phase 3 marker  ci-phase3 게이트
+HAS_WIRE_PHASE4_OK=false  # Phase 4 marker  ci-phase4 게이트
+HAS_ATTEST_PHASE5_OK=false  # Phase 5 marker  ci-phase5 게이트
+HAS_ATTEST_PHASE5_1_OK=false  # Phase 5.1 marker  ci-phase5_1 게이트
+HAS_GAP_PHASE6_OK=false  # Phase 6 marker  ci-phase6 게이트
 if [ -s "${VGA_TXT}" ]; then
     grep -q "Booted\. Initializing"           "${VGA_TXT}" && HAS_BOOTED=true
     grep -q "Capability DRBG Init Done"       "${VGA_TXT}" && HAS_DRBG=true
@@ -252,6 +264,23 @@ if [ -s "${VGA_TXT}" ]; then
     grep -q "Classical (X25519) OK"           "${VGA_TXT}" && HAS_TLS_CLASSICAL=true
     grep -q "keystore + pool wiped"           "${VGA_TXT}" && HAS_TLS_WIPED=true
     grep -q "All Task Done"                   "${VGA_TXT}" && HAS_ALL_DONE=true
+    # Phase 1 HsmRegistry 마일스톤 (additive)
+    grep -q "HsmRegistry static online (8 slots, alloc=0)"                "${VGA_TXT}" && HAS_HSM_STATIC_ONLINE=true
+    grep -q "HsmRegistry smoke: attach -> verify -> detach -> zeroize OK" "${VGA_TXT}" && HAS_HSM_SMOKE=true
+    grep -q "HSM_ATTACH_DETACH_ROUNDTRIP_OK marker"                       "${VGA_TXT}" && HAS_HSM_ROUNDTRIP=true
+    grep -q "HSM_DETACH_NO_CAP_DENIED marker"                             "${VGA_TXT}" && HAS_HSM_DETACH_NOCAP_DENIED=true
+    # Phase 2 BusDriver smoke 마일스톤 (additive)
+    grep -q "BUS_PHASE2_OK marker"                                        "${VGA_TXT}" && HAS_BUS_PHASE2_OK=true
+    # Phase 3 In-Kernel Inter-HSM Channel smoke 마일스톤 (additive)
+    grep -q "CHAN_PHASE3_OK marker"                                       "${VGA_TXT}" && HAS_CHAN_PHASE3_OK=true
+    # Phase 4 Wire Contract Ring 3 lumen smoke 마일스톤 (additive)
+    grep -q "WIRE_PHASE4_OK"                                              "${VGA_TXT}" && HAS_WIRE_PHASE4_OK=true
+    # Phase 5 Attestation Gate kernel-side smoke 마일스톤 (additive  feature smoke 한정)
+    grep -q "ATTEST_PHASE5_OK"                                            "${VGA_TXT}" && HAS_ATTEST_PHASE5_OK=true
+    # Phase 5.1 wire AttestSubmit / Status / lumen smoke 마일스톤 (additive  feature smoke 한정)
+    grep -q "ATTEST_PHASE5_1_OK"                                          "${VGA_TXT}" && HAS_ATTEST_PHASE5_1_OK=true
+    # Phase 6 air-gap dual gate / sys_hsm_status / gap_self_check smoke 마일스톤 (additive feature smoke 한정)
+    grep -q "GAP_PHASE6_OK"                                               "${VGA_TXT}" && HAS_GAP_PHASE6_OK=true
 fi
 
 echo "  [부팅 진입]                    $($HAS_BOOTED && echo PASS || echo MISS)"
@@ -261,6 +290,16 @@ echo "  [TLS PQ-Hybrid 핸드셰이크]      $($HAS_TLS_HYBRID && echo PASS || e
 echo "  [TLS Classical 핸드셰이크]      $($HAS_TLS_CLASSICAL && echo PASS || echo MISS)"
 echo "  [TLS keystore + pool 소거]      $($HAS_TLS_WIPED && echo PASS || echo MISS)"
 echo "  [메인 루프 진입(All Task Done)] $($HAS_ALL_DONE && echo PASS || echo MISS)"
+echo "  [HsmRegistry static online]     $($HAS_HSM_STATIC_ONLINE && echo PASS || echo MISS)"
+echo "  [HsmRegistry smoke OK]          $($HAS_HSM_SMOKE && echo PASS || echo MISS)"
+echo "  [HSM attach->detach roundtrip]  $($HAS_HSM_ROUNDTRIP && echo PASS || echo MISS)"
+echo "  [HSM detach no-cap denied]      $($HAS_HSM_DETACH_NOCAP_DENIED && echo PASS || echo MISS)"
+echo "  [BUS_PHASE2_OK marker]          $($HAS_BUS_PHASE2_OK && echo PASS || echo MISS)"
+echo "  [CHAN_PHASE3_OK marker]         $($HAS_CHAN_PHASE3_OK && echo PASS || echo MISS)"
+echo "  [WIRE_PHASE4_OK marker]         $($HAS_WIRE_PHASE4_OK && echo PASS || echo MISS)"
+echo "  [ATTEST_PHASE5_OK marker]       $($HAS_ATTEST_PHASE5_OK && echo PASS || echo MISS)"
+echo "  [ATTEST_PHASE5_1_OK marker]     $($HAS_ATTEST_PHASE5_1_OK && echo PASS || echo MISS)"
+echo "  [GAP_PHASE6_OK marker]          $($HAS_GAP_PHASE6_OK && echo PASS || echo MISS)"
 
 if ! $HAS_SMOKE_OK; then
     PASS=false
@@ -277,6 +316,56 @@ fi
 if ! $HAS_TLS_WIPED; then
     PASS=false
     FAIL_REASONS+=("TLS 종료 후 키 자료 소거 미확인")
+fi
+# Phase 1 HsmRegistry 마일스톤 fail-accumulator (additive)
+if [ "$HAS_HSM_STATIC_ONLINE" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("HsmRegistry static online 마커 없음 (main.rs 모듈 선언 또는 부팅 순서 누락)")
+fi
+if [ "$HAS_HSM_SMOKE" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("HsmRegistry 스모크 테스트 성공 마커 없음 (attach->detach->zeroize 라운드트립 실패)")
+fi
+if [ "$HAS_HSM_ROUNDTRIP" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("HSM_ATTACH_DETACH_ROUNDTRIP_OK 마커 없음")
+fi
+if [ "$HAS_HSM_DETACH_NOCAP_DENIED" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("HSM_DETACH_NO_CAP_DENIED 마커 없음 — post-attach CAP-02 enforcement 실패")
+fi
+# Phase 2 BusDriver fail-accumulator (additive)
+if [ "$HAS_BUS_PHASE2_OK" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("BUS_PHASE2_OK 마커 없음 — Phase 2 SoftwareBus 루프백 + detach cascade 실패")
+fi
+# Phase 3 In-Kernel Inter-HSM Channel fail-accumulator (additive)
+if [ "$HAS_CHAN_PHASE3_OK" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("CHAN_PHASE3_OK 마커 없음 — Phase 3 Blake3 src -> AesGcm dst relay 라운드트립 실패")
+fi
+# Phase 4 Wire Contract fail-accumulator (additive)
+if [ "$HAS_WIRE_PHASE4_OK" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("WIRE_PHASE4_OK 마커 없음  Phase 4 lumen Ring 3 wire Blake3Hash contract 실패")
+fi
+# Phase 5 Attestation Gate fail-accumulator  feature smoke 활성 빌드에서만 강제
+# REQUIRE_ATTEST_PHASE5_OK=1 인 경우에만 marker 부재를 실패로 누적 (qemu-smoke-smoke Makefile 타겟이 셋)
+if [ "${REQUIRE_ATTEST_PHASE5_OK:-0}" = "1" ] && [ "$HAS_ATTEST_PHASE5_OK" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("ATTEST_PHASE5_OK 마커 없음  Phase 5 attach with attestation Leg 1 valid sig 또는 Leg 2 mutated reject 실패")
+fi
+# Phase 5.1 Wire AttestSubmit / Status / lumen leg fail-accumulator  feature smoke 활성 빌드에서만 강제
+# REQUIRE_ATTEST_PHASE5_1_OK=1 인 경우에만 marker 부재를 실패로 누적 (qemu-smoke-smoke Makefile 타겟이 셋)
+if [ "${REQUIRE_ATTEST_PHASE5_1_OK:-0}" = "1" ] && [ "$HAS_ATTEST_PHASE5_1_OK" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("ATTEST_PHASE5_1_OK 마커 없음 — Phase 5.1 wire AttestSubmit / Status / lumen leg 실패")
+fi
+# Phase 6 Air-Gap Dual Enforcement fail-accumulator  feature smoke 활성 빌드에서만 강제
+# REQUIRE_GAP_PHASE6_OK=1 인 경우에만 marker 부재를 실패로 누적 (qemu-smoke-smoke Makefile 타겟이 셋)
+if [ "${REQUIRE_GAP_PHASE6_OK:-0}" = "1" ] && [ "$HAS_GAP_PHASE6_OK" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("GAP_PHASE6_OK 마커 없음 — Phase 6 dual gate / sys_hsm_status / gap_self_check leg 실패")
 fi
 
 # (d) QEMU exit 코드 (timeout=124, 모니터 quit=정상)

@@ -119,7 +119,7 @@ impl PageTableFlags {
 // 에러 타입
 //
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MmuError {
     /// W^X 정책 위반: WRITABLE + 실행 가능을 동시에 요청
     WxPolicyViolation,
@@ -295,6 +295,90 @@ impl AddressSpace {
         leaf.set(phys_addr, flags.union(PageTableFlags::PRESENT))
     }
 
+    /// 사용자 페이지 매핑(Ring 3 접근 가능, W^X 강제).
+    ///
+    /// 코드 페이지(`writable = false`): `PRESENT | USER_ACCESSIBLE`
+    /// 데이터 페이지(`writable = true`): `PRESENT | USER_ACCESSIBLE | WRITABLE | NO_EXECUTE`
+    ///
+    /// # Errors
+    /// - `UnalignedAddress`: `virt_addr` 가 사용자 영역(`PML4[0..256]`) 밖이거나
+    ///   페이지 정렬되어 있지 않을 때.
+    /// - `WxPolicyViolation`: 호출자가 잘못된 플래그 조합을 강제할 때 (방어적).
+    /// - `AlreadyMapped` / `FrameAllocFailed`: 기본 `map_page()` 와 동일.
+    pub fn map_user_page(
+        &mut self,
+        virt_addr: u64,
+        phys_addr: u64,
+        writable: bool,
+    ) -> Result<(), MmuError> {
+        if !is_user_va(virt_addr) {
+            return Err(MmuError::UnalignedAddress);
+        }
+        let mut flags = PageTableFlags::PRESENT.union(PageTableFlags::USER_ACCESSIBLE);
+        if writable {
+            flags = flags
+                .union(PageTableFlags::WRITABLE)
+                .union(PageTableFlags::NO_EXECUTE);
+        }
+        self.map_page(virt_addr, phys_addr, flags)
+    }
+
+    /// 가상 주소 `va` 에 대한 4 KiB 페이지의 물리 주소를 페이지 테이블 워크로
+    /// 산출함. 매핑이 없으면 `None`. 1 GiB / 2 MiB 대용량 페이지 leaf 도 `None`
+    /// 으로 반환되어 사용자 매핑 경로(항상 4 KiB) 의 정확한 dec coupling 을
+    /// 강제함.
+    ///
+    /// # Safety
+    /// 부트 페이지 테이블이 활성(LINEAR_MAP_ACTIVE = false) 인 동안에는 중간
+    /// 테이블도 identity-mapped 4 GiB 영역 안에 있다고 가정함. activate()
+    /// 이후에는 직접 선형 매핑이 활성화되므로 `phys_to_linear_virt()` 경로가
+    /// 필요해지며, 본 메서드는 사용 전제 변경에 따라 갱신해야 함.
+    pub unsafe fn walk_to_phys(&self, va: u64) -> Option<u64> {
+        let pml4 = &self.pml4;
+        let pdpt_entry = pml4.entries[PageTable::index(va, 4)];
+        if !pdpt_entry.is_present() {
+            return None;
+        }
+        // SAFETY: identity-mapped 단계 — 중간 테이블 phys 주소 = 가상 주소
+        let pdpt_ptr = pdpt_entry.phys_addr() as *const PageTable;
+        let pdpt = unsafe { &*pdpt_ptr };
+        let pd_entry = pdpt.entries[PageTable::index(va, 3)];
+        if !pd_entry.is_present() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return None;
+        }
+        // SAFETY: 동상
+        let pd = unsafe { &*(pd_entry.phys_addr() as *const PageTable) };
+        let pt_entry = pd.entries[PageTable::index(va, 2)];
+        if !pt_entry.is_present() || pt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return None;
+        }
+        // SAFETY: 동상
+        let pt = unsafe { &*(pt_entry.phys_addr() as *const PageTable) };
+        let leaf = pt.entries[PageTable::index(va, 1)];
+        if !leaf.is_present() {
+            return None;
+        }
+        Some(leaf.phys_addr())
+    }
+
+    /// 다른 `AddressSpace` 의 PML4 상위 절반(엔트리 256..512, 커널 직접 선형
+    /// 매핑 + 커널 세그먼트) 을 본 객체에 inherit 함.
+    ///
+    /// 사용자 주소 공간(PML4[0..256]) 은 변경되지 않으므로 사용자 격리는
+    /// 그대로 유지됨. 이 함수는 새 사용자 PML4 생성 직후 한 번만 호출 가정.
+    ///
+    /// # Safety
+    /// - `from` 의 PML4 가 유효한 커널 매핑을 보유해야 함 (build_linear_map +
+    ///   커널 세그먼트 매핑 완료 상태).
+    /// - 호출 시점에 본 객체 PML4 의 상위 절반이 비어 있거나 동일 매핑이어야
+    ///   함. 잘못 호출 시 기존 매핑이 덮어쓰여 메모리 식별자 충돌이 발생할 수
+    ///   있음.
+    pub unsafe fn inherit_kernel_mappings(&mut self, from: &AddressSpace) {
+        for i in 256..TABLE_ENTRIES {
+            self.pml4.entries[i] = from.pml4.entries[i];
+        }
+    }
+
     /// 2 MiB 대용량 페이지 매핑 (직접 선형 매핑 구축 전용).
     ///
     /// PD 레벨에서 HUGE_PAGE 플래그를 설정하여 PT 레벨을 생략함.
@@ -333,6 +417,19 @@ impl AddressSpace {
                 .union(PageTableFlags::HUGE_PAGE),
         )
     }
+}
+
+//
+// 사용자 영역 판정 헬퍼
+//
+
+/// `va` 가 사용자 가상 주소(PML4[0..256], canonical lower half) 범위인지.
+///
+/// 사용자 매핑은 `0x0 .. 0x0000_8000_0000_0000` 에 위치하며, 그 외(직접
+/// 선형 매핑 / 커널 세그먼트 등)는 매핑 거부. 또한 페이지 정렬을 강제함.
+#[inline]
+pub fn is_user_va(va: u64) -> bool {
+    va < 0x0000_8000_0000_0000 && (va & (PAGE_SIZE as u64 - 1)) == 0
 }
 
 //
