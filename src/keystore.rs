@@ -33,6 +33,11 @@ pub const MAX_PSK_SLOTS: usize = 8;
 /// 더 긴 PSK 가 필요하면 본 풀과 분리된 별도 풀을 추가하여 대응.
 pub const MAX_PSK_LEN: usize = 64;
 
+// Phase 5 D-Discretion 신뢰 루트 PSK slot 네임스페이스 예약
+// RESEARCH §14.2 Option (iii) stub 본 const 는 본 페이즈에서 사용되지 않으며 향후 keystore provisioning 의 자리만 잡음
+#[allow(dead_code)]
+pub const TRUST_ROOT_PSK_SLOT: u8 = 0xFE;
+
 /// 슬롯 lifecycle.
 ///
 /// `Wiped` 는 단방향 종착 상태 — 같은 슬롯에 새 키를 다시 공급할 수 없음.

@@ -33,6 +33,17 @@ fn main() {
         "iso-user-lumen",
         "ISO_USER_LUMEN_ELF",
     );
+
+    // Phase 5 RESEARCH §4.2 신뢰 루트 pk44 부재 시 빌드 일찍 실패
+    // src/hsm_attest.rs 의 include_bytes! 가 의존하므로 명시 가드 + rerun-if-changed
+    let trust_root_pk = PathBuf::from(&manifest_dir).join("keys/trust_root.pk44");
+    if !trust_root_pk.exists() {
+        panic!(
+            "Phase 5 trust root pk44 missing: {} (run scripts/gen-dev-keys.sh)",
+            trust_root_pk.display()
+        );
+    }
+    println!("cargo:rerun-if-changed={}", trust_root_pk.display());
 }
 
 /// 사용자 크레이트의 release ELF 를 OUT_DIR 로 복사하고 환경변수로 노출.
