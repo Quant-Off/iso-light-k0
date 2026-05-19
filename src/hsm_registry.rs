@@ -495,10 +495,13 @@ impl HsmRegistry {
                 out[written] = HsmSlotInfo {
                     slot: i as u8,
                     state: slot.state as u8,
-                    // D-19: _reserved[0] = BusKind octet (HsmSlotInfo 8 바이트 ABI 불변). 1..6 은 Phase 5 attestation summary 자리.
+                    // D-19: _reserved[0] = BusKind octet (HsmSlotInfo 8 바이트 ABI 불변).
+                    // D-14: _reserved[1] = verify_result_code, _reserved[2..6] = pk_hash_prefix 4 octet
                     _reserved: {
                         let mut r = [0u8; 6];
                         r[0] = slot.bus.kind() as u8;
+                        r[1] = slot.verify_result_code;
+                        r[2..6].copy_from_slice(&slot.pk_hash_prefix);
                         r
                     },
                 };
@@ -546,6 +549,9 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
     let init_ptr = ctx.rsi;
     let init_len = ctx.rdx;
     let out_ptr = ctx.r8;
+    // Phase 5 D-04 attest payload register snapshot r10 ptr r9 len
+    let attest_ptr = ctx.r10;
+    let attest_len = ctx.r9;
 
     // Phase 1: T-02-04: Usb..Network stub variants 거부 — BusInstance::new() 에 도달 0.
     let bus_kind: BusKind = match bus_kind_raw {
@@ -557,6 +563,11 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
 
     // Phase 2: init_len sanity (Pitfall 6 — honest overflow).
     if init_len > MAX_BUS_INIT_BLOB as u64 {
+        return SyscallError::BadArg.as_rax();
+    }
+    // Phase 5 D-05 attest_len 정확 3732 옥텟 sanity input 독립 early-return
+    const ATTEST_EXACT: u64 = (MLDSA44::PK_LEN + MLDSA44::SIG_LEN) as u64;
+    if attest_len != ATTEST_EXACT {
         return SyscallError::BadArg.as_rax();
     }
 
@@ -572,11 +583,15 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
     if !is_user_address(out_ptr) || !is_user_address(out_ptr.saturating_add(cap_size)) {
         return SyscallError::BadAddress.as_rax();
     }
+    // Phase 5 D-05 attest_ptr dual-range Pitfall 3 일관 attest_len 은 ATTEST_EXACT 로 고정
+    if !is_user_address(attest_ptr) || !is_user_address(attest_ptr.saturating_add(attest_len)) {
+        return SyscallError::BadAddress.as_rax();
+    }
 
     // Phase 4: stack staging buffer (Pitfall 4: stack-local 32B 버퍼. 함수 종료 직전 zeroize).
     let mut init_kbuf = [0u8; MAX_BUS_INIT_BLOB];
 
-    // Phase 5: SMAP read window — init_blob copy 만 stac/clac 윈도우 안 (Pitfall 2).
+    // Phase 5: SMAP-1 read window — init_blob copy 만 stac/clac 윈도우 안 (Pitfall 2).
     if init_len > 0 {
         // SAFETY: init_ptr / init_ptr+init_len 모두 user range 통과 (Phase 3); init_kbuf 는 stack-local.
         unsafe {
@@ -590,23 +605,55 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
         }
     }
 
-    // Phase 6: D-16 all-or-nothing delegate (SMAP 윈도우 밖).
+    // Phase 5 SMAP-2 별개 윈도우 with_attest_buf closure 안 single stac clac
+    // closure 가 SMAP-2 copy + attach 호출 + audit prefix 산출 모두 수행 borrow escape 방지
+    // closure 반환은 (attach_result, pk_prefix) tuple closure 밖에서 RAX 매핑 + audit_enqueue
     let init_slice: &[u8] = &init_kbuf[..init_len as usize];
-    // Pitfall 7: BusError → HsmCapError → SyscallError 3 단계 collapse.
-    // SAFETY: BSP single-core + capability::init_prng() 완료 가정
-    let cap = match unsafe {
-        with_registry_mut(|r| {
-            r.attach(
-                bus_kind,
-                init_slice,
-                // Phase 5 D-10 Task 2 가 Some(payload) 로 교체 Task 1 은 컴파일 보전 None
-                None,
-                // Phase 3 Risk #7  RELAY_SRC/RELAY_DST 비트 활성화  Phase 1 D-03 reserved 비트 사용 개시
-                HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE | HsmRights::RELAY_SRC | HsmRights::RELAY_DST,
-            )
+    let (attach_result, pk_prefix): (Result<HsmCapability, HsmCapError>, [u8; 4]) = unsafe {
+        crate::hsm_attest::with_attest_buf(|abuf| {
+            // SMAP-2 안 single copy attest_payload user -> ATTEST_BUF
+            crate::cpu::stac();
+            core::ptr::copy_nonoverlapping(
+                attest_ptr as *const u8,
+                abuf.as_mut_ptr(),
+                attest_len as usize,
+            );
+            crate::cpu::clac();
+            let payload_slice: &[u8] = &abuf[..attest_len as usize];
+            // pk_prefix audit 노출 prefix attest_payload 의 첫 PK_LEN 옥텟 BLAKE3
+            let pk_ref: &[u8; MLDSA44::PK_LEN] =
+                &*(payload_slice.as_ptr() as *const [u8; MLDSA44::PK_LEN]);
+            let prefix = crate::hsm_attest::pk_hash_prefix(pk_ref);
+            // Phase 6 delegate D-10 Some(payload_slice) 전달로 verify gate 활성
+            // SAFETY BSP single-core capability init_prng 완료 가정
+            let result = with_registry_mut(|r| {
+                r.attach(
+                    bus_kind,
+                    init_slice,
+                    Some(payload_slice),
+                    // Phase 3 Risk #7  RELAY_SRC/RELAY_DST 비트 활성화  Phase 1 D-03 reserved 비트 사용 개시
+                    HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE | HsmRights::RELAY_SRC | HsmRights::RELAY_DST,
+                )
+            });
+            (result, prefix)
         })
-    } {
-        Ok(c) => c,
+    };
+
+    // Phase 6: D-16 all-or-nothing 분기 + D-13 audit_enqueue 성공 실패 모두 기록
+    // Pitfall 7: BusError → HsmCapError → SyscallError 3 단계 collapse.
+    let cap = match attach_result {
+        Ok(c) => {
+            // D-13 성공 audit slot_idx 정확 result 0 bus_kind octet pk_prefix
+            crate::hsm_attest::audit_enqueue(c.slot.0, 0, bus_kind as u8, pk_prefix);
+            c
+        }
+        Err(HsmCapError::AttestFailed) => {
+            // D-13 실패 audit slot 0xFF 미할당 표시 result 1 Pitfall 4 stack zeroize 모든 경로
+            crate::hsm_attest::audit_enqueue(0xFF, 1, bus_kind as u8, pk_prefix);
+            init_kbuf.zeroize();
+            // Pitfall 7 AttestFailed → Denied 단일 collapse mldsa Error variants 누설 0
+            return SyscallError::Denied.as_rax();
+        }
         Err(HsmCapError::Full) => {
             init_kbuf.zeroize();
             return SyscallError::BadArg.as_rax();
@@ -634,6 +681,7 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
     }
 
     // Phase 8: final zeroize (Pitfall 4 — happy path stack staging clean) + RAX=0 success.
+    // ATTEST_BUF zeroize 는 with_attest_buf exit zeroize 가 자동 보장 본 phase 별도 wipe 0
     init_kbuf.zeroize();
     0
 }
