@@ -457,6 +457,226 @@ fn wire_blake3_phase4_test() {
 }
 
 //
+// Phase 5.1 wire AttestSubmit / Status round-trip smoke (lumen client)
+//
+// 8-step 시퀀스:
+//   (1) cap_wire attach (Phase 4 None-attest path  Pitfall 7 회피  syscall arity 4 유지)
+//   (2) sys_attest_fixture_export 로 kernel WIRE_ATTEST_FIXTURE 3733 옥텟 회수
+//   (3) Leg 1 wire frame 빌드 (cmd 0x0040 AttestSubmit, payload 3733B)
+//   (4) Leg 1 write+read 응답 cmd=0x8040 status=0 payload_len=0 n=16
+//   (5) Leg 2 fixture[1313] ^= 0xFF (sig 첫 옥텟 flip) 응답 cmd=0xFFFF status=3
+//   (6) Leg 3 wire frame 빌드 (cmd 0x0080 Status, payload empty)
+//   (7) Leg 3 write+read 응답 cmd=0x8080 payload_len ≥ 8
+//   (8) Marker emit  write_stderr(b"ATTEST_PHASE5_1_OK\n")
+fn wire_attest_phase5_1_test() {
+    const SYS_HSM_ATTACH: u64 = 7;
+    const SYS_HSM_WRITE: u64 = 10;
+    const SYS_HSM_READ: u64 = 12;
+    const SYS_ATTEST_FIXTURE_EXPORT: u64 = 13;
+    const BUS_RING3PROCESS: u64 = 1;
+    const EP_LUMEN_WIRE_RAW: u16 = 0x0003;
+    const WIRE_FRAME_MAX_LOCAL: usize = 4096;
+    const ATTEST_WIRE_LEN: usize = 3733;
+    const CMD_ATTEST_SUBMIT: u16 = 0x0040;
+    const CMD_STATUS: u16 = 0x0080;
+    const SIG_FLIP_OFFSET: usize = 1313; // pk(1312) + bus_kind(1)
+
+    // BSS 거주 buffer  스택 부담 0
+    static mut FRAME_BUF: [u8; WIRE_FRAME_MAX_LOCAL] = [0u8; WIRE_FRAME_MAX_LOCAL];
+    static mut RESPONSE_BUF: [u8; WIRE_FRAME_MAX_LOCAL] = [0u8; WIRE_FRAME_MAX_LOCAL];
+    static mut FIXTURE_BUF: [u8; ATTEST_WIRE_LEN] = [0u8; ATTEST_WIRE_LEN];
+
+    // (1) cap_wire attach  EP_LUMEN_WIRE endpoint_exists 게이트 (Phase 4 None-attest path)
+    let init_wire = EP_LUMEN_WIRE_RAW.to_le_bytes();
+    let mut cap_wire = [0u8; 16];
+    // SAFETY init_wire 와 cap_wire 모두 stack-local 유효 슬라이스
+    let rax = unsafe {
+        syscall4(
+            SYS_HSM_ATTACH,
+            BUS_RING3PROCESS,
+            init_wire.as_ptr() as u64,
+            init_wire.len() as u64,
+            cap_wire.as_mut_ptr() as u64,
+        )
+    };
+    if (rax as i64) < 0 {
+        write_stderr(b"WIRE_PHASE5_1_FAIL: cap_wire attach\n");
+        exit(1);
+    }
+
+    // (2) sys_attest_fixture_export  kernel WIRE_ATTEST_FIXTURE 3733 옥텟 회수
+    // SAFETY FIXTURE_BUF 는 단일 진입 BSS  syscall 진입 시 SMAP 윈도우만 user write
+    let rax = unsafe {
+        syscall3(
+            SYS_ATTEST_FIXTURE_EXPORT,
+            (&raw mut FIXTURE_BUF) as u64,
+            ATTEST_WIRE_LEN as u64,
+            0,
+        )
+    };
+    if (rax as i64) < 0 {
+        write_stderr(b"WIRE_PHASE5_1_FAIL: fixture_export\n");
+        exit(1);
+    }
+
+    // (3) Leg 1 wire frame build  cmd 0x0040 AttestSubmit
+    let payload_len: u16 = ATTEST_WIRE_LEN as u16;
+    let frame_len: usize = 16 + payload_len as usize;
+    // SAFETY BSP 단일 Ring 3 process  FRAME_BUF/FIXTURE_BUF 동시 접근 없음
+    unsafe {
+        let buf = &mut *(&raw mut FRAME_BUF);
+        let fix = &*(&raw const FIXTURE_BUF);
+        buf[0..4].copy_from_slice(b"LWK0");
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes()); // version = 1
+        buf[6..8].copy_from_slice(&CMD_ATTEST_SUBMIT.to_le_bytes());
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // req_id = 1
+        buf[12..14].copy_from_slice(&payload_len.to_le_bytes());
+        buf[14..16].copy_from_slice(&0u16.to_le_bytes()); // request status 0
+        buf[16..16 + ATTEST_WIRE_LEN].copy_from_slice(fix);
+    }
+
+    // (4) Leg 1 write + read  응답 cmd=0x8040 status=0 payload_len=0 n=16
+    // SAFETY FRAME_BUF 의 frame_len 길이 슬라이스만 노출
+    let rax = unsafe {
+        let buf_ptr = (&raw const FRAME_BUF) as *const u8;
+        syscall3(
+            SYS_HSM_WRITE,
+            cap_wire.as_ptr() as u64,
+            buf_ptr as u64,
+            frame_len as u64,
+        )
+    };
+    if (rax as i64) < 0 {
+        write_stderr(b"WIRE_PHASE5_1_FAIL: Leg1 hsm_write\n");
+        exit(1);
+    }
+    // SAFETY RESPONSE_BUF WIRE_FRAME_MAX 윈도우만 노출
+    let n = unsafe {
+        let resp_ptr = (&raw mut RESPONSE_BUF) as *mut u8;
+        syscall3(
+            SYS_HSM_READ,
+            cap_wire.as_ptr() as u64,
+            resp_ptr as u64,
+            WIRE_FRAME_MAX_LOCAL as u64,
+        )
+    };
+    if (n as i64) < 0 {
+        write_stderr(b"WIRE_PHASE5_1_FAIL: Leg1 hsm_read\n");
+        exit(1);
+    }
+    let n = n as usize;
+    // SAFETY RESPONSE_BUF 첫 16 byte read-only
+    let (resp_magic, resp_cmd, resp_status, resp_pl) = unsafe {
+        let b = &*(&raw const RESPONSE_BUF);
+        (
+            [b[0], b[1], b[2], b[3]],
+            u16::from_le_bytes([b[6], b[7]]),
+            u16::from_le_bytes([b[14], b[15]]),
+            u16::from_le_bytes([b[12], b[13]]),
+        )
+    };
+    if &resp_magic != b"LWK0"
+        || resp_cmd != (CMD_ATTEST_SUBMIT | 0x8000)
+        || resp_status != 0
+        || resp_pl != 0
+        || n != 16
+    {
+        write_stderr(b"WIRE_PHASE5_1_FAIL: Leg1 header mismatch\n");
+        exit(1);
+    }
+
+    // (5) Leg 2  sig 첫 옥텟 flip (fixture offset 1313 = pk(1312) + bus_kind(1))
+    //     req_id 2 로 재구성  응답 cmd=0xFFFF status=3 (Denied)
+    // SAFETY FIXTURE_BUF 단일 진입
+    unsafe {
+        (*(&raw mut FIXTURE_BUF))[SIG_FLIP_OFFSET] ^= 0xFF;
+    }
+    unsafe {
+        let buf = &mut *(&raw mut FRAME_BUF);
+        let fix = &*(&raw const FIXTURE_BUF);
+        buf[8..12].copy_from_slice(&2u32.to_le_bytes()); // req_id = 2
+        buf[16..16 + ATTEST_WIRE_LEN].copy_from_slice(fix);
+    }
+    // SAFETY 동상
+    let _ = unsafe {
+        let buf_ptr = (&raw const FRAME_BUF) as *const u8;
+        syscall3(
+            SYS_HSM_WRITE,
+            cap_wire.as_ptr() as u64,
+            buf_ptr as u64,
+            frame_len as u64,
+        )
+    };
+    let _ = unsafe {
+        let resp_ptr = (&raw mut RESPONSE_BUF) as *mut u8;
+        syscall3(
+            SYS_HSM_READ,
+            cap_wire.as_ptr() as u64,
+            resp_ptr as u64,
+            WIRE_FRAME_MAX_LOCAL as u64,
+        )
+    };
+    // SAFETY RESPONSE_BUF 첫 16 byte read-only
+    let (resp_cmd_leg2, resp_status_leg2) = unsafe {
+        let b = &*(&raw const RESPONSE_BUF);
+        (
+            u16::from_le_bytes([b[6], b[7]]),
+            u16::from_le_bytes([b[14], b[15]]),
+        )
+    };
+    if resp_cmd_leg2 != 0xFFFF || resp_status_leg2 != 3 {
+        write_stderr(b"WIRE_PHASE5_1_FAIL: Leg2 not denied\n");
+        exit(1);
+    }
+
+    // (6) Leg 3 Status frame build  cmd 0x0080 payload empty
+    // SAFETY 동상
+    unsafe {
+        let buf = &mut *(&raw mut FRAME_BUF);
+        buf[0..4].copy_from_slice(b"LWK0");
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        buf[6..8].copy_from_slice(&CMD_STATUS.to_le_bytes());
+        buf[8..12].copy_from_slice(&3u32.to_le_bytes()); // req_id = 3
+        buf[12..14].copy_from_slice(&0u16.to_le_bytes()); // payload_len = 0
+        buf[14..16].copy_from_slice(&0u16.to_le_bytes());
+    }
+    // (7) Leg 3 write + read  응답 cmd=0x8080 payload_len ≥ 8
+    let _ = unsafe {
+        let buf_ptr = (&raw const FRAME_BUF) as *const u8;
+        syscall3(
+            SYS_HSM_WRITE,
+            cap_wire.as_ptr() as u64,
+            buf_ptr as u64,
+            16u64,
+        )
+    };
+    let _ = unsafe {
+        let resp_ptr = (&raw mut RESPONSE_BUF) as *mut u8;
+        syscall3(
+            SYS_HSM_READ,
+            cap_wire.as_ptr() as u64,
+            resp_ptr as u64,
+            WIRE_FRAME_MAX_LOCAL as u64,
+        )
+    };
+    // SAFETY RESPONSE_BUF 첫 16 byte read-only
+    let (resp_cmd_leg3, resp_pl_leg3) = unsafe {
+        let b = &*(&raw const RESPONSE_BUF);
+        (
+            u16::from_le_bytes([b[6], b[7]]),
+            u16::from_le_bytes([b[12], b[13]]),
+        )
+    };
+    if resp_cmd_leg3 != (CMD_STATUS | 0x8000) || resp_pl_leg3 < 8 {
+        write_stderr(b"WIRE_PHASE5_1_FAIL: Leg3 status header\n");
+        exit(1);
+    }
+
+    // (8) marker
+    write_stderr(b"ATTEST_PHASE5_1_OK\n");
+}
+
+//
 // 진입점
 //
 /// 사용자 진입점 — `process::enter_ring3()` 가 ELF entry RIP 로 점프함.
@@ -473,6 +693,8 @@ pub unsafe extern "C" fn _start() -> ! {
     check_x25519();
     check_aes256_gcm();
     wire_blake3_phase4_test();
+    // Phase 5.1 wire AttestSubmit / Status round-trip smoke marker ATTEST_PHASE5_1_OK
+    wire_attest_phase5_1_test();
 
     write_stderr(b"[iso-user-lumen] all wire-compat checks passed\n");
     exit(0);
