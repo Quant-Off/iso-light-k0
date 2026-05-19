@@ -565,6 +565,9 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // SAFETY Phase 3 smoke 완료 후 detach cascade 가 REGISTRY 를 비웠음 hsm_attest::init_trust_root 가 BSS 채움
     unsafe {
         attest_phase5_smoke_test();
+        // Phase 5.1 D-04 wire AttestSubmit / Status round-trip smoke
+        // Phase 5 marker 직후 호출  두 marker 모두 emit (Pitfall 6 substring 충돌 0)
+        attest_phase5_1_wire_smoke_test();
     }
 
     //
@@ -1626,6 +1629,197 @@ unsafe fn attest_phase5_smoke_test() {
     // (9) Leg 1 슬롯 detach  registry 정리 다음 smoke 또는 Ring 3 spawn invariant 보존
     // SAFETY BSP 단일 코어
     let _ = unsafe { with_registry_mut(|r| r.detach(&cap_leg1, HsmRights::REVOKE)) };
+}
+
+//
+// Phase 5.1 D-04 wire AttestSubmit fixture 정적 슬롯
+//
+// kernel 의 attest_phase5_1_wire_smoke_test 가 채우고
+// lumen 의 SyscallNum AttestFixtureExport(13) 가 사용자 공간으로 복사
+// feature smoke 한정 closed 빌드 BSS leak 0
+//
+// gate 정합  syscall variant / dispatch arm / handler 모두 #[cfg(feature = "smoke")]
+//           smoke test 함수만 추가로 debug_assertions 게이트 release+smoke
+//           빌드 시 fixture 는 BSS 슬롯으로 존재 (0 초기화), 채움 없음
+#[used]
+#[cfg(feature = "smoke")]
+static mut WIRE_ATTEST_FIXTURE: [u8; 3733] = [0u8; 3733];
+
+//
+// attest_phase5_1_wire_smoke_test  Phase 5.1 wire AttestSubmit / Status round-trip 9-step
+//                                  marker ATTEST_PHASE5_1_OK
+//
+// (1) BOOT_CHALLENGE 와 ACTIVE_TRUST_ROOT_PK 스냅샷 Phase 5 mirror
+// (2) Pre-image (pk || bus_kind || challenge) 재구성 + BLAKE3 digest
+// (3) ML-DSA-44 sign  ctx b"ISO-K0-ENROLL-V1"  rnd 결정적 [0xCC; 32]
+// (4) wire AttestSubmit payload 3733 옥텟 조립 (pk || bus_kind || sig)
+// (5) WIRE_ATTEST_FIXTURE 적재  lumen 의 sys_attest_fixture_export 수령 슬롯
+// (6) Leg 1 valid  kernel-direct handle_attest_submit  resp status = Ok 응답 16B
+// (7) Leg 2 mutated sig (sig 첫 옥텟 flip) handle_attest_submit  resp cmd 0xFFFF status 3
+// (8) audit_ring delta == 2 후행 검증 (5 WireReattestOk + 6 WireReattestFail)
+// (9) ATTEST_PHASE5_1_OK marker emit (Pitfall 6 substring 충돌 0)
+#[cfg(all(target_arch = "x86_64", debug_assertions, feature = "smoke"))]
+unsafe fn attest_phase5_1_wire_smoke_test() {
+    use crate::bus::{BusKind, WIRE_FRAME_MAX, handle_attest_submit};
+    use blake::Blake3;
+    use hsm_attest::{ACTIVE_TRUST_ROOT_PK, BOOT_CHALLENGE};
+    use mldsa::MLDSA44;
+    use zeroize::Zeroize;
+
+    // dev sk 자료는 feature smoke 한정 include_bytes 로만 임베드  closed 빌드 leak 0
+    const DEV_SK: &[u8; MLDSA44::SK_LEN] = include_bytes!("../keys/dev_trust_root.sk44");
+
+    // (1) BOOT_CHALLENGE 와 ACTIVE_TRUST_ROOT_PK 스냅샷
+    // SAFETY BSP single-core 부팅 후 두 BSS static 의 단일 진입 read
+    let pk: [u8; MLDSA44::PK_LEN] = unsafe { *(&raw const ACTIVE_TRUST_ROOT_PK) };
+    let challenge: [u8; 32] = unsafe { *(&raw const BOOT_CHALLENGE) };
+    let bus_kind = BusKind::Software;
+
+    // (2) Pre-image 재구성  hsm_attest verify_attest body 와 byte-exact mirror
+    let mut pre = [0u8; MLDSA44::PK_LEN + 1 + 32];
+    pre[..MLDSA44::PK_LEN].copy_from_slice(&pk);
+    pre[MLDSA44::PK_LEN] = bus_kind as u8;
+    pre[MLDSA44::PK_LEN + 1..].copy_from_slice(&challenge);
+
+    let mut hasher = Blake3::new();
+    hasher.update(&pre);
+    let digest_buf = match hasher.finalize() {
+        Ok(d) => d,
+        Err(_) => {
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: attest_phase5_1 wire smoke FAILED (blake3 digest)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&digest_buf.as_slice()[..32]);
+
+    // (3) ML-DSA-44 sign  ctx b"ISO-K0-ENROLL-V1" 16 옥텟 D-08 도메인 분리
+    // rnd 인자 결정적 smoke 회귀 일관성 위해 고정 nonce [0xCC; 32] 사용 (Phase 5 0xBB 와 분리)
+    let rnd = [0xCC_u8; 32];
+    let sig: [u8; MLDSA44::SIG_LEN] = match MLDSA44::sign(DEV_SK, &digest, b"ISO-K0-ENROLL-V1", &rnd) {
+        Ok(s) => s,
+        Err(_) => {
+            unsafe {
+                vga::println(
+                    b"[iso-light-k0] FATAL: attest_phase5_1 wire smoke FAILED (mldsa44 sign)",
+                    vga::Color::Red,
+                );
+            }
+            return;
+        }
+    };
+
+    // (4) wire AttestSubmit payload 3733 옥텟 조립 (pk(1312) || bus_kind(1) || sig(2420))
+    //     handle_attest_submit 가 기대하는 wire layout (Pitfall 1 회피)
+    const WIRE_ATTEST_LEN: usize = MLDSA44::PK_LEN + 1 + MLDSA44::SIG_LEN;
+    let mut attest_wire = [0u8; WIRE_ATTEST_LEN];
+    attest_wire[..MLDSA44::PK_LEN].copy_from_slice(&pk);
+    attest_wire[MLDSA44::PK_LEN] = bus_kind as u8;
+    attest_wire[MLDSA44::PK_LEN + 1..].copy_from_slice(&sig);
+
+    // (5) WIRE_ATTEST_FIXTURE 적재  lumen smoke 가 sys_attest_fixture_export 로 회수
+    // SAFETY BSP single-core 부팅 초기 본 함수 단일 진입
+    unsafe {
+        (*(&raw mut WIRE_ATTEST_FIXTURE)).copy_from_slice(&attest_wire);
+    }
+
+    // (6) handle_attest_submit kernel-side direct call (Leg 1 valid)
+    let baseline_total = unsafe { (*(&raw const crate::hsm_attest::AUDIT_RING)).total };
+    let mut resp_buf = [0u8; WIRE_FRAME_MAX];
+    let n1 = handle_attest_submit(1, &attest_wire, &mut resp_buf);
+    let resp_status_leg1 = u16::from_le_bytes([resp_buf[14], resp_buf[15]]);
+    if n1 != 16 || resp_status_leg1 != 0 {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5_1 wire smoke FAILED (Leg 1 dispatcher)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (7) Leg 2 mutated sig (sig 첫 옥텟 flip == fixture offset PK_LEN+1 == 1313)
+    let mut tampered = attest_wire;
+    tampered[MLDSA44::PK_LEN + 1] ^= 0xFF;
+    let mut resp_buf2 = [0u8; WIRE_FRAME_MAX];
+    let n2 = handle_attest_submit(2, &tampered, &mut resp_buf2);
+    let resp_cmd_leg2 = u16::from_le_bytes([resp_buf2[6], resp_buf2[7]]);
+    let resp_status_leg2 = u16::from_le_bytes([resp_buf2[14], resp_buf2[15]]);
+    if n2 != 16 || resp_cmd_leg2 != 0xFFFF || resp_status_leg2 != 3 {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5_1 wire smoke FAILED (Leg 2 dispatcher)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (8) audit_ring delta == 2 (5 WireReattestOk + 6 WireReattestFail)
+    let after_total = unsafe { (*(&raw const crate::hsm_attest::AUDIT_RING)).total };
+    if after_total != baseline_total + 2 {
+        unsafe {
+            vga::println(
+                b"[iso-light-k0] FATAL: attest_phase5_1 wire smoke FAILED (audit_ring delta != 2)",
+                vga::Color::Red,
+            );
+        }
+        return;
+    }
+
+    // (9) ATTEST_PHASE5_1_OK marker  Pitfall 6 substring 충돌 0 검증됨
+    // SAFETY identity-mapped VGA 버퍼
+    unsafe {
+        vga::println(
+            b"[iso-light-k0] ATTEST_PHASE5_1_OK marker (wire AttestSubmit Leg1 ok + Leg2 denied + audit +2)",
+            vga::Color::Green,
+        );
+    }
+
+    // cleanup  비밀자료 stack-local 흔적 0
+    pre.zeroize();
+    digest.zeroize();
+    attest_wire.zeroize();
+    tampered.zeroize();
+}
+
+/// Phase 5.1 D-04 attest_payload 3733 옥텟 fixture export 핸들러 (feature smoke 한정)
+///
+/// SyscallNum AttestFixtureExport(13) 의 dispatch 본문 ABI
+///   rdi = out_ptr (user-space dst)
+///   rsi = out_len (== 3733 정확 정합)
+///   반환 u64  성공 시 0, 음수 SyscallError as_rax
+///
+/// # Safety
+/// 호출자 (lumen Ring 3) 가 ctx.rsi == 3733 정확 정합 후 호출 권장 본 함수 자체가 검증
+#[cfg(feature = "smoke")]
+pub fn handle_attest_fixture_export(ctx: &mut syscall::SyscallContext) -> u64 {
+    use syscall::{SyscallError, is_user_address};
+    let out_ptr = ctx.rdi;
+    let out_len = ctx.rsi as usize;
+    if out_len != 3733 {
+        return SyscallError::BadArg.as_rax();
+    }
+    if !is_user_address(out_ptr) || !is_user_address(out_ptr.saturating_add(3733)) {
+        return SyscallError::BadAddress.as_rax();
+    }
+    // SAFETY out_ptr 가 user_space dual-range 통과 SMAP stac/clac 윈도우 최소화
+    //        WIRE_ATTEST_FIXTURE 는 BSP single-core 부팅 초기 채워진 BSS read-only 진입
+    unsafe {
+        cpu::stac();
+        core::ptr::copy_nonoverlapping(
+            (&raw const WIRE_ATTEST_FIXTURE) as *const u8,
+            out_ptr as *mut u8,
+            3733,
+        );
+        cpu::clac();
+    }
+    0
 }
 
 /// 마이크로커널 메인 이벤트 루프.

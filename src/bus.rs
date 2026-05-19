@@ -240,7 +240,7 @@ fn handle_ping(req_id: u32, out: &mut [u8; WIRE_FRAME_MAX]) -> usize {
 /// bus_octet ∉ {0, 1} → BadFrame
 /// verify_attest Err → Denied audit_enqueue result=6 WireReattestFail
 /// 성공 → Ok audit_enqueue result=5 WireReattestOk slot mutation 0
-fn handle_attest_submit(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) -> usize {
+pub(crate) fn handle_attest_submit(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) -> usize {
     // (1) payload 길이 정확 3733 옥텟 (Pitfall 1 회피)
     if payload.len() != WIRE_ATTEST_LEN {
         return build_error_frame_inplace(req_id, WireStatus::BadFrame, out);
