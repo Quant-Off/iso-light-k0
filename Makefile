@@ -239,8 +239,13 @@ chan-dudect:
 # sibling test 컴파일 표면 잠금만 의무 실 실행 PASS 는 Plan 05.1-04 이후
 #
 wire-attest-host-test:
-	@cd /Library/Quant/Repository/projects/elib-k0-nt && \
-	 $(CARGO) test -p constant-time --tests --release -- wire_attest_ wire_status_
+	@HOST_TRIPLE=$$(rustc -vV | sed -n 's/^host: //p') && \
+	 cd /Library/Quant/Repository/projects/elib-k0-nt && \
+	 $(CARGO) test -p constant-time --release --target $$HOST_TRIPLE \
+	   --test wire_attest_submit_dispatch \
+	   --test wire_attest_payload_layout \
+	   --test wire_status_audit_serialize \
+	   --test wire_attest_no_slot_mutation
 	@echo "[CI] Phase 5.1 wire-attest-host-test 게이트 통과"
 
 #
