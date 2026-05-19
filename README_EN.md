@@ -34,6 +34,24 @@ docker compose run --rm iso   # Generate ISO in container
 docker compose run --rm test  # Run QEMU tests in container
 ```
 
+## AI Agent Scope
+
+This project is developed by a single maintainer, and AI agents are used as an auxiliary tool **strictly for documentation work only**. The model in use is Claude Code's Sonnet 4.6, and the editable file scope is limited to `.md` documents. The work that Claude Code performs in this project is restricted to the following four items.
+
+- Improving the readability of specifications and explanatory prose (context arrangement, concise phrasing, etc.)
+- Generating Mermaid diagrams
+- Producing English translations (`*_EN.md`) of general (introductory) documents
+- Adding Rust Docstrings (`///`, `//!`) and ordinary comments
+
+Conversely, every security-sensitive part is written and reviewed directly by a human. AI agents are constrained — through both work scope and tool permissions — so that they cannot reach the following areas.
+
+- Cryptographic algorithm implementations (e.g. `elib-k0-nt`)
+- Kernel system call / IPC core logic
+- Capability validation and permission enforcement paths
+- All other security-sensitive logic and its corresponding specifications
+
+Each cryptographic algorithm crate, the original `README.md`, and `INTRODUCTION.md` have been written by a human with rigorous review since the Rust-native development stage of [EntanglementLib](https://github.com/Quant-Off/entanglementlib); we make it explicit that only the English translations (`*_EN.md`) of the introductory documents were produced by Claude Code's Sonnet 4.6. **This disclosure is not a judgment on other development practices that leverage AI, but is intended to transparently communicate to readers the scope of AI use within this project's trust boundary.**
+
 ## License
 
 This project is under the [MIT LICENSE](LICENSE).
