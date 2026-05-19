@@ -18,6 +18,7 @@ pub mod sign_service;   // EP_SIGN 엔드포인트 ML-DSA PQ 서명 서비스
 pub mod elf; // ELF64 정적 실행 파일 파서
 pub mod hsm; // HSM 추상 트레이트 + NullHsm
 pub mod hsm_registry; // Phase 1: HSM 멀티 슬롯 레지스트리 (capability-backed)
+pub mod hsm_attest; // Phase 5: ML-DSA-44 attest verifier + AUDIT_RING + ATTEST_BUF
 pub mod bus; // Phase 2: 외부 버스 드라이버 추상화 (BusDriver trait + enum-dispatch)
 pub mod idt;
 pub mod ipc; // IPC 메시지 패싱 (동기 rendezvous)
@@ -457,6 +458,18 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
                 vga::Color::Red,
             ),
         }
+    }
+
+    // Phase 5 ENROLL D-01 D-09 부팅 시 1 회 신뢰 루트 dual-path 초기화 + BOOT_CHALLENGE 생성
+    // capability::init_prng 직후 + ipc::init 직전 위치 BOOT_CHALLENGE 생성은 CAP_DRBG 만 의존
+    // SAFETY 단일 코어 부팅 초기 capability::init_prng 완료 가정
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        hsm_attest::init_trust_root();
+        vga::println(
+            b"[iso-light-k0] Trust Root Init Done. (ML-DSA-44 1312B + BOOT_CHALLENGE 32B)",
+            vga::Color::Green,
+        );
     }
 
     //
