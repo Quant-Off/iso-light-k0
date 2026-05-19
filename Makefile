@@ -98,7 +98,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external
 
 all: iso
 
@@ -296,7 +296,7 @@ qemu-smoke-smoke:
 	@mkdir -p $(BOOT_DIR)
 	@cp $(KERNEL_DEBUG) $(BOOT_DIR)/kernel.bin
 	@$(GRUB_MKRES) -o $(ISO_DEBUG) $(ISO_DIR)
-	@REQUIRE_ATTEST_PHASE5_OK=1 REQUIRE_ATTEST_PHASE5_1_OK=1 bash scripts/qemu-test.sh
+	@REQUIRE_ATTEST_PHASE5_OK=1 REQUIRE_ATTEST_PHASE5_1_OK=1 REQUIRE_GAP_PHASE6_OK=1 bash scripts/qemu-test.sh
 	@echo "[CI] Phase 5 QEMU smoke (feature smoke) 통과"
 
 #
@@ -325,3 +325,29 @@ ci-phase5: check-alloc-zero check-alloc-bus check-no-dev-sk qemu-smoke-smoke cha
 #
 ci-phase5_1: check-alloc-zero check-alloc-bus check-no-dev-sk qemu-smoke-smoke chan-dudect wire-attest-host-test
 	@echo "[CI] Phase 5.1 ci 게이트 전체 통과 (ENROLL-01/02/04 + CAP-02 + DOC-01 + wire-attest-host-test)"
+
+#
+# Phase 6 CI 게이트 (GAP-01 ~ GAP-04 + 본 마일스톤 종료 게이트)
+#
+# 4-leg 구조 (ci-phase5_1 6-leg 의 축소 wire-attest / chan-dudect 는 Phase 3/5 leg 재활용):
+#   1) check-alloc-zero       바이너리 alloc 심볼 0 회귀 (Phase 1 ~ 6 누적)
+#   2) check-no-network       closed 프로필 NETWORK_ATTACH_CAP / NETWORK_CAP_STATE / init_network_cap / take_network_cap / air_gap..network 5 패턴 부재 (GAP-03)
+#   3) qemu-smoke-smoke       Phase 1 ~ 5.1 marker 보존 + 신규 GAP_PHASE6_OK marker 강제 (GAP-01 ~ GAP-04 종료 게이트)
+#   4) check-no-dev-sk        closed 프로필 dev sk leak 가드 회귀 보존 (Phase 5 D-19)
+# 5th leg (선택 Open Q3 채택) qemu-smoke-tls-external tls-external + smoke 빌드 양방향 회귀 가드
+#
+ci-phase6: check-alloc-zero check-no-network qemu-smoke-smoke check-no-dev-sk qemu-smoke-tls-external
+	@echo "[CI] Phase 6 ci 게이트 전체 통과 (GAP-01 ~ GAP-04 + 본 마일스톤 종료 게이트)"
+
+check-no-network: build-rel
+	@bash scripts/check-no-network.sh
+	@echo "[CI] check-no-network gate 통과 (GAP-03)"
+
+# 5th leg tls-external + smoke 빌드의 양방향 회귀 가드 (Open Q3 결정 채택)
+qemu-smoke-tls-external:
+	@$(CARGO) build --target $(TARGET) --features tls-external,smoke
+	@mkdir -p $(BOOT_DIR)
+	@cp $(KERNEL_DEBUG) $(BOOT_DIR)/kernel.bin
+	@$(GRUB_MKRES) -o $(ISO_DEBUG) $(ISO_DIR)
+	@REQUIRE_GAP_PHASE6_OK=1 bash scripts/qemu-test.sh
+	@echo "[CI] qemu-smoke-tls-external gate 통과 (tls-external 양 프로필 회귀)"

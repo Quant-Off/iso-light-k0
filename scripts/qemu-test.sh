@@ -255,6 +255,7 @@ HAS_CHAN_PHASE3_OK=false  # Phase 3 marker  ci-phase3 게이트
 HAS_WIRE_PHASE4_OK=false  # Phase 4 marker  ci-phase4 게이트
 HAS_ATTEST_PHASE5_OK=false  # Phase 5 marker  ci-phase5 게이트
 HAS_ATTEST_PHASE5_1_OK=false  # Phase 5.1 marker  ci-phase5_1 게이트
+HAS_GAP_PHASE6_OK=false  # Phase 6 marker  ci-phase6 게이트
 if [ -s "${VGA_TXT}" ]; then
     grep -q "Booted\. Initializing"           "${VGA_TXT}" && HAS_BOOTED=true
     grep -q "Capability DRBG Init Done"       "${VGA_TXT}" && HAS_DRBG=true
@@ -278,6 +279,8 @@ if [ -s "${VGA_TXT}" ]; then
     grep -q "ATTEST_PHASE5_OK"                                            "${VGA_TXT}" && HAS_ATTEST_PHASE5_OK=true
     # Phase 5.1 wire AttestSubmit / Status / lumen smoke 마일스톤 (additive  feature smoke 한정)
     grep -q "ATTEST_PHASE5_1_OK"                                          "${VGA_TXT}" && HAS_ATTEST_PHASE5_1_OK=true
+    # Phase 6 air-gap dual gate / sys_hsm_status / gap_self_check smoke 마일스톤 (additive feature smoke 한정)
+    grep -q "GAP_PHASE6_OK"                                               "${VGA_TXT}" && HAS_GAP_PHASE6_OK=true
 fi
 
 echo "  [부팅 진입]                    $($HAS_BOOTED && echo PASS || echo MISS)"
@@ -296,6 +299,7 @@ echo "  [CHAN_PHASE3_OK marker]         $($HAS_CHAN_PHASE3_OK && echo PASS || ec
 echo "  [WIRE_PHASE4_OK marker]         $($HAS_WIRE_PHASE4_OK && echo PASS || echo MISS)"
 echo "  [ATTEST_PHASE5_OK marker]       $($HAS_ATTEST_PHASE5_OK && echo PASS || echo MISS)"
 echo "  [ATTEST_PHASE5_1_OK marker]     $($HAS_ATTEST_PHASE5_1_OK && echo PASS || echo MISS)"
+echo "  [GAP_PHASE6_OK marker]          $($HAS_GAP_PHASE6_OK && echo PASS || echo MISS)"
 
 if ! $HAS_SMOKE_OK; then
     PASS=false
@@ -356,6 +360,12 @@ fi
 if [ "${REQUIRE_ATTEST_PHASE5_1_OK:-0}" = "1" ] && [ "$HAS_ATTEST_PHASE5_1_OK" != "true" ]; then
     PASS=false
     FAIL_REASONS+=("ATTEST_PHASE5_1_OK 마커 없음 — Phase 5.1 wire AttestSubmit / Status / lumen leg 실패")
+fi
+# Phase 6 Air-Gap Dual Enforcement fail-accumulator  feature smoke 활성 빌드에서만 강제
+# REQUIRE_GAP_PHASE6_OK=1 인 경우에만 marker 부재를 실패로 누적 (qemu-smoke-smoke Makefile 타겟이 셋)
+if [ "${REQUIRE_GAP_PHASE6_OK:-0}" = "1" ] && [ "$HAS_GAP_PHASE6_OK" != "true" ]; then
+    PASS=false
+    FAIL_REASONS+=("GAP_PHASE6_OK 마커 없음 — Phase 6 dual gate / sys_hsm_status / gap_self_check leg 실패")
 fi
 
 # (d) QEMU exit 코드 (timeout=124, 모니터 quit=정상)
