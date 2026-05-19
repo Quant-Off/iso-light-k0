@@ -98,7 +98,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5
 
 all: iso
 
@@ -251,3 +251,43 @@ ci-phase3: check-alloc-zero check-alloc-bus qemu-smoke chan-dudect
 #
 ci-phase4: check-alloc-zero check-alloc-bus qemu-smoke chan-dudect
 	@echo "[CI] Phase 4 ci 게이트 전체 통과 (WIRE-01..WIRE-05 + smoke + dudect)"
+
+#
+# Phase 5 closed 프로필 dev sk leak 가드 (D-19)
+#
+# 본 타겟은 closed 프로필 빌드 산출물에 dev_trust_root.sk44 의 K 시드 16 옥텟이
+# 누설되지 않았음을 xxd grep 으로 검증함  Plan 05-01 D-02 dev sk include 게이트
+# (feature smoke 미활성) 가 closed 프로필에서 cfg-out 되는지 회귀 가드 역할
+#
+check-no-dev-sk: build-rel
+	@bash scripts/check-no-dev-sk.sh
+	@echo "[CI] Phase 5 D-19 dev sk leak 가드 통과 (closed profile)"
+
+#
+# Phase 5 QEMU smoke (feature smoke 활성)
+#
+# 본 타겟은 feature smoke 를 활성화한 debug 빌드로 ISO 를 만들고 QEMU 부팅 후
+# ATTEST_PHASE5_OK 마커 노출을 강제함  CARGO_FLAGS env var 로 attest_phase5_smoke_test
+# 함수를 활성화하며 REQUIRE_ATTEST_PHASE5_OK=1 이 qemu-test.sh 의 fail-accumulator 를
+# Phase 5 마커 부재 시 PASS=false 로 떨어트림
+#
+qemu-smoke-smoke:
+	@$(CARGO) build --target $(TARGET) --features smoke
+	@mkdir -p $(BOOT_DIR)
+	@cp $(KERNEL_DEBUG) $(BOOT_DIR)/kernel.bin
+	@$(GRUB_MKRES) -o $(ISO_DEBUG) $(ISO_DIR)
+	@REQUIRE_ATTEST_PHASE5_OK=1 bash scripts/qemu-test.sh
+	@echo "[CI] Phase 5 QEMU smoke (feature smoke) 통과"
+
+#
+# Phase 5 CI 게이트 (ENROLL-01..ENROLL-04 + CAP-02 + smoke + dudect + dev sk leak 가드)
+#
+# 5-leg 구조 (ci-phase4 + check-no-dev-sk + qemu-smoke-smoke 확장):
+#   1) check-alloc-zero       바이너리 alloc 심볼 0 (Phase 1 게이트 + ATTEST_BUF 4 KiB BSS 가산 회귀)
+#   2) check-alloc-bus        src/bus.rs 소스 alloc 의존 0 (BUS-01 재검증)
+#   3) check-no-dev-sk        closed 프로필 dev sk K 시드 16 옥텟 부재 (D-19)
+#   4) qemu-smoke-smoke       feature smoke 한정 ATTEST_PHASE5_OK 마커 + Phase 1/2/3/4 마커 보존
+#   5) chan-dudect            elib-k0-nt chan_* CT timing balance (Phase 3 leg 재사용)
+#
+ci-phase5: check-alloc-zero check-alloc-bus check-no-dev-sk qemu-smoke-smoke chan-dudect
+	@echo "[CI] Phase 5 ci 게이트 전체 통과 (ENROLL-01..ENROLL-04 + CAP-02 + smoke + dudect + dev sk leak 가드)"
