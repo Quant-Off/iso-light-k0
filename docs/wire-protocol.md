@@ -48,8 +48,8 @@ v1 정의 5 variant
 |----------|----------------|----------------|---------------------------|-------------|-------------------------------------------------------------|
 | `0x0001` | `Ping`         | request        | no (unauthenticated probe)| 4 active    | empty (`payload_len = 0`)                                   |
 | `0x0010` | `Blake3Hash`   | request        | yes (cap, `HsmRights::USE`) | 4 active  | `cap_token (16B) \|\| input (variable, ≤ 4064B)`            |
-| `0x0040` | `AttestSubmit` | request        | yes (Phase 5 attestation) | 5 reserved  | (Phase 5 가 정의)                                           |
-| `0x0080` | `Status`       | request        | yes (Phase 6 admin)       | 6 reserved  | (Phase 6 가 정의)                                           |
+| `0x0040` | `AttestSubmit` | request        | yes (Phase 5 attestation) | 5.1 active  | Phase 5.1 가 정의 — `## WireCmd::AttestSubmit (0x0040) body` § 참조 |
+| `0x0080` | `Status`       | request        | yes (Phase 6 admin)       | 5.1 active  | Phase 5.1 가 정의 — `## WireCmd::Status (0x0080) body` § 참조 |
 | `0xFFFF` | `Error`        | response 전용  | n/a                       | 4 active    | empty (`payload_len = 0`)                                   |
 
 response cmd 계산 규칙
@@ -84,6 +84,91 @@ Payload byte layout (per-cmd 상세)
 `WireCmd::Ping` (`0x0001`)
 - `payload_len = 0` (request)
 - 정상 응답 `cmd = 0x8001`, `payload_len = 0`
+
+## WireCmd::AttestSubmit (0x0040) body
+
+본 명령은 epoch-rollover 재 attestation 또는 외부 lumen 측 부착 시점 attest payload 송신을 처리한다.
+slot mutation 0 — 본 명령은 *재검증* 만 수행하며 registry 의 attached_count 변화 없음.
+
+### Request payload (3733 옥텟)
+
+| offset | length | field | encoding |
+|--------|--------|-------|----------|
+| 0..1312 | 1312 | hsm_pk | ML-DSA-44 raw public key (MLDSA44::PK_LEN) |
+| 1312..1313 | 1 | bus_kind | BusKind 옥텟 (0=Software, 1=Ring3Process) |
+| 1313..3733 | 2420 | sig | ML-DSA-44 raw signature (MLDSA44::SIG_LEN) |
+
+서명 평문: `BLAKE3(pk || bus_kind || BOOT_CHALLENGE)` 32-byte digest, ctx `b"ISO-K0-ENROLL-V1"` 16 옥텟.
+
+Frame total: 16 (header) + 3733 (payload) = 3749 옥텟, `WIRE_FRAME_MAX = 4096` 안.
+
+### Response (Ok)
+
+| offset | length | field |
+|--------|--------|-------|
+| 0..16 | 16 | header (cmd 0x8040, status 0, payload_len 0) |
+
+### Response (Denied)
+
+| offset | length | field |
+|--------|--------|-------|
+| 0..16 | 16 | error frame (cmd 0xFFFF, status 3, payload_len 0) |
+
+### Audit Trail
+
+본 명령 성공 시 AUDIT_RING 에 `EnrollEvent { slot_idx=0xFE, result=5 (WireReattestOk), ... }` 1 개 enqueue.
+실패 시 `EnrollEvent { slot_idx=0xFE, result=6 (WireReattestFail), ... }` 1 개 enqueue.
+`slot_idx=0xFE` 는 wire-side re-attestation marker — 실제 부착 슬롯 인덱스 (`0..=7`) 와 분리되며 Phase 5 attach 실패 sentinel (`0xFF`) 과도 분리.
+
+## WireCmd::Status (0x0080) body
+
+본 명령은 `audit_snapshot` 결과를 wire 응답으로 직렬화 한다. Phase 6 의 `sys_hsm_status` 와 별개의
+wire-side 미러로 동작하며, audit ring 의 단방향 view 만 제공한다 (slot mutation 0).
+
+### Request payload
+
+empty (0 옥텟).
+
+### Response payload (8 + 12*n 옥텟, n = audit_ring written)
+
+| offset | length | field | encoding |
+|--------|--------|-------|----------|
+| 0..2 | 2 | written | u16 LE — 실 events 수 (0..=32) |
+| 2..6 | 4 | total | u32 LE — 누적 enqueue 카운터 (loss 감지 hint) |
+| 6..8 | 2 | _reserved | 항상 0 |
+| 8..(8 + 12n) | 12n | events | EnrollEvent 12 옥텟 raw × written |
+
+Total payload max: 8 + 12 × 32 = 392 옥텟. Frame total max: 16 + 392 = 408 옥텟.
+
+### EnrollEvent raw byte layout (12 옥텟, `#[repr(C)]`)
+
+| offset | length | field |
+|--------|--------|-------|
+| 0..4 | 4 | seq u32 LE |
+| 4..5 | 1 | slot_idx u8 |
+| 5..6 | 1 | result u8 |
+| 6..7 | 1 | bus_kind u8 |
+| 7..8 | 1 | _pad u8 |
+| 8..12 | 4 | pk_hash_prefix [u8; 4] |
+
+`slot_idx` 값 영역
+
+- `0..=7` 실제 부착 슬롯 인덱스 (Phase 5 attach 게이트 사용)
+- `0xFE` wire-side re-attestation marker (Phase 5.1 WireCmd::AttestSubmit)
+- `0xFF` Phase 5 attach 실패 sentinel (부재 슬롯 인덱스)
+
+### Result Code 카탈로그
+
+| code | 의미 | enqueue 시점 |
+|------|------|--------------|
+| 0 | Ok | attach 성공 |
+| 1 | AttestFailed | attach verify 실패 |
+| 2 | Full | slot full |
+| 3 | BadInit | bus_kind / init_blob 잘못됨 |
+| 4 | Other | 기타 |
+| 5 | WireReattestOk | Phase 5.1 wire AttestSubmit 성공 |
+| 6 | WireReattestFail | Phase 5.1 wire AttestSubmit 실패 |
+| 7..=255 | reserved | 향후 phase |
 
 ## Status codes
 
