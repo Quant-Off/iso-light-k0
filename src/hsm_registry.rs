@@ -1,4 +1,5 @@
 use constant_time::{Choice, CtEqOps, CtLess};
+use mldsa::MLDSA44;
 use zeroize::Zeroize;
 
 use crate::bus::{BusDriver, BusInstance, BusKind, MAX_BUS_INIT_BLOB, WIRE_FRAME_MAX};
@@ -90,6 +91,8 @@ pub enum HsmCapError {
     TokenGen,
     // Phase 2: bus.open(init_blob) 실패 (D-16 all-or-nothing).
     BadInit,
+    // Phase 5 D-11 4 mldsa Error variants + Ok(false) 단일 collapse, syscall 경계 SyscallError Denied 로 변환
+    AttestFailed,
 }
 
 //
@@ -172,6 +175,10 @@ pub struct HsmSlot {
     pub token: u64,
     pub rights: HsmRights,
     pub bus: BusInstance,
+    // Phase 5 D-14 verify gate 결과 코드 0=Ok 1=AttestFailed 2..=255=reserved
+    pub verify_result_code: u8,
+    // Phase 5 D-14 BLAKE3(pk) 첫 4 옥텟 audit + enumerate 노출
+    pub pk_hash_prefix: [u8; 4],
 }
 
 impl HsmSlot {
@@ -181,6 +188,8 @@ impl HsmSlot {
             token: 0,
             rights: HsmRights::NONE,
             bus: BusInstance::new_empty(),
+            verify_result_code: 0,
+            pk_hash_prefix: [0u8; 4],
         }
     }
 }
@@ -192,6 +201,9 @@ impl Zeroize for HsmSlot {
         // Phase 2 cascade: BusInstance 의 활성 variant payload 를 비우고 Empty 로 reset (D-11).
         self.bus.zeroize();
         self.rights = HsmRights::NONE;
+        // Phase 5 D-14 verify audit 흔적 0 으로 복귀 detach 후 재사용 시 잔재 차단
+        self.verify_result_code = 0;
+        self.pk_hash_prefix = [0u8; 4];
         // 상태 전이는 가장 마지막 (PATTERNS B-4)
         self.state = HsmSlotState::Empty;
     }
@@ -253,7 +265,37 @@ impl HsmRegistry {
 
     // SAFETY contract (D-09, D-12): BSP single-core; CAP_DRBG must be initialized
     // via capability::init_prng() before this is entered.
-    pub unsafe fn attach(&mut self, bus_kind: BusKind, init_blob: &[u8], rights: HsmRights) -> Result<HsmCapability, HsmCapError> {
+    // Phase 5 D-10 시그니처 확장 attest_payload Some 시 token gen 이전 verify gate atomicity 보장
+    pub unsafe fn attach(
+        &mut self,
+        bus_kind: BusKind,
+        init_blob: &[u8],
+        attest_payload: Option<&[u8]>,
+        rights: HsmRights,
+    ) -> Result<HsmCapability, HsmCapError> {
+        // Phase 5 D-10 verify gate token gen 이전 위치 RESEARCH 6.2 atomicity 슬롯 mutation 0
+        // Some 분기만 verify None 은 Phase 2 3 4 smoke 우회 보존
+        let attest_ok: Option<[u8; 4]> = if let Some(payload) = attest_payload {
+            // Phase 5 D-05 정확 len 검사 cast 안전성 invariant
+            if payload.len() != MLDSA44::PK_LEN + MLDSA44::SIG_LEN {
+                return Err(HsmCapError::AttestFailed);
+            }
+            // SAFETY pk 는 payload 의 첫 PK_LEN 옥텟 sig 는 그 뒤 SIG_LEN 옥텟 len 검사 통과 시 정렬 0 cast 안전
+            let pk: &[u8; MLDSA44::PK_LEN] = unsafe {
+                &*(payload.as_ptr() as *const [u8; MLDSA44::PK_LEN])
+            };
+            let sig: &[u8; MLDSA44::SIG_LEN] = unsafe {
+                &*(payload.as_ptr().add(MLDSA44::PK_LEN) as *const [u8; MLDSA44::SIG_LEN])
+            };
+            // Pitfall 7 AttestError 4 variants 모두 HsmCapError AttestFailed 로 collapse
+            crate::hsm_attest::verify_attest(pk, bus_kind, sig)
+                .map_err(|_| HsmCapError::AttestFailed)?;
+            // verify 통과 시 audit 노출 prefix 산출 caller 가 commit 직전 슬롯에 기록
+            Some(crate::hsm_attest::pk_hash_prefix(pk))
+        } else {
+            None
+        };
+
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if matches!(slot.state, HsmSlotState::Empty) {
                 // SAFETY: BSP single-core; capability::init_prng() completed in boot order
@@ -277,6 +319,11 @@ impl HsmRegistry {
                 slot.bus = bus;
                 slot.token = token;
                 slot.rights = rights;
+                // Phase 5 D-14 verify gate 통과 시 audit 흔적 기록 None 분기는 default 유지
+                if let Some(prefix) = attest_ok {
+                    slot.verify_result_code = 0;
+                    slot.pk_hash_prefix = prefix;
+                }
                 slot.state = HsmSlotState::Attached;
                 // CR-03: padding 까지 명시 0 (struct literal 이 모든 가시 필드 초기화)
                 return Ok(HsmCapability {
@@ -468,7 +515,25 @@ impl HsmRegistry {
 // SAFETY: BSP 단일 코어 + capability::init_prng() 완료 가정.
 pub unsafe fn attach_kernel_side(bus_kind: BusKind, init_blob: &[u8], rights: HsmRights) -> Result<HsmCapability, HsmCapError> {
     // SAFETY: BSP single-core; with_registry_mut 의 invariant 위임
-    unsafe { with_registry_mut(|r| r.attach(bus_kind, init_blob, rights)) }
+    // Phase 5 D-10 None 전달 verify gate 우회 Phase 2 3 4 smoke 호환성 보존
+    unsafe { with_registry_mut(|r| r.attach(bus_kind, init_blob, None, rights)) }
+}
+
+/// Phase 5 attestation gate 통과 후에만 슬롯에 부착하는 boot smoke 진입점
+///
+/// `attach_kernel_side` 의 None 분기 sibling Some(attest_payload) 전달로 verify gate 강제
+/// Plan 05-04 host sibling test 와 향후 Phase 5 통합 smoke 가 호출
+///
+/// # Safety
+/// BSP 단일 코어 capability init_prng 완료 가정 attest_payload 는 정확 3732 옥텟 pk 1312 sig 2420 직렬화
+pub unsafe fn attach_kernel_side_with_attest(
+    bus_kind: BusKind,
+    init_blob: &[u8],
+    attest_payload: &[u8],
+    rights: HsmRights,
+) -> Result<HsmCapability, HsmCapError> {
+    // SAFETY BSP single-core with_registry_mut 의 invariant 위임 Some 전달로 attach 본문 verify gate 활성
+    unsafe { with_registry_mut(|r| r.attach(bus_kind, init_blob, Some(attest_payload), rights)) }
 }
 
 //
@@ -534,6 +599,8 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
             r.attach(
                 bus_kind,
                 init_slice,
+                // Phase 5 D-10 Task 2 가 Some(payload) 로 교체 Task 1 은 컴파일 보전 None
+                None,
                 // Phase 3 Risk #7  RELAY_SRC/RELAY_DST 비트 활성화  Phase 1 D-03 reserved 비트 사용 개시
                 HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE | HsmRights::RELAY_SRC | HsmRights::RELAY_DST,
             )
