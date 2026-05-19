@@ -553,11 +553,36 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
     let attest_ptr = ctx.r10;
     let attest_len = ctx.r9;
 
-    // Phase 1: T-02-04: Usb..Network stub variants 거부 — BusInstance::new() 에 도달 0.
+    // Phase 1: T-02-04: Usb..SmartCard stub variants 거부 — BusInstance::new() 에 도달 0
+    // Phase 6 GAP D-01 D-02 Network=6 cfg-split tls-external 분기 NETWORK_CAP_STATE Taken 검증
+    // closed 분기 audit_enqueue + SyscallError::Denied 5 NetworkDenied 콜럐스 단일 RAX 잠금
     let bus_kind: BusKind = match bus_kind_raw {
         0 => BusKind::Software,
         1 => BusKind::Ring3Process,
-        2..=6 => return SyscallError::BadArg.as_rax(),
+        #[cfg(feature = "tls-external")]
+        6 => {
+            // Phase 6 D-02 NETWORK_ATTACH cap state-only 검증 (Open Q2 in-plan state-only 결정)
+            // SAFETY BSP single-core init_network_cap 호출 완료 가정 NETWORK_CAP_STATE 단일 read
+            let cap_taken = unsafe {
+                (&raw const crate::air_gap::NETWORK_CAP_STATE).read()
+                    == crate::air_gap::NetCapState::Taken
+            };
+            if !cap_taken {
+                // 5 NetworkDenied 콜럐스 두번째 카테고리 cap-less 호출 (D-01)
+                // slot_idx=0xFF 미할당 result=2 NetworkDenied bus_kind=6 Network pk=[0u8;4]
+                crate::hsm_attest::audit_enqueue(0xFF, 2, 6, [0u8; 4]);
+                return SyscallError::Denied.as_rax();
+            }
+            BusKind::Network
+        }
+        #[cfg(not(feature = "tls-external"))]
+        6 => {
+            // closed 빌드 거부 경로 (D-01 첫번째 카테고리 closed-build 우발 진입)
+            // matchless `_` arm 대신 명시 6 arm Pitfall 7 일관 Denied collapse
+            crate::hsm_attest::audit_enqueue(0xFF, 2, 6, [0u8; 4]);
+            return SyscallError::Denied.as_rax();
+        }
+        2..=5 => return SyscallError::BadArg.as_rax(),
         _ => return SyscallError::BadArg.as_rax(),
     };
 
