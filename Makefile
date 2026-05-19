@@ -98,7 +98,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test
 
 all: iso
 
@@ -227,6 +227,21 @@ ci-phase2: check-alloc-zero check-alloc-bus qemu-smoke
 chan-dudect:
 	@cd /Library/Quant/Repository/projects/elib-k0-nt && $(CARGO) test -p constant-time --tests --release -- --ignored chan_
 	@echo "[CI] Phase 3 chan-dudect 게이트 통과"
+
+#
+# Phase 5.1 host-side wire attest leg (Plan 05.1-01 Wave 0 신설)
+#
+# elib-k0-nt sibling 크레이트의 wire_attest_* / wire_status_* CT 회귀 테스트
+# AttestSubmit dispatcher 성공/실패 + Status response byte-exact roundtrip
+# + payload 3733 옥텟 split + re-attestation slot mutation 0 회귀 가드 4 종
+#
+# 본 leg 는 Plan 05.1-04 의 GREEN fill-in 후 PASS Wave 0 단계는
+# sibling test 컴파일 표면 잠금만 의무 실 실행 PASS 는 Plan 05.1-04 이후
+#
+wire-attest-host-test:
+	@cd /Library/Quant/Repository/projects/elib-k0-nt && \
+	 $(CARGO) test -p constant-time --tests --release -- wire_attest_ wire_status_
+	@echo "[CI] Phase 5.1 wire-attest-host-test 게이트 통과"
 
 #
 # Phase 3 CI 게이트 (CHAN-01..CHAN-04 + smoke + dudect)
