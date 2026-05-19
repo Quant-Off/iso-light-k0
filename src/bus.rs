@@ -3,6 +3,7 @@ use crate::capability::rand_bytes;
 use aes::{AES256GCM, GCM_NONCE_SIZE, GCM_TAG_SIZE};
 use blake::{BLAKE3_OUT_LEN, Blake3};
 use constant_time::CtEqOps;
+use mldsa;
 use serde::{Deserialize, Serialize};
 use zeroize::Secret;
 use zeroize::Zeroize;
@@ -81,12 +82,19 @@ pub enum WireStatus {
     Internal = 4,
 }
 
+/// Phase 5.1 D-01 wire AttestSubmit payload 정확 길이 pk 1312 ‖ bus_kind 1 ‖ sig 2420 = 3733
+///
+/// Pitfall 1 회피 syscall attach 의 ATTEST_EXACT 3732 와 1 옥텟 차이
+/// wire 는 bus_kind 옥텟이 payload 안에 인라인 포함
+pub const WIRE_ATTEST_LEN: usize = mldsa::MLDSA44::PK_LEN + 1 + mldsa::MLDSA44::SIG_LEN;
+
 // 컴파일-타임 size/align 핀 (RESEARCH Pattern 1 + PATTERNS SH-4)
 const _: () = assert!(core::mem::size_of::<WireFrameHeader>() == 16);
 const _: () = assert!(core::mem::align_of::<WireFrameHeader>() == 4);
 const _: () = assert!(core::mem::size_of::<WireCmd>() == 2);
 const _: () = assert!(core::mem::size_of::<WireStatus>() == 2);
 const _: () = assert!(WIRE_PAYLOAD_MAX + 16 == WIRE_FRAME_MAX);
+const _: () = assert!(WIRE_ATTEST_LEN == 3733);
 
 //
 // Phase 4 Plan 02 Wire 헬퍼 6 함수 (D-08 / D-11 / D-16 / D-17 / D-18)
@@ -220,6 +228,100 @@ fn handle_blake3(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) ->
 /// Ping 디스패치  빈 payload 의 Ok 응답 프레임 (D-Discretion)
 fn handle_ping(req_id: u32, out: &mut [u8; WIRE_FRAME_MAX]) -> usize {
     build_response_frame(req_id, WireCmd::Ping, WireStatus::Ok, &[], out)
+}
+
+/// Phase 5.1 D-01 wire AttestSubmit 디스패치  epoch-rollover 재 attestation
+///
+/// # Safety
+/// 호출자가 Tier 1/2 sanity 통과한 payload 만 전달 data.len ∈ [16, 4096] + magic LWK0 + version 1
+///
+/// # Errors
+/// payload.len() != WIRE_ATTEST_LEN 3733 → BadFrame
+/// bus_octet ∉ {0, 1} → BadFrame
+/// verify_attest Err → Denied audit_enqueue result=6 WireReattestFail
+/// 성공 → Ok audit_enqueue result=5 WireReattestOk slot mutation 0
+fn handle_attest_submit(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) -> usize {
+    // (1) payload 길이 정확 3733 옥텟 (Pitfall 1 회피)
+    if payload.len() != WIRE_ATTEST_LEN {
+        return build_error_frame_inplace(req_id, WireStatus::BadFrame, out);
+    }
+    // (2) split — wire layout fixed offset pk 1312 || bus_kind 1 || sig 2420
+    // SAFETY  payload.len == WIRE_ATTEST_LEN 검증 통과, repr 균등 byte stream
+    let pk: &[u8; mldsa::MLDSA44::PK_LEN] = unsafe {
+        &*(payload.as_ptr() as *const [u8; mldsa::MLDSA44::PK_LEN])
+    };
+    let bus_octet = payload[mldsa::MLDSA44::PK_LEN];
+    let sig: &[u8; mldsa::MLDSA44::SIG_LEN] = unsafe {
+        &*(payload[mldsa::MLDSA44::PK_LEN + 1..].as_ptr()
+            as *const [u8; mldsa::MLDSA44::SIG_LEN])
+    };
+    // (3) BusKind octet decode 유효 variant 만 허용
+    let bus_kind = match bus_octet {
+        0 => BusKind::Software,
+        1 => BusKind::Ring3Process,
+        _ => return build_error_frame_inplace(req_id, WireStatus::BadFrame, out),
+    };
+    // (4) verify_attest 호출 Phase 5 가드 그대로 재사용 slot mutation 0
+    let result = crate::hsm_attest::verify_attest(pk, bus_kind, sig);
+    // (5) audit_enqueue wire-side re-attestation event slot=0xFE wire marker
+    let prefix = crate::hsm_attest::pk_hash_prefix(pk);
+    let (audit_result_code, status) = match result {
+        Ok(()) => (5u8, WireStatus::Ok),
+        Err(_) => (6u8, WireStatus::Denied),
+    };
+    crate::hsm_attest::audit_enqueue(0xFE, audit_result_code, bus_octet, prefix);
+    // (6) 응답 frame Ok 는 16B header only Denied 는 error frame
+    match status {
+        WireStatus::Ok => {
+            build_response_frame(req_id, WireCmd::AttestSubmit, WireStatus::Ok, &[], out)
+        }
+        _ => build_error_frame_inplace(req_id, WireStatus::Denied, out),
+    }
+}
+
+/// Phase 5.1 D-02 wire Status 디스패치  audit_snapshot 직렬화
+///
+/// # Errors
+/// payload 가 비어있지 않으면 BadFrame
+/// 성공 시 payload = [written u16 LE | total u32 LE | 2B reserved | EnrollEvent[written] raw 12 옥텟]
+fn handle_status(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) -> usize {
+    // (1) payload empty 정합성
+    if !payload.is_empty() {
+        return build_error_frame_inplace(req_id, WireStatus::BadFrame, out);
+    }
+    // (2) caller buffer 시뮬레이션 staging stack-local AUDIT_RING_CAPACITY 슬롯
+    let mut events_local = [crate::hsm_attest::EnrollEvent::default();
+        crate::hsm_attest::AUDIT_RING_CAPACITY];
+    let (written, total) = crate::hsm_attest::audit_snapshot(&mut events_local);
+    // (3) wire payload 직렬화 manual LE byte-level (Pitfall 2 transmute 미사용)
+    let header_len: usize = 8; // written u16 + total u32 + reserved u16
+    let event_bytes = written * core::mem::size_of::<crate::hsm_attest::EnrollEvent>();
+    let payload_len = header_len + event_bytes;
+    debug_assert!(payload_len <= WIRE_PAYLOAD_MAX); // Pitfall 4 future-proof
+    // staging = 8 + 32 * 12 = 392 옥텟
+    let mut staging = [0u8; 8
+        + crate::hsm_attest::AUDIT_RING_CAPACITY
+            * core::mem::size_of::<crate::hsm_attest::EnrollEvent>()];
+    staging[0..2].copy_from_slice(&(written as u16).to_le_bytes());
+    staging[2..6].copy_from_slice(&total.to_le_bytes());
+    // staging[6..8] reserved 이미 0 초기화
+    for i in 0..written {
+        let off = 8 + i * core::mem::size_of::<crate::hsm_attest::EnrollEvent>();
+        // Pitfall 2 회피 명시 byte 조립 transmute 미사용
+        staging[off..off + 4].copy_from_slice(&events_local[i].seq.to_le_bytes());
+        staging[off + 4] = events_local[i].slot_idx;
+        staging[off + 5] = events_local[i].result;
+        staging[off + 6] = events_local[i].bus_kind;
+        staging[off + 7] = events_local[i]._pad;
+        staging[off + 8..off + 12].copy_from_slice(&events_local[i].pk_hash_prefix);
+    }
+    build_response_frame(
+        req_id,
+        WireCmd::Status,
+        WireStatus::Ok,
+        &staging[..payload_len],
+        out,
+    )
 }
 
 //
@@ -652,12 +754,20 @@ impl BusDriver for Ring3ProcessBus {
             return Err(BusError::Internal);
         }
 
-        // Tier 3  cmd dispatch (D-11 — Blake3Hash 단일 실 dispatch, AttestSubmit/Status 는 UnknownCmd)
+        // Tier 3  cmd dispatch (D-11 / Phase 5.1 D-01 D-02 — AttestSubmit/Status 본문 closure)
         let payload = &data[16..16 + hdr.payload_len as usize];
         let resp_frame_len = match hdr.cmd {
             x if x == WireCmd::Ping as u16 => handle_ping(hdr.req_id, &mut self.pending_response),
             x if x == WireCmd::Blake3Hash as u16 => {
                 handle_blake3(hdr.req_id, payload, &mut self.pending_response)
+            }
+            // 본 페이즈 신규 Phase 5.1 D-01 wire AttestSubmit re-attestation dispatch
+            x if x == WireCmd::AttestSubmit as u16 => {
+                handle_attest_submit(hdr.req_id, payload, &mut self.pending_response)
+            }
+            // 본 페이즈 신규 Phase 5.1 D-02 wire Status audit-snapshot dispatch
+            x if x == WireCmd::Status as u16 => {
+                handle_status(hdr.req_id, payload, &mut self.pending_response)
             }
             _ => build_error_frame_inplace(
                 hdr.req_id,
