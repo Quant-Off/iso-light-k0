@@ -153,6 +153,22 @@ pub enum SyscallNum {
     /// 채운 WIRE_ATTEST_FIXTURE BSS 를 사용자 공간으로 복사 closed 빌드 cfg-out
     #[cfg(feature = "smoke")]
     AttestFixtureExport = 13,
+    /// Phase 6 GAP D-03 NETWORK_ATTACH cap one-shot Ring 3 인도 (tls-external 한정)
+    ///
+    /// out_ptr 16 옥텟 HsmCapability 응답 first-caller-wins after-take Denied
+    /// closed 빌드 cfg-out variant 자체 부재 호출 시 Unknown 폴백 (RAX -1)
+    #[cfg(feature = "tls-external")]
+    NetworkCapTake = 14,
+    /// Phase 6 GAP D-06 AUDIT_READ cap one-shot Ring 3 인도 (양 프로필 공통)
+    ///
+    /// out_ptr 16 옥텟 HsmCapability 응답 first-caller-wins after-take Denied
+    /// audit query 보유자만 sys_hsm_status 진입 가능
+    AuditCapTake = 15,
+    /// Phase 6 GAP D-05 sys_hsm_status atomic 456 옥텟 응답 (AUDIT_READ cap 보유자만)
+    ///
+    /// out_ptr rdi out_len rsi caller_cap_token rdx ABI 잠금
+    /// 호출 자체는 AUDIT_RING 미기록 (D-05 audit-of-audit 회피)
+    HsmStatus = 16,
 }
 
 /// 사용자에 노출되는 음수 에러 코드 (Linux errno 와 호환되지 않음, 자체 ABI).
@@ -330,6 +346,11 @@ extern "C" fn dispatch(ctx: &mut SyscallContext) {
         x if x == SyscallNum::AttestFixtureExport as u64 => {
             crate::handle_attest_fixture_export(ctx)
         }
+        // Phase 6 air-gap dual-enforcement (D-03 / D-05 / D-06)
+        #[cfg(feature = "tls-external")]
+        x if x == SyscallNum::NetworkCapTake as u64 => crate::air_gap::take_network_cap(ctx),
+        x if x == SyscallNum::AuditCapTake as u64 => crate::air_gap::take_audit_read_cap(ctx),
+        x if x == SyscallNum::HsmStatus as u64 => crate::air_gap::handle_status(ctx),
         // IpcCall/IpcRecv/IpcReply/CapRequest 는 Phase B 에서 와이어업.
         x if x == SyscallNum::IpcCall as u64
             || x == SyscallNum::IpcRecv as u64
