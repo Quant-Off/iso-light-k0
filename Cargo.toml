@@ -11,6 +11,8 @@ build = "build.rs"
 [features]
 default = []
 tls-external = []
+# Phase 5 D-02: kernel-side smoke 전용 dev sk include 게이트 closed 프로필 부재
+smoke = []
 
 # `cargo clippy --all-targets`가 bare-metal(no_std) 커널 바이너리에 대해
 # test/bench/doctest harness를 합성하면 `extern crate test;`를 주입하여

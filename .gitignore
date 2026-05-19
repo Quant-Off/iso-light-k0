@@ -8,3 +8,6 @@ AIR-GAP.md
 
 # GSD planning artifacts (commit_docs: false)
 .planning/
+
+# Phase 5 D-02 dev trust root secret keys
+keys/*.sk*
