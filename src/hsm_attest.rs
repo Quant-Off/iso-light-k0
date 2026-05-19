@@ -37,12 +37,14 @@ const _: () = assert!(MLDSA44::SIG_LEN == 2420);
 /// 활성 신뢰 루트 ML-DSA-44 공개키 1312 옥텟
 ///
 /// `init_trust_root` 가 부팅 시 1 회만 채움, 이후 `verify_attest` 가 `&raw const` 로만 접근
+#[used]
 pub static mut ACTIVE_TRUST_ROOT_PK: [u8; MLDSA44::PK_LEN] = [0u8; MLDSA44::PK_LEN];
 
 /// 부팅 세션 단위 challenge 32 옥텟 (D-09)
 ///
 /// `capability::gen_token_u64` 4 회 호출 결과의 big-endian 연쇄로 채움
 /// 부팅 마다 새로 생성되어 cross-boot replay 차단
+#[used]
 pub static mut BOOT_CHALLENGE: [u8; 32] = [0u8; 32];
 
 /// attestation staging buffer 한도 (D-06 RELAY_BUF 와 동일 크기, 책임 경계 분리)
@@ -52,6 +54,7 @@ pub const ATTEST_BUF_MAX: usize = 4096;
 ///
 /// PK_LEN_44 (1312) + SIG_LEN_44 (2420) = 3732 옥텟 + 364 옥텟 forward-reserve
 /// 단일 syscall 안에서 `with_attest_buf` 안전 래퍼 진입 시 + 이탈 시 양면 zeroize
+#[used]
 pub static mut ATTEST_BUF: [u8; ATTEST_BUF_MAX] = [0u8; ATTEST_BUF_MAX];
 
 /// AUDIT_RING 의 정적 capacity (D-13)
@@ -90,6 +93,7 @@ pub struct AuditRing {
 }
 
 /// 단일 AUDIT_RING BSS singleton (D-13)
+#[used]
 pub static mut AUDIT_RING: AuditRing = AuditRing {
     events: [EnrollEvent {
         seq: 0,
@@ -234,6 +238,82 @@ pub fn audit_snapshot(out: &mut [EnrollEvent]) -> (usize, u32) {
         }
         (n, r.total)
     }
+}
+
+//
+// verify_attest ML-DSA-44 어테스테이션 검증 (D-07 amendment / D-08 / D-11 / D-12)
+//
+// 서명 평문 = BLAKE3(pk(1312) || bus_kind(1) || BOOT_CHALLENGE(32)) 32 옥텟 (D-07 amendment)
+// MLDSA44::verify 의 m_prime[1024] 한도 안에서 안전 (2 + ctx(16) + msg(32) = 50)
+// 4 mldsa::Error variant + Ok(false) 모두 단일 AttestError::AttestFailed 로 collapse (D-11)
+
+/// ML-DSA-44 어테스테이션 서명을 신뢰 루트로 검증
+///
+/// # Arguments
+/// `hsm_pk` HSM 자체의 ML-DSA-44 공개키 1312 옥텟
+/// `bus_kind` HSM 부착 transport 분류 BUS_KIND_OCTET 으로 메시지에 포함
+/// `sig` HSM 의 ML-DSA-44 서명 2420 옥텟
+///
+/// # Errors
+/// `AttestError::AttestFailed` 4 mldsa::Error variant + verify Ok(false) 모두 단일 collapse (D-11 Pitfall 7)
+///
+/// # Security Note
+/// 메시지 재구성 + SMAP copy 는 입력값 독립 분기 (D-12) verify 결과만 input-dependent
+/// 모든 경로 (Ok 또는 Err) 에서 stack-local pre 와 digest 가 zeroize 되어 잔존 0
+pub fn verify_attest(
+    hsm_pk: &[u8; MLDSA44::PK_LEN],
+    bus_kind: BusKind,
+    sig: &[u8; MLDSA44::SIG_LEN],
+) -> Result<(), AttestError> {
+    // (1) Pre-image 재구성 byte-exact copy 순서 고정 input-독립 (D-12)
+    // layout pk(1312) || bus_kind_octet(1) || BOOT_CHALLENGE(32) = 1345 옥텟
+    let mut pre = [0u8; MLDSA44::PK_LEN + 1 + 32];
+    pre[0..MLDSA44::PK_LEN].copy_from_slice(hsm_pk);
+    pre[MLDSA44::PK_LEN] = bus_kind as u8;
+    // SAFETY BSP single-core BOOT_CHALLENGE 의 단일 진입 read
+    unsafe {
+        pre[MLDSA44::PK_LEN + 1..]
+            .copy_from_slice(&*(&raw const BOOT_CHALLENGE));
+    }
+
+    // (2) BLAKE3 digest 산출 (D-07 amendment RESEARCH §14.1 RESOLVED)
+    // 서명 평문 = digest(32) 1024 옥텟 m_prime 한도 안에서 안전
+    // BLAKE3 충돌저항 2^256 이 pk / bus / challenge substitution + replay 차단을 그대로 유지
+    let mut digest = [0u8; 32];
+    {
+        let mut hasher = Blake3::new();
+        hasher.update(&pre);
+        match hasher.finalize() {
+            Ok(d) => {
+                digest.copy_from_slice(&d.as_slice()[..32]);
+                debug_assert_eq!(d.as_slice().len(), BLAKE3_OUT_LEN);
+            }
+            Err(_) => {
+                // BLAKE3 finalize 실패는 본 경계에서 검증 실패와 동일 collapse
+                pre.zeroize();
+                digest.zeroize();
+                return Err(AttestError::AttestFailed);
+            }
+        }
+    }
+
+    // (3) ML-DSA-44 verify (D-08 ctx 16 옥텟 도메인 분리)
+    // SAFETY BSP single-core ACTIVE_TRUST_ROOT_PK 의 단일 진입 read
+    let trust_root = unsafe { &*(&raw const ACTIVE_TRUST_ROOT_PK) };
+    let result = MLDSA44::verify(trust_root, &digest, sig, b"ISO-K0-ENROLL-V1");
+
+    // (4) 4 mldsa::Error variant + Ok(false) → 단일 AttestFailed collapse (D-11 Pitfall 7)
+    // single match expression 분기 분리 X (CT 일관)
+    let outcome = match result {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AttestError::AttestFailed),
+        Err(_) => Err(AttestError::AttestFailed),
+    };
+
+    // (5) 모든 경로 stack-local zeroize (D-12 Pitfall 4)
+    pre.zeroize();
+    digest.zeroize();
+    outcome
 }
 
 //
