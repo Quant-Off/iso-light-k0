@@ -19,6 +19,7 @@ pub mod elf; // ELF64 정적 실행 파일 파서
 pub mod hsm; // HSM 추상 트레이트 + NullHsm
 pub mod hsm_registry; // Phase 1: HSM 멀티 슬롯 레지스트리 (capability-backed)
 pub mod hsm_attest; // Phase 5: ML-DSA-44 attest verifier + AUDIT_RING + ATTEST_BUF
+pub mod air_gap; // Phase 6: air-gap 이중 게이트 + sys_hsm_status + 2 층 self-check
 pub mod bus; // Phase 2: 외부 버스 드라이버 추상화 (BusDriver trait + enum-dispatch)
 pub mod idt;
 pub mod ipc; // IPC 메시지 패싱 (동기 rendezvous)
