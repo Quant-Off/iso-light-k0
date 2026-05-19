@@ -147,6 +147,12 @@ pub enum SyscallNum {
     HsmWrite = 10,    // Phase 3: USE cap → SoftHSM mode-aware write (D-02)
     HsmRelay = 11,    // Phase 3: src(RELAY_SRC) + dst(RELAY_DST) dual-cap kernel-internal transfer (D-03)
     HsmRead = 12,     // Phase 4: USE cap → wire frame response 회수 (D-06)
+    /// Phase 5.1 D-04 attest_payload 3733 옥텟 fixture export (feature smoke 한정)
+    ///
+    /// lumen 측 mldsa 의존 부재 우회 kernel 이 attest_phase5_1_wire_smoke_test 에서
+    /// 채운 WIRE_ATTEST_FIXTURE BSS 를 사용자 공간으로 복사 closed 빌드 cfg-out
+    #[cfg(feature = "smoke")]
+    AttestFixtureExport = 13,
 }
 
 /// 사용자에 노출되는 음수 에러 코드 (Linux errno 와 호환되지 않음, 자체 ABI).
@@ -320,6 +326,10 @@ extern "C" fn dispatch(ctx: &mut SyscallContext) {
         x if x == SyscallNum::HsmWrite as u64 => crate::hsm_registry::handle_write(ctx),
         x if x == SyscallNum::HsmRelay as u64 => crate::hsm_registry::handle_relay(ctx),
         x if x == SyscallNum::HsmRead as u64 => crate::hsm_registry::handle_read(ctx),
+        #[cfg(feature = "smoke")]
+        x if x == SyscallNum::AttestFixtureExport as u64 => {
+            crate::handle_attest_fixture_export(ctx)
+        }
         // IpcCall/IpcRecv/IpcReply/CapRequest 는 Phase B 에서 와이어업.
         x if x == SyscallNum::IpcCall as u64
             || x == SyscallNum::IpcRecv as u64
