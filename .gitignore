@@ -9,6 +9,7 @@ AIR-GAP.md
 # GSD (Claude Code)
 .planning/
 .claude/
+CLAUDE.md
 
 # Phase 5 D-02 dev trust root secret keys
 keys/*.sk*
