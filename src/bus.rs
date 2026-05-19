@@ -754,12 +754,20 @@ impl BusDriver for Ring3ProcessBus {
             return Err(BusError::Internal);
         }
 
-        // Tier 3  cmd dispatch (D-11 — Blake3Hash 단일 실 dispatch, AttestSubmit/Status 는 UnknownCmd)
+        // Tier 3  cmd dispatch (D-11 / Phase 5.1 D-01 D-02 — AttestSubmit/Status 본문 closure)
         let payload = &data[16..16 + hdr.payload_len as usize];
         let resp_frame_len = match hdr.cmd {
             x if x == WireCmd::Ping as u16 => handle_ping(hdr.req_id, &mut self.pending_response),
             x if x == WireCmd::Blake3Hash as u16 => {
                 handle_blake3(hdr.req_id, payload, &mut self.pending_response)
+            }
+            // 본 페이즈 신규 Phase 5.1 D-01 wire AttestSubmit re-attestation dispatch
+            x if x == WireCmd::AttestSubmit as u16 => {
+                handle_attest_submit(hdr.req_id, payload, &mut self.pending_response)
+            }
+            // 본 페이즈 신규 Phase 5.1 D-02 wire Status audit-snapshot dispatch
+            x if x == WireCmd::Status as u16 => {
+                handle_status(hdr.req_id, payload, &mut self.pending_response)
             }
             _ => build_error_frame_inplace(
                 hdr.req_id,
