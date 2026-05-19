@@ -473,6 +473,27 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
         );
     }
 
+    // Phase 6 GAP D-02 D-06 부팅 시 1 회 NETWORK_ATTACH + AUDIT_READ cap mint (양 프로필 공통 + cfg)
+    // 호출 위치 hsm_attest::init_trust_root 직후 capability::init_prng + init_trust_root 완료 가정
+    // SAFETY 단일 코어 부팅 초기 BSP single-core invariant 양 init_*_cap 의 단일 진입 갱신
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        air_gap::init_audit_read_cap();
+        vga::println(
+            b"[iso-light-k0] AUDIT_READ_CAP Init Done.",
+            vga::Color::Green,
+        );
+
+        #[cfg(feature = "tls-external")]
+        {
+            air_gap::init_network_cap();
+            vga::println(
+                b"[iso-light-k0] NETWORK_ATTACH_CAP Init Done.",
+                vga::Color::Green,
+            );
+        }
+    }
+
     //
     // 13. IPC 서브시스템 초기화
     //
@@ -580,6 +601,15 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     unsafe {
         core::arch::asm!("sti", options(nostack, preserves_flags));
         vga::println(b"[iso-light-k0] All Task Done.", vga::Color::Green);
+    }
+
+    // Phase 6 GAP D-07 Layer 2 self-check 모든 init + syscall::install + dispatcher arm 등록 직후
+    // 호출 위치 syscall::install (L226) 후 + try_spawn_user 진입 전 정확한 fail-stop 경계
+    // SAFETY 모든 init_* + STAR/LSTAR MSR 등록 완료 Ring 3 진입 이전 단일 코어
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        air_gap::gap_self_check();
+        vga::println(b"[iso-light-k0] gap_self_check OK.", vga::Color::Green);
     }
 
     //
