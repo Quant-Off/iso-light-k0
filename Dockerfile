@@ -6,7 +6,7 @@
 #   - qemu-system-x86_64 (커널 테스트)
 #   - xorriso (ISO 백엔드)
 
-FROM ubuntu:24.04
+FROM --platform=linux/amd64 ubuntu:24.04
 
 # 패키지 설치 중 대화형 프롬프트 방지
 ENV DEBIAN_FRONTEND=noninteractive
@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     git \
     gcc \
+    libc6-dev \
     make \
     # ISO 생성 도구
     xorriso \

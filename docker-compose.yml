@@ -22,6 +22,7 @@
 # target/ 은 호스트(macOS)와의 cross-target 충돌을 막기 위해 named volume 사용.
 
 x-kernel-build: &kernel-build
+  platform: linux/amd64
   build:
     context: .
     dockerfile: Dockerfile
