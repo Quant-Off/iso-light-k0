@@ -31,6 +31,25 @@ sha3          = { path = "../../../elib-k0-nt/sha3", version = "1.0.0" }
 postcard      = { version = "1", default-features = false }
 serde         = { version = "1", default-features = false, features = ["derive"] }
 
+# Phase 7 Plan 04 SC #5 cargo-machete dead-dep 게이트 deferred 처리
+#
+# 본 entries 는 cargo-machete v0.9.2 가 본 crate 최상위 [dependencies] 에서
+# `use` 직접 호출 부재로 신호한 dead deps 정본 정책 (.machete.toml proc-macro
+# 위양성만 허용) 위배 회피를 위해 본 per-crate metadata 로 격리 처리
+# Phase 7 Plan 04 의 정본 audit scope 가 커널 Cargo.toml 만 다루기에 본 sibling
+# user-space crate 의 dead-dep cleanup 은 별도 cleanup plan 으로 deferred
+# 처리 (.planning/phases/07-integration-gap-audit/deferred-items.md 참고)
+# 본 ignore 는 임시 정본 cleanup 시 본 metadata block 전체 삭제 필요
+[package.metadata.cargo-machete]
+ignored = [
+    "zeroize",        # Phase 7 Plan 04 deferred dedicated cleanup plan 에서 처리
+    "constant-time",  # Phase 7 Plan 04 deferred dedicated cleanup plan 에서 처리
+    "sha2",           # Phase 7 Plan 04 deferred dedicated cleanup plan 에서 처리
+    "sha3",           # Phase 7 Plan 04 deferred dedicated cleanup plan 에서 처리
+    "postcard",       # Phase 7 Plan 04 deferred dedicated cleanup plan 에서 처리
+    "serde",          # Phase 7 Plan 04 deferred dedicated cleanup plan 에서 처리
+]
+
 [profile.dev]
 panic = "abort"
 

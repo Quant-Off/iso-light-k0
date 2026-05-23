@@ -1,0 +1,11 @@
+# Phase 7 SC #5 cargo-machete dead-dep + dead-pub-item 게이트 화이트리스트
+#
+# CONTEXT.md §Claude's Discretion §.machete.toml 초기 상태 해소
+# 본 plan 의 default 위양성 데이터 없이 noise 추가 위험 회피
+# 발견 시 entry 추가 + per-line justification 주석 강제
+#
+# CONTEXT.md §scope-reduction 의 정본 제한 proc-macro 위양성만 허용
+# build.rs 의존 또는 derive macro 발견 시 본 화이트리스트에 추가
+# 그 외 모든 dead dep 또는 dead pub item 발견 시 화이트리스트 추가 금지 빌드 수정 필요
+
+ignored = []

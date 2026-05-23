@@ -1,0 +1,22 @@
+# Phase 7 AUDIT-03 air-gap dual-gate re-proof evidence
+PHASE: 07
+GENERATED_AT: 2026-05-23T12:35:29Z
+COMMIT: ee29a00e8b8605229f98ef76f12b14b42119d4c8
+BUILD_CMD: cargo build --release --target x86_64-unknown-none
+BUILD_EXIT: 0
+DUMP_TOOL: objdump -C --syms
+KERNEL_BIN: target/x86_64-unknown-none/release/iso-light-k0
+KERNEL_BIN_SIZE: 208864
+KERNEL_BIN_SHA256: 85c6931cfad20a203073551bec635fff1446270d8aa6d04e934b83647af2738c
+PATTERNS_SEARCHED: 7
+PATTERNS_MATCHED: 0
+--- per-pattern detail ---
+[1] NETWORK_ATTACH_CAP: 0 hits
+[2] NETWORK_CAP_STATE: 0 hits
+[3] init_network_cap: 0 hits
+[4] take_network_cap: 0 hits
+[5] air_gap..network: 0 hits
+[6] handle_attach.*Network: 0 hits
+[7] gen_token_u64.*air_gap: 0 hits
+--- end ---
+VERDICT: PASS

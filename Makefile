@@ -98,7 +98,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external check-machete ci-phase7
 
 all: iso
 
@@ -351,3 +351,17 @@ qemu-smoke-tls-external:
 	@$(GRUB_MKRES) -o $(ISO_DEBUG) $(ISO_DIR)
 	@REQUIRE_GAP_PHASE6_OK=1 bash scripts/qemu-test.sh
 	@echo "[CI] qemu-smoke-tls-external gate 통과 (tls-external 양 프로필 회귀)"
+
+#
+# Phase 7 SC #5 cargo-machete dead-dep + dead-pub-item 표준 게이트
+#
+# v2.0 마일스톤의 모든 후속 phase (8~12) 가 동일 leg 재사용 prior art
+# .machete.toml ignore 화이트리스트는 proc-macro 위양성만 허용 정본 제한
+#
+check-machete:
+	@echo "[machete] cargo-machete dead-dep + dead-pub-item gate"
+	@command -v cargo-machete >/dev/null 2>&1 || { echo "[machete] FAIL cargo-machete 미설치 cargo install --locked cargo-machete 실행 필요"; exit 1; }
+	@cargo machete
+
+ci-phase7: check-alloc-zero check-machete
+	@echo "[ci-phase7] PASS Phase 7 audit gates green alloc-zero plus cargo-machete"
