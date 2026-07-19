@@ -1,5 +1,5 @@
 #!/bin/bash
-# QEMU 부팅 + 암호 스모크 테스트 스크립트 (Ubuntu 24.04 Docker 전용)
+# QEMU 부팅 + 암호 스모크 테스트 스크립트 (Linux KVM / Linux TCG / macOS TCG 공용)
 #
 # 수행 내용:
 #   1. make iso  커널 ELF 빌드 + grub-mkrescue ISO 생성
@@ -47,49 +47,60 @@ echo ""
 
 # 2. KVM 가속 여부 확인
 KVM_FLAGS=()
-CPU_FLAGS=(-cpu qemu64)
-# Apple Silicon (Rosetta-translated qemu-system-x86_64) TCG 환경에서 RDRAND 와
-# RDSEED 두 명령 모두 에뮬레이션 결함이 있어 wild jump #PF 를 결정적으로 유발함
-# (RIP=0x40B866ECEB4E, RSP=0x000FC958, deterministic 재현).
-# 진단 매트릭스
-#   -cpu max                          wild jump
-#   -cpu qemu64,+rdrand,+rdseed       wild jump
-#   -cpu qemu64,+rdrand               wild jump
-#   -cpu qemu64,+rdseed               wild jump  (단독으로도 트리거)
-#   -cpu qemu64                       부팅 통과
-# 결론 RDRAND/RDSEED 둘 다 끄는 것이 유일한 안전 baseline 임.
-# 단점 capability.rs::fill_hw_entropy 가 hardware entropy 부재로 CapError::NoEntropy
-# 를 반환하여 HSM attach 및 TLS handshake 마커가 fail 함 (Mac 개발 환경 한계).
-# 전체 마커 PASS 검증은 Linux + KVM (CI) 또는 실기에서 수행.
-# KVM 가속 가능 환경 (Linux + /dev/kvm) 에서는 아래 분기에서 -cpu host 로 덮어씀.
 if [ -w /dev/kvm ]; then
     echo "[INFO] /dev/kvm 접근 가능 -> KVM 가속 활성화"
     KVM_FLAGS=(-enable-kvm)
-    CPU_FLAGS=(-cpu host)
 else
-    echo "[INFO] /dev/kvm 없음 -> TCG 소프트웨어 에뮬레이션 (${CPU_FLAGS[*]})"
+    echo "[INFO] /dev/kvm 없음 -> TCG 소프트웨어 에뮬레이션"
 fi
 
+# TCG RDRAND/RDSEED 에뮬레이션 결함과 QEMU 버전 (aarch64 호스트 실측 이력)
+# QEMU <= 8.2: RDRAND/RDSEED 활성 시 wild jump #PF 결정적 유발
+#   (RIP=0x40B866ECEB4E, RSP=0x000FC958. -cpu max / +rdrand / +rdseed 전부 재현)
+# QEMU >= 11.0: 위 조기 결함 수정 실측 (2026-07-19, macOS Homebrew 11.0)
+#   -cpu qemu64,+rdrand,+rdseed 로 DRBG/TrustRoot/HsmRegistry/BLAKE3/TLS(Classical+
+#   PQ-Hybrid) 까지 런타임 통과. 단 TLS 소거 직후 원인 미확정 무증상 폭주(post-TLS
+#   stall) 가 있어 HSM smoke 이후 마커는 tcg-entropy 모드에서 검증 제외
+# 9.x / 10.x 는 미검증이므로 보수적으로 tcg-no-entropy 를 유지
+QEMU_MAJOR=$(qemu-system-x86_64 --version 2>/dev/null \
+    | sed -n '1s/.*version \([0-9][0-9]*\).*/\1/p' || true)
+
 # ENTROPY_MODE 자동 결정
-#   full            KVM 가속 또는 -cpu host  RDRAND/RDSEED 정상 가용 (모든 마커 PASS 요구)
-#   tcg-no-entropy  -cpu qemu64 (Mac Rosetta TCG baseline) RDRAND/RDSEED 부재
-#                   capability::fill_hw_entropy → CapError::NoEntropy 결정적 반환
-#                   DRBG 미초기화로 capability 발급 불가 → HSM/TLS/Phase 2..6 마커 도미노 fail
-#                   본 모드에서는 entropy 의존 마커를 expected MISS 로 분리 표기하고
-#                   PASS 판정에서 제외함 (보안 마커 검증은 Linux+KVM 또는 실기에서)
-# 환경변수 K0_TEST_MODE 가 있으면 자동 결정을 override (full | tcg-no-entropy)
+#   full            KVM 가속 (-cpu host). RDRAND/RDSEED 정상 가용, 모든 마커 PASS 요구
+#   tcg-entropy     TCG + QEMU >= 11 (-cpu qemu64,+rdrand,+rdseed)
+#                   entropy 의존 마커를 TLS 소거까지 PASS 요구
+#                   HSM smoke 이후는 post-TLS stall 로 검증 제외 표기
+#   tcg-no-entropy  TCG + QEMU < 11 (-cpu qemu64). RDRAND/RDSEED 부재
+#                   H5/M12 fail-closed 로 init_prng 에서 의도적 부팅 중단이 정상 동작
+#                   부팅 진입 + fail-closed FATAL + reset<=2 를 PASS 조건으로 판정
+# 환경변수 K0_TEST_MODE 로 override 가능 (full | tcg-entropy | tcg-no-entropy)
 if [ -n "${K0_TEST_MODE:-}" ]; then
     ENTROPY_MODE="${K0_TEST_MODE}"
     echo "[INFO] ENTROPY_MODE=${ENTROPY_MODE} (K0_TEST_MODE override)"
 elif [ "${#KVM_FLAGS[@]}" -gt 0 ]; then
     ENTROPY_MODE="full"
     echo "[INFO] ENTROPY_MODE=${ENTROPY_MODE} (KVM detected)"
-elif [ "${CPU_FLAGS[*]}" = "-cpu qemu64" ]; then
-    ENTROPY_MODE="tcg-no-entropy"
-    echo "[INFO] ENTROPY_MODE=${ENTROPY_MODE} (TCG baseline, RDRAND/RDSEED 부재)"
+elif [ "${QEMU_MAJOR:-0}" -ge 11 ]; then
+    ENTROPY_MODE="tcg-entropy"
+    echo "[INFO] ENTROPY_MODE=${ENTROPY_MODE} (TCG + QEMU ${QEMU_MAJOR} >= 11, RDRAND/RDSEED 활성)"
 else
-    ENTROPY_MODE="full"
-    echo "[INFO] ENTROPY_MODE=${ENTROPY_MODE} (default)"
+    ENTROPY_MODE="tcg-no-entropy"
+    echo "[INFO] ENTROPY_MODE=${ENTROPY_MODE} (TCG + QEMU ${QEMU_MAJOR:-?} < 11, RDRAND/RDSEED 부재)"
+fi
+
+# CPU 플래그는 최종 ENTROPY_MODE 를 따름
+if [ "${#KVM_FLAGS[@]}" -gt 0 ]; then
+    CPU_FLAGS=(-cpu host)
+elif [ "${ENTROPY_MODE}" = "tcg-no-entropy" ]; then
+    CPU_FLAGS=(-cpu qemu64)
+else
+    CPU_FLAGS=(-cpu qemu64,+rdrand,+rdseed)
+fi
+echo "[INFO] CPU_FLAGS=${CPU_FLAGS[*]}"
+
+# tcg-no-entropy 는 init_prng fail-closed 가 초기화 직후 발동하므로 대기 단축
+if [ "${ENTROPY_MODE}" = "tcg-no-entropy" ]; then
+    BOOT_WAIT_SEC=45
 fi
 
 # 이전 실행 잔여물 정리
@@ -100,7 +111,7 @@ echo "[2/5] QEMU 부팅 (TIMEOUT=${TIMEOUT_SEC}s)..."
 
 set +e
 timeout "${TIMEOUT_SEC}" qemu-system-x86_64 \
-    "${KVM_FLAGS[@]}" \
+    ${KVM_FLAGS[@]+"${KVM_FLAGS[@]}"} \
     "${CPU_FLAGS[@]}" \
     -m 512M \
     -cdrom "${ISO}" \
@@ -292,6 +303,7 @@ fi
 
 # (c) 핵심 부팅 마일스톤 확인
 HAS_BOOTED=false
+HAS_FAILCLOSED=false
 HAS_DRBG=false
 HAS_SMOKE_OK=false
 HAS_TLS_HYBRID=false
@@ -312,6 +324,7 @@ HAS_ATTEST_PHASE5_1_OK=false  # Phase 5.1 marker  ci-phase5_1 게이트
 HAS_GAP_PHASE6_OK=false  # Phase 6 marker  ci-phase6 게이트
 if [ -s "${VGA_TXT}" ]; then
     grep -q "Booted\. Initializing"           "${VGA_TXT}" && HAS_BOOTED=true
+    grep -q "FATAL: no hardware entropy"      "${VGA_TXT}" && HAS_FAILCLOSED=true
     grep -q "Capability DRBG Init Done"       "${VGA_TXT}" && HAS_DRBG=true
     grep -q "BLAKE3 round-trip OK"            "${VGA_TXT}" && HAS_SMOKE_OK=true
     grep -q "PQ-Hybrid (X25519+MLKEM768) OK"  "${VGA_TXT}" && HAS_TLS_HYBRID=true
@@ -338,19 +351,25 @@ if [ -s "${VGA_TXT}" ]; then
 fi
 
 # 마커 출력 + fail 누적 헬퍼
-# 인자 1 라벨, 2 has_flag (true/false), 3 entropy_dependent (true/false), 4 fail_reason
-# - entropy_dependent=true 인 마커는 tcg-no-entropy 모드에서 MISS 라도 fail 누적 안 함
-# - 모든 모드 공통 라벨 정렬을 유지하기 위해 echo 포맷을 호출자에서 지정
+# 인자 1 라벨, 2 has_flag (true/false), 3 클래스, 4 fail_reason
+# 클래스
+#   struct   entropy 비의존 구조 마커. full 과 tcg-entropy 에서 PASS 요구
+#            tcg-no-entropy 에서는 fail-closed 가 도달 전에 부팅을 중단하므로 expected MISS
+#   entropy  entropy 의존 + TLS 소거 이전 구간. full 과 tcg-entropy 에서 PASS 요구
+#   stall    entropy 의존 + TLS 소거 이후 구간. full 에서만 PASS 요구
+#            tcg-entropy 에서는 post-TLS stall(원인 미확정) 로 검증 제외
 check_marker() {
     local label="$1"
     local has_flag="$2"
-    local entropy_dependent="$3"
+    local klass="$3"
     local fail_reason="$4"
     local status
     if [ "$has_flag" = "true" ]; then
         status="PASS"
-    elif [ "$entropy_dependent" = "true" ] && [ "$ENTROPY_MODE" = "tcg-no-entropy" ]; then
-        status="MISS (expected, TCG-no-entropy)"
+    elif [ "$ENTROPY_MODE" = "tcg-no-entropy" ]; then
+        status="MISS (expected, fail-closed 선행 중단)"
+    elif [ "$ENTROPY_MODE" = "tcg-entropy" ] && [ "$klass" = "stall" ]; then
+        status="MISS (post-TLS stall, 검증 제외)"
     else
         status="MISS"
         PASS=false
@@ -362,7 +381,7 @@ check_marker() {
 # 환경변수 게이트 (REQUIRE_*=1) 가 있는 Phase 5/5.1/6 전용 헬퍼
 # - 게이트 미설정 시 MISS 라도 fail 누적 없음 (현 동작 보존)
 # - 게이트 설정 + full 모드 + MISS = fail
-# - 게이트 설정 + tcg-no-entropy 모드 + MISS = expected MISS (entropy 의존이므로)
+# - 게이트 설정 + TCG 모드 + MISS = expected MISS (entropy 의존 + stall 구간이므로)
 check_gated_marker() {
     local label="$1"
     local has_flag="$2"
@@ -371,8 +390,8 @@ check_gated_marker() {
     local status
     if [ "$has_flag" = "true" ]; then
         status="PASS"
-    elif [ "$ENTROPY_MODE" = "tcg-no-entropy" ]; then
-        status="MISS (expected, TCG-no-entropy)"
+    elif [ "$ENTROPY_MODE" != "full" ]; then
+        status="MISS (expected, ${ENTROPY_MODE})"
     elif [ "$require_flag" = "1" ]; then
         status="MISS"
         PASS=false
@@ -383,37 +402,61 @@ check_gated_marker() {
     printf "  %-34s %s\n" "${label}" "${status}"
 }
 
-# 부팅 진입 마커는 현재 grep 패턴 별건으로 fail 누적 안 함 (기존 동작 보존)
-printf "  %-34s %s\n" "[부팅 진입]" "$($HAS_BOOTED && echo PASS || echo MISS)"
-# 메인 루프 진입 마커는 entropy 비의존이고 fail 누적 안 함 (기존 동작 보존)
-printf "  %-34s %s\n" "[메인 루프 진입(All Task Done)]" "$($HAS_ALL_DONE && echo PASS || echo MISS)"
+# 부팅 진입 마커. tcg-entropy 에서는 진행이 길어 VGA 25행 밖으로 스크롤되므로 별도 표기
+if [ "${ENTROPY_MODE}" = "tcg-entropy" ] && ! $HAS_BOOTED; then
+    printf "  %-34s %s\n" "[부팅 진입]" "MISS (VGA 스크롤, DRBG 마커로 대체 확인)"
+else
+    printf "  %-34s %s\n" "[부팅 진입]" "$($HAS_BOOTED && echo PASS || echo MISS)"
+fi
+# 메인 루프 진입 마커는 fail 누적 안 함 (기존 동작 보존)
+if [ "${ENTROPY_MODE}" = "tcg-entropy" ] && ! $HAS_ALL_DONE; then
+    printf "  %-34s %s\n" "[메인 루프 진입(All Task Done)]" "MISS (post-TLS stall, 검증 제외)"
+else
+    printf "  %-34s %s\n" "[메인 루프 진입(All Task Done)]" "$($HAS_ALL_DONE && echo PASS || echo MISS)"
+fi
 
-# 구조적 마커 (entropy 비의존, 두 모드 모두 PASS 요구)
-check_marker "[HsmRegistry static online]"     "$HAS_HSM_STATIC_ONLINE"        "false" \
+# tcg-no-entropy 모드는 H5/M12 fail-closed 발동 자체가 검증 대상
+# 부팅 진입 + fail-closed FATAL 출력 + reset<=2 (위 (a)) 조합이 PASS 조건
+if [ "${ENTROPY_MODE}" = "tcg-no-entropy" ]; then
+    printf "  %-34s %s\n" "[H5/M12 fail-closed FATAL]" "$($HAS_FAILCLOSED && echo PASS || echo MISS)"
+    if ! $HAS_FAILCLOSED; then
+        PASS=false
+        FAIL_REASONS+=("fail-closed FATAL(no hardware entropy) 미출력 — 부팅이 예상 경로로 진행되지 않음")
+    fi
+    if ! $HAS_BOOTED; then
+        PASS=false
+        FAIL_REASONS+=("부팅 진입 마커(Booted. Initializing) 미확인")
+    fi
+fi
+
+# 구조 마커 (tcg-entropy 와 full 에서 PASS 요구)
+check_marker "[HsmRegistry static online]"     "$HAS_HSM_STATIC_ONLINE"        "struct" \
     "HsmRegistry static online 마커 없음 (main.rs 모듈 선언 또는 부팅 순서 누락)"
 
-# entropy 의존 마커 (full 모드에서만 PASS 요구, tcg-no-entropy 에서는 expected MISS)
-check_marker "[Hash-DRBG 초기화]"               "$HAS_DRBG"                     "true"  \
+# entropy 의존 마커, TLS 소거 이전 구간 (tcg-entropy 와 full 에서 PASS 요구)
+check_marker "[Hash-DRBG 초기화]"               "$HAS_DRBG"                     "entropy"  \
     "Hash-DRBG 초기화 마커 없음 (RDSEED/RDRAND 부재)"
-check_marker "[BLAKE3 라운드트립 스모크]"        "$HAS_SMOKE_OK"                 "true"  \
+check_marker "[BLAKE3 라운드트립 스모크]"        "$HAS_SMOKE_OK"                 "entropy"  \
     "BLAKE3 라운드트립 스모크 결과 미확인"
-check_marker "[TLS PQ-Hybrid 핸드셰이크]"        "$HAS_TLS_HYBRID"               "true"  \
+check_marker "[TLS PQ-Hybrid 핸드셰이크]"        "$HAS_TLS_HYBRID"               "entropy"  \
     "TLS PQ-Hybrid 핸드셰이크 미확인"
-check_marker "[TLS Classical 핸드셰이크]"        "$HAS_TLS_CLASSICAL"            "true"  \
+check_marker "[TLS Classical 핸드셰이크]"        "$HAS_TLS_CLASSICAL"            "entropy"  \
     "TLS Classical 핸드셰이크 미확인"
-check_marker "[TLS keystore + pool 소거]"        "$HAS_TLS_WIPED"                "true"  \
+check_marker "[TLS keystore + pool 소거]"        "$HAS_TLS_WIPED"                "entropy"  \
     "TLS 종료 후 키 자료 소거 미확인"
-check_marker "[HsmRegistry smoke OK]"            "$HAS_HSM_SMOKE"                "true"  \
+
+# entropy 의존 마커, TLS 소거 이후 구간 (full 에서만 PASS 요구, post-TLS stall 참조)
+check_marker "[HsmRegistry smoke OK]"            "$HAS_HSM_SMOKE"                "stall"  \
     "HsmRegistry 스모크 테스트 성공 마커 없음 (attach->detach->zeroize 라운드트립 실패)"
-check_marker "[HSM attach->detach roundtrip]"    "$HAS_HSM_ROUNDTRIP"            "true"  \
+check_marker "[HSM attach->detach roundtrip]"    "$HAS_HSM_ROUNDTRIP"            "stall"  \
     "HSM_ATTACH_DETACH_ROUNDTRIP_OK 마커 없음"
-check_marker "[HSM detach no-cap denied]"        "$HAS_HSM_DETACH_NOCAP_DENIED"  "true"  \
+check_marker "[HSM detach no-cap denied]"        "$HAS_HSM_DETACH_NOCAP_DENIED"  "stall"  \
     "HSM_DETACH_NO_CAP_DENIED 마커 없음 — post-attach CAP-02 enforcement 실패"
-check_marker "[BUS_PHASE2_OK marker]"            "$HAS_BUS_PHASE2_OK"            "true"  \
+check_marker "[BUS_PHASE2_OK marker]"            "$HAS_BUS_PHASE2_OK"            "stall"  \
     "BUS_PHASE2_OK 마커 없음 — Phase 2 SoftwareBus 루프백 + detach cascade 실패"
-check_marker "[CHAN_PHASE3_OK marker]"           "$HAS_CHAN_PHASE3_OK"           "true"  \
+check_marker "[CHAN_PHASE3_OK marker]"           "$HAS_CHAN_PHASE3_OK"           "stall"  \
     "CHAN_PHASE3_OK 마커 없음 — Phase 3 Blake3 src -> AesGcm dst relay 라운드트립 실패"
-check_marker "[WIRE_PHASE4_OK marker]"           "$HAS_WIRE_PHASE4_OK"           "true"  \
+check_marker "[WIRE_PHASE4_OK marker]"           "$HAS_WIRE_PHASE4_OK"           "stall"  \
     "WIRE_PHASE4_OK 마커 없음  Phase 4 lumen Ring 3 wire Blake3Hash contract 실패"
 
 # REQUIRE_* 게이트가 있는 Phase 5/5.1/6 entropy 의존 마커
@@ -432,16 +475,23 @@ esac
 
 echo ""
 if $PASS; then
-    if [ "${ENTROPY_MODE}" = "tcg-no-entropy" ]; then
-        echo "✓ 테스트 통과 (ENTROPY_MODE=tcg-no-entropy) — 부팅 + 구조적 마커 정상"
-        echo "  보안 마커(entropy 의존) 검증은 Linux+KVM CI 또는 실기에서 수행 필요"
-    else
-        echo "✓ 테스트 통과 (ENTROPY_MODE=${ENTROPY_MODE}) — 전체 마커 검증 통과"
-    fi
+    case "${ENTROPY_MODE}" in
+        tcg-no-entropy)
+            echo "✓ 테스트 통과 (ENTROPY_MODE=tcg-no-entropy) — 부팅 진입 + H5/M12 fail-closed 정상"
+            echo "  entropy 의존 마커 검증은 QEMU>=11 TCG(tcg-entropy) 또는 Linux+KVM/실기에서 수행"
+            ;;
+        tcg-entropy)
+            echo "✓ 테스트 통과 (ENTROPY_MODE=tcg-entropy) — TLS 소거까지 entropy 마커 정상"
+            echo "  HSM smoke 이후 마커는 post-TLS stall(원인 미확정) 로 검증 제외. 전체 검증은 Linux+KVM/실기"
+            ;;
+        *)
+            echo "✓ 테스트 통과 (ENTROPY_MODE=${ENTROPY_MODE}) — 전체 마커 검증 통과"
+            ;;
+    esac
     exit 0
 else
     echo "✗ 테스트 실패 (ENTROPY_MODE=${ENTROPY_MODE})"
-    for r in "${FAIL_REASONS[@]}"; do
+    for r in ${FAIL_REASONS[@]+"${FAIL_REASONS[@]}"}; do
         echo "  - ${r}"
     done
     exit 1

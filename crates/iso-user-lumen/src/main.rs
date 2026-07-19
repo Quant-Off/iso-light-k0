@@ -243,8 +243,16 @@ fn check_x25519() {
     let alice_pk = alice_sk.public_key();
     let bob_pk = bob_sk.public_key();
 
-    let s_ab = alice_sk.diffie_hellman(&bob_pk);
-    let s_ba = bob_sk.diffie_hellman(&alice_pk);
+    let (s_ab, s_ba) = match (
+        alice_sk.diffie_hellman(&bob_pk),
+        bob_sk.diffie_hellman(&alice_pk),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            write_stderr(b"[iso-user-lumen] x25519 ECDH LOW-ORDER REJECTED\n");
+            exit(1);
+        }
+    };
 
     if s_ab.as_bytes() == s_ba.as_bytes() {
         let mut shared = [0u8; 32];

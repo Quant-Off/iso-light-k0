@@ -45,6 +45,42 @@ fn main() {
     }
     println!("cargo:rerun-if-changed={}", trust_root_pk.display());
 
+    // C1 개발용 신뢰 루트 탐지 게이트
+    //
+    // scripts/gen-dev-keys.sh 는 MLDSA44::keygen(&[0xAA; 32]) 결정론적 시드로
+    // trust_root.pk44 를 생성하므로 개인키를 누구나 복원할 수 있음. 이 개발 키가
+    // 출하 바이너리에 임베드되면 어테스테이션 신뢰 앵커가 위조 가능해짐(C1)
+    //
+    // 정책
+    //   - 개발 키 지문(FNV-1a-64)이 일치하면 매 빌드 cargo:warning 로 경고
+    //   - K0_REQUIRE_PROD_TRUST_ROOT=1|true|yes 설정 시 개발 키면 빌드 fatal
+    //     (CI, release 파이프라인이 출하 산출물에 개발 키 유입을 차단하는 게이트)
+    //   - K0_ALLOW_DEV_TRUST_ROOT=1|true|yes 는 require 하에서도 개발 키를 명시
+    //     허용(로컬 release 검증용 escape hatch)
+    //
+    // 참고 현재 committed 개발 키 SHA-256
+    //   ad4aff7ef5aa8895fb4f59c2c211afe55419d0d8709bfa0ee4d8f496e92600a7
+    const DEV_TRUST_ROOT_FNV1A64: u64 = 0x0c4e_fb6d_d994_ad6d;
+    println!("cargo:rerun-if-env-changed=K0_REQUIRE_PROD_TRUST_ROOT");
+    println!("cargo:rerun-if-env-changed=K0_ALLOW_DEV_TRUST_ROOT");
+    let pk_bytes = fs::read(&trust_root_pk)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", trust_root_pk.display()));
+    if fnv1a64(&pk_bytes) == DEV_TRUST_ROOT_FNV1A64 {
+        let require_prod = env_truthy("K0_REQUIRE_PROD_TRUST_ROOT");
+        let allow_dev = env_truthy("K0_ALLOW_DEV_TRUST_ROOT");
+        if require_prod && !allow_dev {
+            panic!(
+                "keys/trust_root.pk44 is the deterministic DEV trust root (seed 0xAA*32, \
+                 private key publicly reproducible). Provision a production trust root, or set \
+                 K0_ALLOW_DEV_TRUST_ROOT=1 to override. (C1)"
+            );
+        }
+        println!(
+            "cargo:warning=keys/trust_root.pk44 is the DEV trust root (C1): attestation anchor is \
+             forgeable. Do NOT ship. Set K0_REQUIRE_PROD_TRUST_ROOT=1 to hard-fail release builds."
+        );
+    }
+
     // Phase 5.1 D-01 K0_TRUST_ROOT_KEYSTORE env → cargo:rustc-cfg=k0_trust_root_keystore
     //
     // 설정 값이 "1" | "true" | "yes" (trim 후) 중 하나면 cfg 활성 그 외는 비활성 (const 폴백)
@@ -57,6 +93,27 @@ fn main() {
     if matches!(keystore_env.as_str(), "1" | "true" | "yes") {
         println!("cargo:rustc-cfg=k0_trust_root_keystore");
     }
+}
+
+/// FNV-1a 64-bit 해시. 특정 알려진 아티팩트(개발 신뢰 루트) 식별 전용.
+///
+/// 암호학적 용도가 아니라 committed 파일 지문 매칭 목적이므로 외부 의존성 없이
+/// 자립적으로 구현함(에어갭 빌드 공급망 표면 0 유지).
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// 환경변수가 "1" | "true" | "yes" (trim 후) 중 하나면 true.
+fn env_truthy(key: &str) -> bool {
+    env::var(key)
+        .ok()
+        .map(|s| matches!(s.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 /// 사용자 크레이트의 release ELF 를 OUT_DIR 로 복사하고 환경변수로 노출.

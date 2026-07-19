@@ -335,7 +335,7 @@ extern "C" fn dispatch(ctx: &mut SyscallContext) {
     let result: u64 = match num {
         x if x == SyscallNum::Exit as u64 => sys_exit(ctx.rdi),
         x if x == SyscallNum::Write as u64 => sys_write(ctx.rdi, ctx.rsi, ctx.rdx),
-        x if x == SyscallNum::GetRandom as u64 => sys_getrandom(ctx.rsi, ctx.rdx),
+        x if x == SyscallNum::GetRandom as u64 => sys_getrandom(ctx.rdi, ctx.rsi),
         x if x == SyscallNum::HsmAttach as u64 => crate::hsm_registry::handle_attach(ctx),
         x if x == SyscallNum::HsmDetach as u64 => crate::hsm_registry::handle_detach(ctx),
         x if x == SyscallNum::HsmEnumerate as u64 => crate::hsm_registry::handle_enumerate(ctx),
@@ -478,9 +478,13 @@ fn sys_getrandom(buf_ptr: u64, len: u64) -> u64 {
 
 /// `va` 가 사용자 가상 주소(canonical lower half, PML4[0..255]) 범위인지.
 ///
-/// 사용자 매핑은 0x0..0x0000_8000_0000_0000 범위에 위치. 그 외(커널 직접
-/// 선형 매핑·커널 세그먼트 등)는 차단.
+/// 사용자 매핑은 첫 페이지(NULL 페이지)를 제외한
+/// 0x1000..0x0000_8000_0000_0000 범위에 위치. NULL 페이지와 그 외(커널 직접
+/// 선형 매핑, 커널 세그먼트 등)는 차단. NULL 하한은 미매핑 0 페이지로의
+/// copy 가 fatal #PF 를 유발하는 경로(SYS-05)를 조기 차단함
 #[inline]
 pub fn is_user_address(va: u64) -> bool {
-    va < 0x0000_8000_0000_0000
+    const USER_MIN: u64 = 0x1000;
+    const USER_MAX: u64 = 0x0000_8000_0000_0000;
+    (USER_MIN..USER_MAX).contains(&va)
 }

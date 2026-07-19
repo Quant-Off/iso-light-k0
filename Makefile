@@ -46,9 +46,19 @@ ifeq ($(shell uname),Darwin)
         for p in \
             /opt/homebrew/bin/grub-mkrescue \
             /usr/local/bin/grub-mkrescue \
-            /opt/homebrew/opt/grub/bin/grub-mkrescue; do \
+            /opt/homebrew/opt/grub/bin/grub-mkrescue \
+            $$HOME/.local/bin/grub-mkrescue; do \
             [ -x "$$p" ] && echo "$$p" && break; \
         done)
+    # Homebrew x86_64-elf-grub(x86_64-efi 전용) + 추출한 i386-pc 모듈 조합 폴백
+    # i386-pc 모듈 준비 절차는 docs/vm-kernel-test.md macOS 섹션 참조
+    ifeq ($(GRUB_MKRES),)
+        GRUB_MKRES := $(shell \
+            if [ -x /opt/homebrew/bin/x86_64-elf-grub-mkrescue ] \
+               && [ -d "$$HOME/.local/share/grub/i386-pc" ]; then \
+                echo "/opt/homebrew/bin/x86_64-elf-grub-mkrescue -d $$HOME/.local/share/grub/i386-pc"; \
+            fi)
+    endif
     ifeq ($(GRUB_MKRES),)
         GRUB_MKRES := grub-mkrescue
     endif

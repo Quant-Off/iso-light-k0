@@ -454,10 +454,15 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
                 b"[iso-light-k0] Capability DRBG Init Done. (Hash-DRBG-SHA256)",
                 vga::Color::Green,
             ),
-            Err(_) => vga::println(
-                b"[iso-light-k0] FATAL: no hardware entropy (RDSEED/RDRAND).",
-                vga::Color::Red,
-            ),
+            Err(_) => {
+                vga::println(
+                    b"[iso-light-k0] FATAL: no hardware entropy (RDSEED/RDRAND).",
+                    vga::Color::Red,
+                );
+                // H5/M12 HW 엔트로피 부재는 무조건 부팅 중단(fail-closed)
+                // 이후 BOOT_CHALLENGE 와 capability 토큰이 전부 0 이 되는 상태로 진행 금지
+                panic!("no hardware entropy source (RDSEED/RDRAND)");
+            }
         }
     }
 

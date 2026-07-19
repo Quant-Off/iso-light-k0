@@ -196,18 +196,23 @@ pub unsafe fn parse_multiboot2(info_addr: u64) -> Result<MemoryMap, ParseError> 
         }
 
         // 태그 타입 6 = 메모리 맵
-        if tag.typ == 6 && tag.size >= 16 {
-            // SAFETY: 태그 크기가 유효하고 type=6 구조체 크기를 충족함
+        // M7 손상/악성 부트로더 핸드오프가 무경계 tag.size 로 물리 OOB read 를
+        //    유발하지 못하도록 태그 전체가 info 구조 경계 내에 있어야 함
+        let info_end = info_addr + total_size as u64;
+        let tag_fits = tag_phys.saturating_add(tag.size as u64) <= info_end;
+        if tag.typ == 6 && tag.size >= 16 && tag_fits {
+            // SAFETY: tag_fits 로 tag_phys+16 <= info_end 확인됨(Mb2MmapTag 16옥텟 read 안전)
             let mmap_tag = unsafe { &*(tag_phys as *const Mb2MmapTag) };
             let entry_size = mmap_tag.entry_size as u64;
 
             // entry_size는 최소 Mb2MmapEntry 크기(24 bytes)여야 함
             if entry_size >= 24 {
                 let entries_start = tag_phys + 16; // Mb2MmapTag 헤더 이후
-                let entries_end = tag_phys + tag.size as u64;
+                // entries_end 는 tag.size 로 산정하되 info 구조 끝으로 clamp
+                let entries_end = (tag_phys + tag.size as u64).min(info_end);
 
                 let mut entry_ptr = entries_start;
-                while entry_ptr + entry_size <= entries_end {
+                while entry_ptr.saturating_add(entry_size) <= entries_end {
                     // SAFETY: entry_ptr은 태그 범위 내부의 유효한 위치
                     let entry = unsafe { &*(entry_ptr as *const Mb2MmapEntry) };
 

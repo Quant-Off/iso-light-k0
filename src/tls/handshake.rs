@@ -22,7 +22,7 @@
 
 use mlkem::{MLKEM768KeyPair, mlkem768_decaps, mlkem768_encaps, mlkem768_keygen};
 use x25519::SecretKey as X25519Sk;
-use zeroize::Secret;
+use zeroize::{Secret, Zeroize};
 
 use crate::capability;
 use crate::hsm::{HsmDriver, PskId};
@@ -167,8 +167,9 @@ unsafe fn do_handshake<H: HsmDriver>(
     }
     let client_x_sk = X25519Sk::from_bytes(c_seed);
     let server_x_sk = X25519Sk::from_bytes(s_seed);
-    c_seed.fill(0);
-    s_seed.fill(0);
+    // TLS-03 임시 시드는 DSE 로 소거가 제거되지 않도록 zeroize 로 볼라타일 소거
+    c_seed.zeroize();
+    s_seed.zeroize();
     let client_x_pk = client_x_sk.public_key();
     let server_x_pk = server_x_sk.public_key();
 
@@ -182,8 +183,9 @@ unsafe fn do_handshake<H: HsmDriver>(
                 capability::rand_bytes(&mut z).map_err(|_| TlsError::HsmFailure)?;
             }
             let kp = mlkem768_keygen(&d, &z);
-            d.fill(0);
-            z.fill(0);
+            // TLS-03 ML-KEM keygen 시드 볼라타일 소거
+            d.zeroize();
+            z.zeroize();
             Some(kp)
         }
         KexPolicy::Classical => None,
@@ -311,9 +313,14 @@ unsafe fn do_handshake<H: HsmDriver>(
     //
     // 8. KEX 공유비밀 도출
     //
-    let client_x_ss = client_x_sk.diffie_hellman(&server_x_pk);
-    let server_x_ss = server_x_sk.diffie_hellman(&client_x_pk);
-    if client_x_ss.as_bytes() != server_x_ss.as_bytes() {
+    let client_x_ss = client_x_sk
+        .diffie_hellman(&server_x_pk)
+        .map_err(|_| TlsError::Internal)?;
+    let server_x_ss = server_x_sk
+        .diffie_hellman(&client_x_pk)
+        .map_err(|_| TlsError::Internal)?;
+    // TLS-02 비밀 공유비밀 동등성 비교는 상수시간으로 수행(타이밍 사이드채널 차단)
+    if !ct_eq_bytes(client_x_ss.as_bytes(), server_x_ss.as_bytes()) {
         return Err(TlsError::Internal);
     }
 
@@ -325,11 +332,14 @@ unsafe fn do_handshake<H: HsmDriver>(
             unsafe {
                 capability::rand_bytes(&mut m).map_err(|_| TlsError::HsmFailure)?;
             }
-            let (kem_ct, kem_ss_server) = mlkem768_encaps(&kp.ek, &m);
-            m.fill(0);
+            let encaps = mlkem768_encaps(&kp.ek, &m);
+            // TLS-03 ML-KEM encaps 난수 m 볼라타일 소거
+            m.zeroize();
+            let (kem_ct, kem_ss_server) = encaps.map_err(|_| TlsError::Internal)?;
             sh[q..q + TLS_MLKEM768_CT_LEN].copy_from_slice(&kem_ct);
             let kem_ss_client = mlkem768_decaps(&kem_ct, kp.dk.expose());
-            if kem_ss_client.expose() != kem_ss_server.expose() {
+            // TLS-02 비밀 KEM 공유비밀 비교도 상수시간으로 수행
+            if !ct_eq_bytes(kem_ss_client.expose(), kem_ss_server.expose()) {
                 return Err(TlsError::Internal);
             }
 

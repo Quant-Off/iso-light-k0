@@ -185,8 +185,16 @@ pub unsafe fn init_trust_root() {
     // (3) BOOT_CHALLENGE 32 옥텟 채움 4 회 gen_token_u64 의 big-endian 연쇄 (Phase 5 D-09 보존)
     let mut challenge = [0u8; 32];
     for i in 0..4 {
+        // H5/M12 엔트로피 실패 시 fail-open(unwrap_or(0)) 금지
+        // 챌린지 생성 불가 = 어테스테이션 신선도 무효이므로 즉시 부팅 중단(fail-closed)
         // SAFETY 호출자가 capability::init_prng 완료를 보장
-        let token = unsafe { capability::gen_token_u64().unwrap_or(0) };
+        let token = match unsafe { capability::gen_token_u64() } {
+            Ok(t) => t,
+            Err(_) => {
+                challenge.zeroize();
+                panic!("BOOT_CHALLENGE entropy unavailable (DRBG failure)");
+            }
+        };
         challenge[i * 8..(i + 1) * 8].copy_from_slice(&token.to_be_bytes());
     }
     // SAFETY 단일 코어 부팅 초기 + BOOT_CHALLENGE 의 단일 진입 갱신

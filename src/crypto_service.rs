@@ -71,6 +71,7 @@ pub enum CryptoError {
     AuthenticationFailed = 5,
     InvalidRequest = 6,
     OutputTooLarge = 7,
+    WeakNonce = 8,
 }
 
 //
@@ -368,6 +369,15 @@ fn encrypt_aes256gcm(
     let mut nonce = [0u8; GCM_NONCE_SIZE];
     nonce.copy_from_slice(&req.nonce[..GCM_NONCE_SIZE]);
 
+    // M3 GCM 논스 재사용은 GHASH 키 복원과 보편적 위조로 직결됨
+    // 전 유일성 강제는 와이어 계약 변경(커널측 논스 생성) 필요 사항이나
+    // 최소한 명백한 오용인 전영(all-zero) 논스는 암호화 시점에 거부함
+    if nonce.iter().all(|&b| b == 0) {
+        nonce.zeroize();
+        key.expose_mut().zeroize();
+        return Err(CryptoError::WeakNonce);
+    }
+
     let cipher = AES256GCM::new(key.expose());
     cipher.encrypt(
         &nonce,
@@ -439,6 +449,14 @@ fn encrypt_chacha20poly(
         .copy_from_slice(&req.key[..CHACHA20_KEY_SIZE]);
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&req.nonce[..12]);
+
+    // M3 ChaCha20-Poly1305 논스 재사용은 키스트림 재사용과 인증 위조로 직결됨
+    // 전영(all-zero) 논스는 명백한 오용이므로 암호화 시점에 거부함
+    if nonce.iter().all(|&b| b == 0) {
+        nonce.zeroize();
+        key.expose_mut().zeroize();
+        return Err(CryptoError::WeakNonce);
+    }
 
     let aead = ChaCha20Poly1305::new(key.expose());
     aead.encrypt(
@@ -772,19 +790,20 @@ fn handle_dh(
             if req.data_len as usize != X448_PK_SIZE {
                 return Err(CryptoError::InvalidDataLength);
             }
-            let sk_arr: [u8; X448_SK_SIZE] = req.key[..X448_SK_SIZE]
+            let mut sk_arr: [u8; X448_SK_SIZE] = req.key[..X448_SK_SIZE]
                 .try_into()
                 .map_err(|_| CryptoError::InvalidKeyLength)?;
             let pk_arr: [u8; X448_PK_SIZE] = req.data[..X448_PK_SIZE]
                 .try_into()
                 .map_err(|_| CryptoError::InvalidDataLength)?;
             let sk = X448Sk::from_bytes(sk_arr);
+            // CRY-02 X448Sk 로 복사(Copy)된 개인키 로컬 원본 잔재를 즉시 소거
+            sk_arr.zeroize();
             let peer_pk = X448Pk::from_bytes(pk_arr);
-            let shared = sk.diffie_hellman(&peer_pk);
-            // 소그룹 공격 방지: 공유비밀이 0(기여 없음)이면 거부
-            if shared.is_zero() {
-                return Err(CryptoError::AuthenticationFailed);
-            }
+            // 소그룹 공격 방지: 저차수 점(공유비밀 0)은 라이브러리가 Err 로 거부
+            let shared = sk
+                .diffie_hellman(&peer_pk)
+                .map_err(|_| CryptoError::AuthenticationFailed)?;
             write_ok_reply(reply, req.algo, shared.as_bytes())
             // shared: SharedSecret(Secret<[u8;56]>) 은 Drop 시 자동 소거
         }
