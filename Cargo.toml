@@ -13,6 +13,8 @@ default = []
 tls-external = []
 # Phase 5 D-02: kernel-side smoke 전용 dev sk include 게이트 closed 프로필 부재
 smoke = []
+# Phase 8 ENTR-05 명문 entropy-degraded-ok TCG cell 한정 tls-external 와 compile-time mutex
+entropy-degraded-ok = []
 
 # Phase 5.1 D-01 trust root dual-path build.rs 가 K0_TRUST_ROOT_KEYSTORE env →
 # cargo:rustc-cfg=k0_trust_root_keystore 노출 (Rust 1.80+ unexpected_cfgs lint 명시)
@@ -57,3 +59,5 @@ rng = { path = "../elib-k0-nt/rng", version = "1.0.0" }
 # Phase 4 Plan 01 postcard 와이어 프레임 alloc-free 의존성 (D-15)
 postcard = { version = "1", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive"] }
+# Phase 8 ENTR-01 virtio-rng PCI/MMIO 어댑터 no_std no-alloc 강제
+virtio-drivers = { version = "0.13", default-features = false }

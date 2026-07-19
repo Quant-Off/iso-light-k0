@@ -9,6 +9,7 @@
 #![allow(clippy::deref_addrof)]
 
 pub mod allocator;
+pub mod arch; // Phase 8: arch 디렉토리 골격 (D-01 Forward) + entropy 서브트리
 pub mod boot;
 pub mod boot_stub; // Multiboot2 헤더 + 32-bit 부팅 스텁 (global_asm)
 pub mod capability; // Capability-based Access Control

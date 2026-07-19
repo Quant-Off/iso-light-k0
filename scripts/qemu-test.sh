@@ -350,6 +350,19 @@ if [ -s "${VGA_TXT}" ]; then
     grep -q "GAP_PHASE6_OK"                                               "${VGA_TXT}" && HAS_GAP_PHASE6_OK=true
 fi
 
+# Phase 8 entropy marker recognition 신규 4 종 (recognition only)
+# marker 부재가 Phase 1~7 회귀 게이트를 깨뜨리지 않음 (Wave 0 skeleton mode)
+HAS_TIMER_LINE=false
+HAS_ENTROPY_QUORUM_OK=false
+HAS_ENTROPY_DEGRADED_ACTIVE=false
+HAS_ENTROPY_SOURCES_AVAILABLE=false
+if [ -s "${VGA_TXT}" ]; then
+    grep -qE "^timer: (invariant_tsc|jitter_calibration)" "${VGA_TXT}" && HAS_TIMER_LINE=true
+    grep -qE "ENTROPY_QUORUM_(2_OF_3|1_OF_3)_OK"          "${VGA_TXT}" && HAS_ENTROPY_QUORUM_OK=true
+    grep -q  "ENTROPY_DEGRADED_OK_ACTIVE=1"               "${VGA_TXT}" && HAS_ENTROPY_DEGRADED_ACTIVE=true
+    grep -qE "ENTROPY_SOURCES_AVAILABLE=[1-3]"            "${VGA_TXT}" && HAS_ENTROPY_SOURCES_AVAILABLE=true
+fi
+
 # 마커 출력 + fail 누적 헬퍼
 # 인자 1 라벨, 2 has_flag (true/false), 3 클래스, 4 fail_reason
 # 클래스
@@ -496,3 +509,5 @@ else
     done
     exit 1
 fi
+
+# Phase 8 entropy marker recognition 신규 4 종 Wave 4 의 check_marker 호출 합류 anchor

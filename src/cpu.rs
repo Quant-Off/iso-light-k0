@@ -30,7 +30,7 @@
 /// CPUID leaf `eax`, sub-leaf `ecx`를 실행한 결과(EAX, EBX, ECX, EDX) 반환.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-fn cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
+pub(crate) fn cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
     let (mut eax, mut ebx, mut ecx, mut edx);
     // SAFETY: CPUID는 임의 시점에 안전하게 실행 가능한 읽기 전용 명령어
     unsafe {

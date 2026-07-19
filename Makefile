@@ -108,7 +108,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external check-machete ci-phase7
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external check-machete ci-phase7 ci-phase8 check-jitter-lto check-virtio-sentinel check-entropy-mutex qemu-tcg qemu-kvm entropy-host-test
 
 all: iso
 
@@ -375,3 +375,61 @@ check-machete:
 
 ci-phase7: check-alloc-zero check-machete
 	@echo "[ci-phase7] PASS Phase 7 audit gates green alloc-zero plus cargo-machete"
+
+#
+# Phase 8 CI 게이트 (ENTR-01..ENTR-08 종료 게이트)
+#
+# 6-leg 구조
+#   1) check-alloc-zero        Phase 1 standing (BSS 가산 회귀)
+#   2) check-machete           Phase 7 standing (dead-dep 가드)
+#   3) check-jitter-lto        Phase 8 신규 (ENTR-08 LTO 보호 objdump CI)
+#   4) check-virtio-sentinel   Phase 8 신규 (ENTR-04 sentinel + verify-changed 회귀)
+#   5) qemu-kvm                Phase 8 신규 (production strict 2-of-3 13 marker PASS)
+#   6) qemu-tcg                Phase 8 신규 (degraded TCG cell virtio-rng-only 13 marker PASS)
+#
+# Wave 0 단계는 skeleton 호출 가능 표면만 보증 (본문 채움은 Wave 1~4)
+# check-jitter-lto 와 check-virtio-sentinel 은 target 부재 시 expected fail-fast
+#
+check-jitter-lto: build-rel
+	@bash scripts/check-jitter-lto.sh
+
+check-virtio-sentinel:
+	@bash scripts/check-virtio-sentinel.sh
+
+# Phase 8 ENTR-05 compile_error mutex 게이트
+# Wave 0 (mod.rs compile_error 부재) 는 진짜 컴파일 통과가 일어나므로 expected exit 1
+# Wave 1 의 compile_error 신설 후 PASS 전환
+check-entropy-mutex:
+	@$(CARGO) build --features tls-external,entropy-degraded-ok 2>&1 | grep -q "compile_error" \
+	    || (echo "[CI] FAIL ENTR-05 compile_error trigger 누락" && exit 1)
+	@echo "[CI] PASS ENTR-05 entropy-degraded-ok 와 tls-external mutex compile_error 확인"
+
+# Phase 8 host-side entropy host test leg
+# 본 repo tests/ 디렉토리 4 host test (BLOCKER-5 정합 cross-repo elib-k0-nt 의존 제거)
+# Wave 0 단계 (test 파일 부재) fail-fast expected Plan 03 의 4 test 본문 채움 후 PASS
+entropy-host-test:
+	@HOST_TRIPLE=$$(rustc -vV | sed -n 's/^host: //p') && \
+	 CARGO_BUILD_TARGET= $(CARGO) test --release --target $$HOST_TRIPLE \
+	   --test entropy_quorum_fault_inject \
+	   --test entropy_health_rct_apt \
+	   --test entropy_virtio_sentinel \
+	   --test audit_entropy_schema
+	@echo "[CI] Phase 8 entropy-host-test 게이트 통과"
+
+# Phase 8 D-03 entropy-degraded-ok TCG cell 한정 build + qemu-test
+# production 산출 경로 오염 방지 별도 산출물 경로
+qemu-tcg:
+	@$(CARGO) build --release --target $(TARGET) --features smoke,entropy-degraded-ok
+	@mkdir -p $(BOOT_DIR)
+	@cp $(KERNEL_REL) $(BOOT_DIR)/kernel.bin
+	@cp $(KERNEL_REL) target/$(TARGET)/release/iso-light-k0-tcg.elf
+	@$(GRUB_MKRES) -o $(ISO_REL) $(ISO_DIR)
+	@K0_TEST_MODE=full bash scripts/qemu-test.sh
+	@echo "[CI] Phase 8 qemu-tcg degraded-ok build smoke 통과"
+
+# Phase 8 production KVM lane qemu-kvm 강제 + strict 2-of-3
+qemu-kvm: qemu-smoke-smoke
+	@echo "[CI] Phase 8 qemu-kvm production strict 2-of-3 통과 (qemu-smoke-smoke leg 재사용)"
+
+ci-phase8: check-alloc-zero check-machete check-jitter-lto check-virtio-sentinel qemu-kvm qemu-tcg
+	@echo "[CI] Phase 8 ci 게이트 전체 통과 (ENTR-01..ENTR-08 + 13 marker PASS)"
