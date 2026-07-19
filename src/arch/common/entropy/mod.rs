@@ -15,4 +15,4 @@ pub mod jitter;
 pub mod quorum;
 pub mod virtio_rng;
 
-pub use quorum::EntropyError;
+pub use quorum::{QuorumEntropy, EntropyError};

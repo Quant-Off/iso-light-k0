@@ -186,21 +186,15 @@ impl Zeroize for Capability {
 /// 단일 코어 부팅 초기 혹은 적절한 동기화 이후에 호출되어야 함.
 /// CPU 기능 탐지(`cpu::enable_simd_fpu`)가 먼저 수행되어야 함.
 unsafe fn fill_hw_entropy(buf: &mut [u8]) -> Result<(), CapError> {
-    // Wave 1 bridge stub Wave 3 에서 quorum::collect_with_retry 로 교체 ENTR-06 anchor
-    #[cfg(target_arch = "x86_64")]
-    {
-        use crate::arch::common::entropy::EntropyError;
-        // SAFETY: capability::init_prng 또는 reseed_drbg 호출자가 단일 코어 + cpu::features() 완료 보장
-        match unsafe { crate::arch::x86_64::entropy::hw::collect_hw_into(buf) } {
-            Ok(()) => Ok(()),
-            Err(EntropyError::SourceUnavailable) => Err(CapError::NoEntropy),
-            Err(_) => Err(CapError::NoEntropy),
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = buf;
-        Err(CapError::NoEntropy)
+    use crate::arch::common::entropy::{EntropyError, QuorumEntropy};
+
+    // ENTR-06 단일점 최종 교체 arch-중립 QuorumEntropy 진입점 D-05 60sec 폴링
+    // SAFETY: capability::init_prng 또는 reseed_drbg 호출자가 단일 코어 + cpu::features() 완료 보장
+    match unsafe { QuorumEntropy::collect_with_retry(buf, 60_000) } {
+        Ok(()) => Ok(()),
+        Err(EntropyError::QuorumFailed) => Err(CapError::NoEntropy),
+        Err(EntropyError::SourceUnavailable) => Err(CapError::NoEntropy),
+        Err(EntropyError::HealthTestFailed) => Err(CapError::NoEntropy),
     }
 }
 

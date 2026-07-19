@@ -9,12 +9,15 @@ build = "build.rs"
 # 활성화해도 런타임 별도 Capability가 추가로 필요한 이중 게이팅 구조
 # 폐쇄망 전용(`closed` 프로필)은 본 feature 없이도 항상 사용 가능
 [features]
-default = []
+default = ["kernel-bin"]
 tls-external = []
 # Phase 5 D-02: kernel-side smoke 전용 dev sk include 게이트 closed 프로필 부재
 smoke = []
 # Phase 8 ENTR-05 명문 entropy-degraded-ok TCG cell 한정 tls-external 와 compile-time mutex
 entropy-degraded-ok = []
+# Phase 8 BLOCKER-5 구조 feature 기본 ON 커널 산출물 영향 0
+# host test (`--no-default-features`) 시 kernel bin 을 빌드 대상에서 제외
+kernel-bin = []
 
 # Phase 5.1 D-01 trust root dual-path build.rs 가 K0_TRUST_ROOT_KEYSTORE env →
 # cargo:rustc-cfg=k0_trust_root_keystore 노출 (Rust 1.80+ unexpected_cfgs lint 명시)
@@ -25,12 +28,23 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(k0_trust_root_keystore)'] 
 # test/bench/doctest harness를 합성하면 `extern crate test;`를 주입하여
 # `x86_64-unknown-none` 타깃에서 E0463(test 크레이트 없음)으로 실패함
 # 이 커널은 호스트 측 단위 테스트 대상이 아니므로 모든 보조 타깃을 비활성화함
+# Phase 8 BLOCKER-5 host 전용 테스트 표면 kernel target 에서는 빈 crate 로 축소
+# tests/ 디렉토리 4 host test 가 본 lib 표면만 링크 (cross-repo 의존 0)
+[lib]
+name = "iso_light_k0"
+path = "src/lib.rs"
+test = false
+bench = false
+doctest = false
+
 [[bin]]
 name = "iso-light-k0"
 path = "src/main.rs"
 test = false
 bench = false
 doctest = false
+# host triple cargo test 시 kernel bin 빌드 제외 (BLOCKER-5)
+required-features = ["kernel-bin"]
 
 # 커널 패닉 시 스택 와인딩을 방지하고 즉각 중단
 [profile.dev]

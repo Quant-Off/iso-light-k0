@@ -14,7 +14,10 @@ use blake::{BLAKE3_OUT_LEN, Blake3};
 use mldsa::MLDSA44;
 use zeroize::Zeroize;
 
+// host lib 표면 (BLOCKER-5) 에서는 kernel 전용 의존 모듈 참조를 제외
+#[cfg(target_os = "none")]
 use crate::bus::BusKind;
+#[cfg(target_os = "none")]
 use crate::capability;
 
 //
@@ -150,6 +153,7 @@ pub unsafe fn with_attest_buf<R>(f: impl FnOnce(&mut [u8; ATTEST_BUF_MAX]) -> R)
 /// # Safety
 /// 부팅 시 단일 코어에서 1 회만 호출 호출자가 `capability::init_prng` 완료를 보장해야 함
 /// 본 함수가 ACTIVE_TRUST_ROOT_PK 와 BOOT_CHALLENGE 두 static 의 비원자적 갱신을 단일 진입으로 수행
+#[cfg(target_os = "none")]
 pub unsafe fn init_trust_root() {
     // (1) Phase 5.1 D-01 dual-path K0_TRUST_ROOT_KEYSTORE cfg 분기
     //
@@ -285,6 +289,7 @@ pub fn audit_snapshot(out: &mut [EnrollEvent]) -> (usize, u32) {
 /// # Security Note
 /// 메시지 재구성 + SMAP copy 는 입력값 독립 분기 (D-12) verify 결과만 input-dependent
 /// 모든 경로 (Ok 또는 Err) 에서 stack-local pre 와 digest 가 zeroize 되어 잔존 0
+#[cfg(target_os = "none")]
 pub fn verify_attest(
     hsm_pk: &[u8; MLDSA44::PK_LEN],
     bus_kind: BusKind,

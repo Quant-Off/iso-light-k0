@@ -34,9 +34,13 @@ if [ -z "$SYMBOL" ]; then
     exit 1
 fi
 
-INSTRUCTION_COUNT=$($DUMP_DISAS "$KERNEL_BIN" 2>/dev/null \
-    | awk -v sym="$SYMBOL" '$0 ~ sym {found=1; next} found && /^$/ {exit} found' \
-    | wc -l)
+# 심볼 header line (`<sym>:`) 만 anchor 로 사용 call site 텍스트 오매칭 차단
+# awk 조기 exit 의 SIGPIPE 가 pipefail 로 전파되지 않도록 || true 가드
+INSTRUCTION_COUNT=$({ $DUMP_DISAS "$KERNEL_BIN" 2>/dev/null \
+    | awk -v sym="$SYMBOL" 'index($0, "<" sym ">:") {found=1; next} found && /^$/ {exit} found' \
+    | wc -l; } || true)
+INSTRUCTION_COUNT=$(echo "$INSTRUCTION_COUNT" | tr -d '[:space:]')
+INSTRUCTION_COUNT=${INSTRUCTION_COUNT:-0}
 
 if [ "$INSTRUCTION_COUNT" -lt 1024 ]; then
     echo "[CI] FAIL jitter_fold_step instruction count $INSTRUCTION_COUNT < 1024 LTO DCE 의심" >&2

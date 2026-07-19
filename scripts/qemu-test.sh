@@ -74,6 +74,8 @@ QEMU_MAJOR=$(qemu-system-x86_64 --version 2>/dev/null \
 #                   H5/M12 fail-closed 로 init_prng 에서 의도적 부팅 중단이 정상 동작
 #                   부팅 진입 + fail-closed FATAL + reset<=2 를 PASS 조건으로 판정
 # 환경변수 K0_TEST_MODE 로 override 가능 (full | tcg-entropy | tcg-no-entropy)
+# DEPRECATED Phase 8 ENTR-07 production+degraded 양 lane 모두 13 marker PASS 요구
+# K0_TEST_MODE override 만 v1.0 호환 유지 modal 분기 자체는 Phase 12 4-cell matrix 가 잠금
 if [ -n "${K0_TEST_MODE:-}" ]; then
     ENTROPY_MODE="${K0_TEST_MODE}"
     echo "[INFO] ENTROPY_MODE=${ENTROPY_MODE} (K0_TEST_MODE override)"
@@ -371,6 +373,8 @@ fi
 #   entropy  entropy 의존 + TLS 소거 이전 구간. full 과 tcg-entropy 에서 PASS 요구
 #   stall    entropy 의존 + TLS 소거 이후 구간. full 에서만 PASS 요구
 #            tcg-entropy 에서는 post-TLS stall(원인 미확정) 로 검증 제외
+#   false    ENTR-07 flip entropy_dependent=false. full 과 tcg-entropy 양 lane 강제 PASS
+#            (Phase 8 quorum 완성 후 stall 예외 해제 tcg-no-entropy 만 expected MISS)
 check_marker() {
     local label="$1"
     local has_flag="$2"
@@ -442,43 +446,55 @@ if [ "${ENTROPY_MODE}" = "tcg-no-entropy" ]; then
     fi
 fi
 
-# 구조 마커 (tcg-entropy 와 full 에서 PASS 요구)
-check_marker "[HsmRegistry static online]"     "$HAS_HSM_STATIC_ONLINE"        "struct" \
+# 구조 마커 (ENTR-07 flip entropy_dependent=false 전 lane 강제 PASS 요구)
+check_marker "[HsmRegistry static online]"     "$HAS_HSM_STATIC_ONLINE"        "false" \
     "HsmRegistry static online 마커 없음 (main.rs 모듈 선언 또는 부팅 순서 누락)"
 
-# entropy 의존 마커, TLS 소거 이전 구간 (tcg-entropy 와 full 에서 PASS 요구)
-check_marker "[Hash-DRBG 초기화]"               "$HAS_DRBG"                     "entropy"  \
+# entropy 의존 마커, TLS 소거 이전 구간 (ENTR-07 flip entropy->false 전 lane 강제 PASS 요구)
+check_marker "[Hash-DRBG 초기화]"               "$HAS_DRBG"                     "false" \
     "Hash-DRBG 초기화 마커 없음 (RDSEED/RDRAND 부재)"
-check_marker "[BLAKE3 라운드트립 스모크]"        "$HAS_SMOKE_OK"                 "entropy"  \
+check_marker "[BLAKE3 라운드트립 스모크]"        "$HAS_SMOKE_OK"                 "false" \
     "BLAKE3 라운드트립 스모크 결과 미확인"
-check_marker "[TLS PQ-Hybrid 핸드셰이크]"        "$HAS_TLS_HYBRID"               "entropy"  \
+check_marker "[TLS PQ-Hybrid 핸드셰이크]"        "$HAS_TLS_HYBRID"               "false" \
     "TLS PQ-Hybrid 핸드셰이크 미확인"
-check_marker "[TLS Classical 핸드셰이크]"        "$HAS_TLS_CLASSICAL"            "entropy"  \
+check_marker "[TLS Classical 핸드셰이크]"        "$HAS_TLS_CLASSICAL"            "false" \
     "TLS Classical 핸드셰이크 미확인"
-check_marker "[TLS keystore + pool 소거]"        "$HAS_TLS_WIPED"                "entropy"  \
+check_marker "[TLS keystore + pool 소거]"        "$HAS_TLS_WIPED"                "false" \
     "TLS 종료 후 키 자료 소거 미확인"
 
-# entropy 의존 마커, TLS 소거 이후 구간 (full 에서만 PASS 요구, post-TLS stall 참조)
-check_marker "[HsmRegistry smoke OK]"            "$HAS_HSM_SMOKE"                "stall"  \
-    "HsmRegistry 스모크 테스트 성공 마커 없음 (attach->detach->zeroize 라운드트립 실패)"
-check_marker "[HSM attach->detach roundtrip]"    "$HAS_HSM_ROUNDTRIP"            "stall"  \
+# entropy 의존 마커, TLS 소거 이후 구간 (ENTR-07 flip stall->false 전 lane 강제 PASS 요구)
+check_marker "[HsmRegistry smoke OK]"            "$HAS_HSM_SMOKE"                "false" \
+    "HsmRegistry 스모크 테스트 성공 마커 없음 (attach detach zeroize 라운드트립 실패)"
+check_marker "[HSM attach->detach roundtrip]"    "$HAS_HSM_ROUNDTRIP"            "false" \
     "HSM_ATTACH_DETACH_ROUNDTRIP_OK 마커 없음"
-check_marker "[HSM detach no-cap denied]"        "$HAS_HSM_DETACH_NOCAP_DENIED"  "stall"  \
-    "HSM_DETACH_NO_CAP_DENIED 마커 없음 — post-attach CAP-02 enforcement 실패"
-check_marker "[BUS_PHASE2_OK marker]"            "$HAS_BUS_PHASE2_OK"            "stall"  \
-    "BUS_PHASE2_OK 마커 없음 — Phase 2 SoftwareBus 루프백 + detach cascade 실패"
-check_marker "[CHAN_PHASE3_OK marker]"           "$HAS_CHAN_PHASE3_OK"           "stall"  \
-    "CHAN_PHASE3_OK 마커 없음 — Phase 3 Blake3 src -> AesGcm dst relay 라운드트립 실패"
-check_marker "[WIRE_PHASE4_OK marker]"           "$HAS_WIRE_PHASE4_OK"           "stall"  \
-    "WIRE_PHASE4_OK 마커 없음  Phase 4 lumen Ring 3 wire Blake3Hash contract 실패"
+check_marker "[HSM detach no-cap denied]"        "$HAS_HSM_DETACH_NOCAP_DENIED"  "false" \
+    "HSM_DETACH_NO_CAP_DENIED 마커 없음 post-attach CAP-02 enforcement 실패"
+check_marker "[BUS_PHASE2_OK marker]"            "$HAS_BUS_PHASE2_OK"            "false" \
+    "BUS_PHASE2_OK 마커 없음 Phase 2 SoftwareBus 루프백 + detach cascade 실패"
+check_marker "[CHAN_PHASE3_OK marker]"           "$HAS_CHAN_PHASE3_OK"           "false" \
+    "CHAN_PHASE3_OK 마커 없음 Phase 3 Blake3 src -> AesGcm dst relay 라운드트립 실패"
+check_marker "[WIRE_PHASE4_OK marker]"           "$HAS_WIRE_PHASE4_OK"           "false" \
+    "WIRE_PHASE4_OK 마커 없음 Phase 4 lumen Ring 3 wire Blake3Hash contract 실패"
 
-# REQUIRE_* 게이트가 있는 Phase 5/5.1/6 entropy 의존 마커
-check_gated_marker "[ATTEST_PHASE5_OK marker]"   "$HAS_ATTEST_PHASE5_OK"   "${REQUIRE_ATTEST_PHASE5_OK:-0}" \
-    "ATTEST_PHASE5_OK 마커 없음  Phase 5 attach with attestation Leg 1 valid sig 또는 Leg 2 mutated reject 실패"
-check_gated_marker "[ATTEST_PHASE5_1_OK marker]" "$HAS_ATTEST_PHASE5_1_OK" "${REQUIRE_ATTEST_PHASE5_1_OK:-0}" \
-    "ATTEST_PHASE5_1_OK 마커 없음 — Phase 5.1 wire AttestSubmit / Status / lumen leg 실패"
-check_gated_marker "[GAP_PHASE6_OK marker]"      "$HAS_GAP_PHASE6_OK"      "${REQUIRE_GAP_PHASE6_OK:-0}" \
-    "GAP_PHASE6_OK 마커 없음 — Phase 6 dual gate / sys_hsm_status / gap_self_check leg 실패"
+# Phase 8 Wave 4 신규 marker 4 종 check_marker 합류 (Wave 3 main.rs emit)
+# timer / ENTROPY_QUORUM / ENTROPY_SOURCES 는 전 lane 강제 (false)
+# ENTROPY_DEGRADED 는 degraded 빌드에서만 emit 되므로 K0_REQUIRE_DEGRADED 게이트
+check_marker "[timer: line]"                     "$HAS_TIMER_LINE"               "false" \
+    "timer frequency line 부재 Pitfall 12 회귀 의심"
+check_marker "[ENTROPY_QUORUM marker]"           "$HAS_ENTROPY_QUORUM_OK"        "false" \
+    "ENTROPY_QUORUM marker 부재 Phase 8 entropy quorum 미작동"
+check_marker "[ENTROPY_SOURCES_AVAILABLE marker]" "$HAS_ENTROPY_SOURCES_AVAILABLE" "false" \
+    "ENTROPY_SOURCES_AVAILABLE marker 부재 Pitfall 5 가시 효과 부재"
+check_gated_marker "[ENTROPY_DEGRADED_OK_ACTIVE marker]" "$HAS_ENTROPY_DEGRADED_ACTIVE" "${K0_REQUIRE_DEGRADED:-0}" \
+    "ENTROPY_DEGRADED_OK_ACTIVE 마커 부재 degraded 빌드 D-03 식별 실패"
+
+# REQUIRE_* 게이트가 있는 Phase 5/5.1/6 marker (ENTR-07 default 0 -> 1 강제 PASS)
+check_gated_marker "[ATTEST_PHASE5_OK marker]"   "$HAS_ATTEST_PHASE5_OK"   "${REQUIRE_ATTEST_PHASE5_OK:-1}" \
+    "ATTEST_PHASE5_OK 마커 없음 Phase 5 attach with attestation Leg 1 valid sig 또는 Leg 2 mutated reject 실패"
+check_gated_marker "[ATTEST_PHASE5_1_OK marker]" "$HAS_ATTEST_PHASE5_1_OK" "${REQUIRE_ATTEST_PHASE5_1_OK:-1}" \
+    "ATTEST_PHASE5_1_OK 마커 없음 Phase 5.1 wire AttestSubmit / Status / lumen leg 실패"
+check_gated_marker "[GAP_PHASE6_OK marker]"      "$HAS_GAP_PHASE6_OK"      "${REQUIRE_GAP_PHASE6_OK:-1}" \
+    "GAP_PHASE6_OK 마커 없음 Phase 6 dual gate / sys_hsm_status / gap_self_check leg 실패"
 
 # (d) QEMU exit 코드 (timeout=124, 모니터 quit=정상)
 case "${QEMU_EXIT}" in
@@ -511,3 +527,4 @@ else
 fi
 
 # Phase 8 entropy marker recognition 신규 4 종 Wave 4 의 check_marker 호출 합류 anchor
+# Phase 8 Wave 4 check_marker flip complete entropy_dependent false 전환 + 4 신규 marker check

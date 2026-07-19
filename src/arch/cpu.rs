@@ -1,12 +1,12 @@
-//! 본 모듈은 timer frequency 탐지 표면을 정의합니다
+//! 본 모듈은 timer frequency 탐지와 cycle counter HAL hook 표면을 정의합니다
 //!
 //! # Features
-//! CPUID 0x15 우선 + 0x16 fallback chain 으로 TSC 주파수를 Hz 단위로 노출합니다.
-//! zero frequency 는 None semantic 으로 lifting 하여 divide-by-zero panic 을
-//! 차단합니다 (PITFALLS Pitfall 12). calibration fallback 은 Wave 2 의 jitter
-//! calibrate 합류 anchor 로 현재 None 을 반환합니다.
+//! CPUID 0x15 우선 + 0x16 fallback + CMOS RTC calibration 3 단 chain 으로 TSC
+//! 주파수를 Hz 단위로 노출합니다. zero frequency 는 None semantic 으로 lifting
+//! 하여 divide-by-zero panic 을 차단합니다 (PITFALLS Pitfall 12). cycle_counter
+//! 는 jitter noise source 의 timestamp HAL hook 입니다 (rdtsc on x86)
 
-// W7 ROADMAP SC 7 정합 2-source 구분 Wave 2 부터 JitterCalibration 활성
+// W7 ROADMAP SC 7 정합 2-source 구분
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimerKind {
@@ -14,7 +14,22 @@ pub enum TimerKind {
     JitterCalibration,
 }
 
-// Wave 2 의 boot serial 출력 합류 전까지 호출자 부재 한시 허용
+/// CPU cycle counter 를 읽는 HAL hook 함수
+///
+/// x86_64 는 RDTSC 직접 호출이며 aarch64 분기는 Phase 10 이 cntvct_el0 으로 채움
+pub fn cycle_counter() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY RDTSC 는 Ring 0 에서 임의 시점 안전 실행 가능한 읽기 전용 명령어
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0u64
+    }
+}
+
+// Wave 4 의 boot serial 출력 합류 전까지 호출자 부재 한시 허용
 #[allow(dead_code)]
 pub fn timer_frequency() -> Option<(u64, TimerKind)> {
     #[cfg(target_arch = "x86_64")]
@@ -27,8 +42,10 @@ pub fn timer_frequency() -> Option<(u64, TimerKind)> {
         if (eax16 & 0xFFFF) != 0 {
             return Some((((eax16 & 0xFFFF) as u64) * 1_000_000, TimerKind::InvariantTsc));
         }
-        // Wave 2 의 jitter calibrate 합류 시 활성 TimerKind::JitterCalibration emit
-        None
+        // calibration fallback (Pitfall 12) CPUID 양 leaf fail 시 CMOS RTC polling
+        crate::arch::common::entropy::jitter::calibrate_tsc_via_rtc()
+            .ok()
+            .map(|hz| (hz, TimerKind::JitterCalibration))
     }
     #[cfg(not(target_arch = "x86_64"))]
     None

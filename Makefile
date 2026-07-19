@@ -409,11 +409,11 @@ check-entropy-mutex:
 # Wave 0 단계 (test 파일 부재) fail-fast expected Plan 03 의 4 test 본문 채움 후 PASS
 entropy-host-test:
 	@HOST_TRIPLE=$$(rustc -vV | sed -n 's/^host: //p') && \
-	 CARGO_BUILD_TARGET= $(CARGO) test --release --target $$HOST_TRIPLE \
+	 $(CARGO) test --release --no-default-features --target $$HOST_TRIPLE \
 	   --test entropy_quorum_fault_inject \
 	   --test entropy_health_rct_apt \
 	   --test entropy_virtio_sentinel \
-	   --test audit_entropy_schema
+	   --test audit_entropy_schema -- --include-ignored
 	@echo "[CI] Phase 8 entropy-host-test 게이트 통과"
 
 # Phase 8 D-03 entropy-degraded-ok TCG cell 한정 build + qemu-test
@@ -424,7 +424,7 @@ qemu-tcg:
 	@cp $(KERNEL_REL) $(BOOT_DIR)/kernel.bin
 	@cp $(KERNEL_REL) target/$(TARGET)/release/iso-light-k0-tcg.elf
 	@$(GRUB_MKRES) -o $(ISO_REL) $(ISO_DIR)
-	@K0_TEST_MODE=full bash scripts/qemu-test.sh
+	@K0_REQUIRE_DEGRADED=1 K0_TEST_MODE=full bash scripts/qemu-test.sh
 	@echo "[CI] Phase 8 qemu-tcg degraded-ok build smoke 통과"
 
 # Phase 8 production KVM lane qemu-kvm 강제 + strict 2-of-3

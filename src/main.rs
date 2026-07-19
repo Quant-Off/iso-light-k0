@@ -102,6 +102,128 @@ static mut KERNEL_ADDR_SPACE: AddressSpace = AddressSpace::new();
 ///   9. 커널 세그먼트 매핑 (W^X 정책 강제)
 ///  10. 커널 주소 공간 활성화 (CR3 재로드) <- TODO: 링커 스크립트 재배치 후
 ///  11. 인터럽트 활성화 (sti) + 커널 메인 이벤트 루프
+/// u64 를 10 진 ASCII 로 buffer 에 기록하는 함수
+///
+/// # Arguments
+/// `out` - 기록 대상 buffer
+/// `at` - 기록 시작 offset
+/// `v` - 직렬화할 값
+fn fmt_dec(out: &mut [u8], mut at: usize, v: u64) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    let mut n = v;
+    if n == 0 {
+        if at < out.len() {
+            out[at] = b'0';
+            at += 1;
+        }
+        return at;
+    }
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        if at < out.len() {
+            out[at] = tmp[i];
+            at += 1;
+        }
+    }
+    at
+}
+
+/// timer 주파수 line 을 TimerKind 분기로 직렬화하는 함수 (ROADMAP SC 7 2-source 구분)
+///
+/// # Arguments
+/// `buf` - 직렬화 대상 64 옥텟 buffer
+/// `hz` - TSC 주파수 Hz
+/// `kind` - invariant_tsc 또는 jitter_calibration 구분
+fn format_timer_line(buf: &mut [u8; 64], hz: u64, kind: crate::arch::cpu::TimerKind) -> &[u8] {
+    let prefix: &[u8] = match kind {
+        crate::arch::cpu::TimerKind::InvariantTsc => {
+            b"[iso-light-k0] timer: invariant_tsc=true freq="
+        }
+        crate::arch::cpu::TimerKind::JitterCalibration => {
+            b"[iso-light-k0] timer: jitter_calibration freq="
+        }
+    };
+    let mut at = 0usize;
+    for &c in prefix {
+        if at < buf.len() {
+            buf[at] = c;
+            at += 1;
+        }
+    }
+    at = fmt_dec(&mut buf[..], at, hz);
+    for &c in b" hz" {
+        if at < buf.len() {
+            buf[at] = c;
+            at += 1;
+        }
+    }
+    &buf[..at]
+}
+
+/// ENTROPY_SOURCES_AVAILABLE marker line 을 직렬화하는 함수 (Pitfall 5 visibility)
+///
+/// # Arguments
+/// `buf` - 직렬화 대상 64 옥텟 buffer
+/// `n` - boot 시점 latch 된 live source 수
+fn format_sources_line(buf: &mut [u8; 64], n: u8) -> &[u8] {
+    let prefix: &[u8] = b"[iso-light-k0] ENTROPY_SOURCES_AVAILABLE=";
+    let mut at = 0usize;
+    for &c in prefix {
+        if at < buf.len() {
+            buf[at] = c;
+            at += 1;
+        }
+    }
+    at = fmt_dec(&mut buf[..], at, n as u64);
+    &buf[..at]
+}
+
+/// JITTER_DUMP 한 line 을 hex 직렬화하는 함수 (host-side min-entropy 분석 입력)
+///
+/// # Arguments
+/// `buf` - 직렬화 대상 600 옥텟 buffer
+/// `data` - 256 옥텟 raw delta 표본 slice
+/// `line_idx` - 0..63 line 번호 2-digit decimal 표기
+fn format_jitter_dump_line<'a>(buf: &'a mut [u8; 600], data: &[u8], line_idx: u8) -> &'a [u8] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let prefix: &[u8] = b"[iso-light-k0] JITTER_DUMP[";
+    let mut at = 0usize;
+    for &c in prefix {
+        if at < buf.len() {
+            buf[at] = c;
+            at += 1;
+        }
+    }
+    if at < buf.len() {
+        buf[at] = b'0' + (line_idx / 10);
+        at += 1;
+    }
+    if at < buf.len() {
+        buf[at] = b'0' + (line_idx % 10);
+        at += 1;
+    }
+    for &c in b"]=" {
+        if at < buf.len() {
+            buf[at] = c;
+            at += 1;
+        }
+    }
+    for &b in data {
+        if at + 1 < buf.len() {
+            buf[at] = HEX[(b >> 4) as usize];
+            buf[at + 1] = HEX[(b & 0x0f) as usize];
+            at += 2;
+        }
+    }
+    &buf[..at]
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     //
@@ -450,19 +572,104 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // SAFETY: cpu::enable_simd_fpu() 완료 후 단일 코어에서 최초 1회 호출
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        match capability::init_prng() {
-            Ok(()) => vga::println(
-                b"[iso-light-k0] Capability DRBG Init Done. (Hash-DRBG-SHA256)",
-                vga::Color::Green,
-            ),
-            Err(_) => {
+        // (1) virtio-rng PCI probe 부팅 시 1 회
+        // SAFETY BSP single-core boot MMU identity map 가정
+        crate::arch::common::entropy::virtio_rng::init_virtio_rng_instance();
+
+        // (2) jitter boot self-test 16384 sample min-entropy 회귀 TCG 환경 self-disable
+        // SAFETY BSP single-core JITTER_POOL 단일 진입
+        let jitter_ok = crate::arch::common::entropy::jitter::jitter_boot_self_test();
+        if !jitter_ok {
+            vga::println(
+                b"[iso-light-k0] WARN: jitter self-test fail (TCG environment likely)",
+                vga::Color::Yellow,
+            );
+        }
+
+        // (3) timer frequency line emit ROADMAP SC 7 2-source 구분 Pitfall 12 None 처리
+        match crate::arch::cpu::timer_frequency() {
+            Some((hz, kind)) => {
+                let mut tbuf = [0u8; 64];
+                let msg = format_timer_line(&mut tbuf, hz, kind);
+                vga::println(msg, vga::Color::Green);
+            }
+            None => {
                 vga::println(
-                    b"[iso-light-k0] FATAL: no hardware entropy (RDSEED/RDRAND).",
+                    b"[iso-light-k0] WARN: no timer source (jitter disabled)",
                     vga::Color::Red,
                 );
-                // H5/M12 HW 엔트로피 부재는 무조건 부팅 중단(fail-closed)
+            }
+        }
+
+        // (4) entropy-degraded-ok build marker Red ALERT 식별 D-03
+        #[cfg(feature = "entropy-degraded-ok")]
+        vga::println(
+            b"[iso-light-k0] ENTROPY_DEGRADED_OK_ACTIVE=1",
+            vga::Color::Red,
+        );
+
+        match capability::init_prng() {
+            Ok(()) => {
+                vga::println(
+                    b"[iso-light-k0] Capability DRBG Init Done. (Hash-DRBG-SHA256)",
+                    vga::Color::Green,
+                );
+
+                // (5) ENTROPY_SOURCES_AVAILABLE=N marker Pitfall 5 visibility
+                let n_sources =
+                    crate::arch::common::entropy::QuorumEntropy::sources_available_at_boot();
+                let mut nbuf = [0u8; 64];
+                let nmsg = format_sources_line(&mut nbuf, n_sources);
+                vga::println(nmsg, vga::Color::Green);
+
+                // (6) quorum status marker production strict / degraded
+                #[cfg(not(feature = "entropy-degraded-ok"))]
+                vga::println(
+                    b"[iso-light-k0] ENTROPY_QUORUM_2_OF_3_OK",
+                    vga::Color::Green,
+                );
+                #[cfg(feature = "entropy-degraded-ok")]
+                vga::println(
+                    b"[iso-light-k0] ENTROPY_QUORUM_1_OF_3_OK",
+                    vga::Color::Green,
+                );
+
+                // (7) JitterRng 16384 sample boot self-test PASS 시 raw 표본 전체 hex dump
+                // host-side ea_iid (NIST SP 800-90B) 또는 in-tree estimator 가 boot serial 의
+                // JITTER_BOOT_DUMP_BEGIN END 사이 16384 옥텟 추출 후 min-entropy >= 0.5 회귀 검증
+                // 64 line x 256 byte = 16384 옥텟 raw pre-conditioning 표본 (key material 아님)
+                if jitter_ok {
+                    vga::println(
+                        b"[iso-light-k0] JITTER_BOOT_DUMP_BEGIN N=16384",
+                        vga::Color::Green,
+                    );
+                    // SAFETY BSP single-core BOOT_SELF_TEST_BUF 단일 진입 read
+                    let dump_buf =
+                        crate::arch::common::entropy::jitter::boot_self_test_samples();
+                    for line_idx in 0..64 {
+                        let mut hex_buf = [0u8; 600];
+                        let off = line_idx * 256;
+                        let msg = format_jitter_dump_line(
+                            &mut hex_buf,
+                            &dump_buf[off..off + 256],
+                            line_idx as u8,
+                        );
+                        vga::println(msg, vga::Color::White);
+                    }
+                    vga::println(
+                        b"[iso-light-k0] JITTER_BOOT_DUMP_END",
+                        vga::Color::Green,
+                    );
+                }
+            }
+            Err(_) => {
+                vga::println(
+                    b"[iso-light-k0] FATAL: entropy quorum failure",
+                    vga::Color::Red,
+                );
+                // H5/M12 엔트로피 quorum 부재는 무조건 부팅 중단 fail-closed
                 // 이후 BOOT_CHALLENGE 와 capability 토큰이 전부 0 이 되는 상태로 진행 금지
-                panic!("no hardware entropy source (RDSEED/RDRAND)");
+                panic!("entropy quorum failure");
             }
         }
     }

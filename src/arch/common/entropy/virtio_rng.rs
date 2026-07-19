@@ -6,12 +6,18 @@
 //! silent-pass 를 차단하며 (PITFALLS Pitfall 5) 모든 이탈 경로에서 scratch 를
 //! zeroize 합니다 (with_attest_buf prior art 정합). `KernelHal` 은 static BSS
 //! DMA pool 만 사용하는 alloc-zero `virtio_drivers::Hal` 구현입니다.
+//! sentinel + verify-changed 코어는 `sentinel_collect_with` 로 분리되어 host
+//! 전용 테스트 (BLOCKER-5) 가 mock 주입 형태로 동일 본문을 검증합니다.
 
+#[cfg(target_os = "none")]
 use core::ptr::NonNull;
 
 use constant_time::{Choice, CtEqOps};
+#[cfg(target_os = "none")]
 use virtio_drivers::device::rng::VirtIORng;
+#[cfg(target_os = "none")]
 use virtio_drivers::transport::pci::PciTransport;
+#[cfg(target_os = "none")]
 use virtio_drivers::{BufferDirection, Hal, PAGE_SIZE, PhysAddr};
 use zeroize::Zeroize;
 
@@ -21,29 +27,36 @@ pub const SENTINEL: u8 = 0xFE;
 // capability.rs::ENTROPY_LEN 정합
 pub const VIRTIO_SCRATCH_LEN: usize = 32;
 
+#[cfg(target_os = "none")]
 #[used]
 pub static mut VIRTIO_SCRATCH: [u8; VIRTIO_SCRATCH_LEN] = [SENTINEL; VIRTIO_SCRATCH_LEN];
 
 // Wave 4 boot init 시점 probe_virtio_rng 결과로 채움
+#[cfg(target_os = "none")]
 pub static mut VIRTIO_RNG_INSTANCE: Option<VirtIORng<KernelHal, PciTransport>> = None;
 
 // VirtQueue modern layout 2 page + 여유 2 page
+#[cfg(target_os = "none")]
 const DMA_POOL_PAGES: usize = 4;
 
 /// PAGE_SIZE 정렬을 강제하는 DMA pool 단위 페이지 구조체.
 ///
 /// virtio-drivers 의 `Hal::dma_alloc` 이 요구하는 4 KiB 정렬 유일 소유
 /// 페이지를 static BSS 로 제공하기 위한 래퍼입니다.
+#[cfg(target_os = "none")]
 #[repr(C, align(4096))]
 struct DmaPage([u8; PAGE_SIZE]);
 
+#[cfg(target_os = "none")]
 static mut DMA_POOL: [DmaPage; DMA_POOL_PAGES] = [const { DmaPage([0u8; PAGE_SIZE]) }; DMA_POOL_PAGES];
+#[cfg(target_os = "none")]
 static mut DMA_POOL_NEXT: usize = 0;
 
 /// 커널 higher-half VMA 를 물리 주소로 변환하는 함수입니다.
 ///
 /// # Arguments
 /// `vaddr` - 변환할 가상 주소
+#[cfg(target_os = "none")]
 fn virt_to_phys(vaddr: usize) -> PhysAddr {
     let v = vaddr as u64;
     if v >= crate::mmu::KERNEL_VMA_BASE {
@@ -69,14 +82,61 @@ fn ct_eq_bytes(a: &[u8], b: &[u8]) -> Choice {
     eq
 }
 
+/// sentinel 사전 채움 + verify-changed + zeroize 코어 함수입니다.
+///
+/// ENTR-04 본문의 단일 정본으로 kernel 경로 (`virtio_collect`) 와 host 전용
+/// 테스트 (mock 주입) 가 동일 코어를 공유합니다. request 가 scratch 를 전혀
+/// 변경하지 않으면 (sentinel 전체 잔존) silent-pass 를 차단합니다.
+///
+/// # Arguments
+/// `scratch` - sentinel 채움 대상 staging buffer
+/// `buf` - 수집 결과 출력 buffer
+/// `request` - scratch 를 채우는 entropy 요청 클로저
+///
+/// # Errors
+/// `EntropyError::SourceUnavailable` - 요청 실패 / 0 옥텟 / sentinel 잔존
+pub fn sentinel_collect_with<E>(
+    scratch: &mut [u8; VIRTIO_SCRATCH_LEN],
+    buf: &mut [u8],
+    request: impl FnOnce(&mut [u8]) -> Result<usize, E>,
+) -> Result<usize, EntropyError> {
+    // (1) sentinel 사전 채움 (Pitfall 5 회피)
+    for b in scratch.iter_mut() {
+        *b = SENTINEL;
+    }
+
+    // (2) request_entropy 상당 요청 실패 또는 0 옥텟 시 즉시 차단
+    let n = match request(&mut scratch[..]) {
+        Ok(n) if n > 0 => n,
+        _ => {
+            scratch.zeroize();
+            return Err(EntropyError::SourceUnavailable);
+        }
+    };
+
+    // (3) verify-changed sentinel 전체 잔존 시 silent-pass 차단
+    let still_sentinel = [SENTINEL; VIRTIO_SCRATCH_LEN];
+    if ct_eq_bytes(&scratch[..], &still_sentinel[..]).unwrap_u8() == 1 {
+        scratch.zeroize();
+        return Err(EntropyError::SourceUnavailable);
+    }
+
+    let take = core::cmp::min(core::cmp::min(n, VIRTIO_SCRATCH_LEN), buf.len());
+    buf[..take].copy_from_slice(&scratch[..take]);
+    scratch.zeroize();
+    Ok(take)
+}
+
 /// virtio-drivers Hal 의 alloc-zero 구현체.
 ///
 /// DMA 페이지는 static BSS pool 에서만 배분되어 동적 할당이 발생하지 않으며
 /// pool 소진 시 paddr 0 을 반환해 `Dma::new` 가 DmaError 로 fail-stop 합니다.
+#[cfg(target_os = "none")]
 pub struct KernelHal;
 
 // SAFETY: dma_alloc 은 PAGE_SIZE 정렬 + zero 화 + 유일 소유 페이지를 반환하고
 // pool 재사용이 없어 (dealloc leak 정책) alias 가 발생하지 않음
+#[cfg(target_os = "none")]
 unsafe impl Hal for KernelHal {
     /// static BSS pool 에서 연속 DMA 페이지를 배분하는 함수입니다.
     ///
@@ -138,15 +198,11 @@ unsafe impl Hal for KernelHal {
 /// BSP single-core + VIRTIO_SCRATCH 와 VIRTIO_RNG_INSTANCE 의 단일 진입 가정
 /// FMASK 재진입 차단으로 boot 및 reseed 경로의 단일 호출을 invariant 로 가정함
 // Wave 3 quorum 합류 전까지 호출자 부재 한시 허용
+#[cfg(target_os = "none")]
 #[allow(dead_code)]
 pub unsafe fn virtio_collect(buf: &mut [u8]) -> Result<usize, EntropyError> {
     // SAFETY: BSP single-core VIRTIO_SCRATCH 단일 진입
     let scratch = unsafe { &mut *(&raw mut VIRTIO_SCRATCH) };
-
-    // (1) sentinel 사전 채움 (Pitfall 5 회피)
-    for b in scratch.iter_mut() {
-        *b = SENTINEL;
-    }
 
     // SAFETY: BSP single-core VIRTIO_RNG_INSTANCE 단일 진입
     let rng = match unsafe { (*(&raw mut VIRTIO_RNG_INSTANCE)).as_mut() } {
@@ -157,24 +213,25 @@ pub unsafe fn virtio_collect(buf: &mut [u8]) -> Result<usize, EntropyError> {
         }
     };
 
-    // (2) request_entropy virtio-drivers 0.13 API
-    let n = match rng.request_entropy(&mut scratch[..]) {
-        Ok(n) if n > 0 => n,
-        _ => {
-            scratch.zeroize();
-            return Err(EntropyError::SourceUnavailable);
+    // sentinel + verify-changed + zeroize 코어 위임 (ENTR-04 단일 정본)
+    sentinel_collect_with(scratch, buf, |s| rng.request_entropy(s))
+}
+
+/// boot 시점 virtio-rng probe 결과를 BSS singleton 에 채우는 함수입니다.
+///
+/// # Safety
+/// BSP single-core 부팅 1 회만 호출 VIRTIO_RNG_INSTANCE 단일 진입 갱신 가정
+// Wave 4 main.rs boot 합류 전까지 호출자 부재 한시 허용
+#[cfg(target_os = "none")]
+#[allow(dead_code)]
+pub unsafe fn init_virtio_rng_instance() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: BSP single-core boot MMIO ECAM 은 identity map 영역
+        let probed = unsafe { crate::arch::x86_64::entropy::virtio_transport::probe_virtio_rng() };
+        // SAFETY: BSP single-core VIRTIO_RNG_INSTANCE 단일 진입 갱신
+        unsafe {
+            *(&raw mut VIRTIO_RNG_INSTANCE) = probed;
         }
-    };
-
-    // (3) verify-changed sentinel 전체 잔존 시 silent-pass 차단
-    let still_sentinel = [SENTINEL; VIRTIO_SCRATCH_LEN];
-    if ct_eq_bytes(&scratch[..], &still_sentinel[..]).unwrap_u8() == 1 {
-        scratch.zeroize();
-        return Err(EntropyError::SourceUnavailable);
     }
-
-    let take = core::cmp::min(n, buf.len());
-    buf[..take].copy_from_slice(&scratch[..take]);
-    scratch.zeroize();
-    Ok(take)
 }
