@@ -48,12 +48,12 @@ impl crate::arch::Cpu for X86Cpu {
     #[inline(always)]
     unsafe fn interrupts_disable() {
         // SAFETY: Ring 0 에서만 호출하며 임계 구역 종료 시 interrupts_enable 로 복구
-        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) }
+        unsafe { cpu::interrupts_disable() }
     }
     #[inline(always)]
     unsafe fn interrupts_enable() {
         // SAFETY: IDT/PIC 초기화 완료 이후에만 호출
-        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) }
+        unsafe { cpu::interrupts_enable() }
     }
     #[inline(always)]
     fn wait_for_interrupt() {
@@ -155,14 +155,14 @@ pub struct X86Console;
 
 impl crate::arch::Console for X86Console {
     #[inline(always)]
-    fn write_str(s: &str) {
-        // SAFETY: VGA_BASE 는 부팅 초기 update_base 이후 유효 포인터를 가리킴
+    unsafe fn write_str(s: &str) {
+        // SAFETY: 호출자가 VGA_BASE 유효 초기화 계약을 승계
         //         (release 빌드에서 print 는 no-op 로 축약됨)
         unsafe { vga::print(s.as_bytes(), vga::Color::White) }
     }
     #[inline(always)]
-    fn clear() {
-        // SAFETY: VGA_BASE 유효 포인터 전제 (release 빌드 no-op)
+    unsafe fn clear() {
+        // SAFETY: 호출자가 VGA_BASE 유효 초기화 계약을 승계 (release 빌드 no-op)
         unsafe { vga::clear() }
     }
 }

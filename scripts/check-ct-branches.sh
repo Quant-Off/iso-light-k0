@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Phase 9 SC #8 CT 함수 분기 부재 objdump CI gate (Phase 12 MTRX-05(c) prior art)
-# LTO + opt-level=z 재배치가 CT 함수에 je/jne/jz/jnz 를 재생성하지 않는지 상시 검증 (RESEARCH Pitfall 2)
+# WR-03 LTO + opt-level=z 재배치가 CT 함수에 secret-dependent 조건부 점프(jCC 전수
+# je/jne/jb/ja/jl/jg/js/jc/jo/jp 등)를 재생성하지 않는지 상시 검증 (RESEARCH Pitfall 2)
+# cmov/setCC 는 branchless CT 목표 수단이므로 별도 관측 카운터로 분리 보고 (하드 게이트 아님)
 #
 # 대상 심볼 fragment 쌍 (PLAN 명명 대비 실측 정정 09-01-SUMMARY Deviations 참조)
 #   1) hsm_registry + authenticate  capability 토큰 CT 인증 실구현 (PLAN 의 capability::authenticate 는 미실존 명명)
@@ -38,20 +40,33 @@ find_symbols() {
         | sed -E 's/^[0-9a-f]+ <(.*)>:.*/\1/'; } || true
 }
 
+# secret-dependent 조건부 점프 (jCC) 전수 = 하드 게이트 (0 강제)
+# 부호/무부호 비교 (jb/ja/jl/jg 등) + sign/carry/parity/overflow 분기 포함
+# jmp (무조건 점프) 는 secret-dependent 아니므로 의도적 제외
+JCC_RE='\bj(e|ne|z|nz|b|nb|be|nbe|a|na|ae|l|nl|le|nle|g|ng|ge|s|ns|c|nc|o|no|p|np)\b'
+# cmov / setCC 는 branchless CT 목표 수단이므로 관측 전용 별도 카운터 (하드 게이트 아님)
+CTMOVE_RE='\bcmov[a-z]+\b|\bset[a-z]+\b'
+
 # 심볼 header line (`<sym>:`) 만 anchor 로 사용 call site 텍스트 오매칭 차단
 # awk 조기 exit 의 SIGPIPE 가 pipefail 로 전파되지 않도록 || true 가드
-branch_count() {
+body_of() {
     local sym="$1"
-    local body
-    body=$({ echo "$DISAS" | awk -v sym="$sym" 'index($0, "<" sym ">:") {found=1; next} found && /^$/ {exit} found'; } || true)
-    echo "$body" | grep -cE '\bje\b|\bjne\b|\bjz\b|\bjnz\b' || true
+    { echo "$DISAS" | awk -v sym="$sym" 'index($0, "<" sym ">:") {found=1; next} found && /^$/ {exit} found'; } || true
+}
+
+jcc_count() {
+    echo "$1" | grep -cE "$JCC_RE" || true
+}
+
+ctmove_count() {
+    echo "$1" | grep -cE "$CTMOVE_RE" || true
 }
 
 PASS=true
 
 check_pair() {
     local frag1="$1" frag2="$2" label="$3"
-    local syms sym cnt
+    local syms sym body jcc ctm
     syms=$(find_symbols "$frag1" "$frag2")
     if [ -z "$syms" ]; then
         echo "[CI] FAIL symbol not found ${label} (${frag1} + ${frag2}) LTO 인라이닝 의심 본체 수정 우회 금지 blocker 보고" >&2
@@ -59,12 +74,14 @@ check_pair() {
         return
     fi
     while IFS= read -r sym; do
-        cnt=$(branch_count "$sym" | tr -d '[:space:]')
-        if [ "${cnt:-0}" != "0" ]; then
-            echo "[CI] FAIL ${label} ${sym} je/jne/jz/jnz ${cnt} 건 (CT 분기 재생성 의심)" >&2
+        body=$(body_of "$sym")
+        jcc=$(jcc_count "$body" | tr -d '[:space:]')
+        ctm=$(ctmove_count "$body" | tr -d '[:space:]')
+        if [ "${jcc:-0}" != "0" ]; then
+            echo "[CI] FAIL ${label} ${sym} secret-dependent jCC ${jcc} 건 (CT 분기 재생성 의심)" >&2
             PASS=false
         else
-            echo "[CI]  ok  ${label} ${sym} branch=0"
+            echo "[CI]  ok  ${label} ${sym} jCC=0 (cmov/set=${ctm:-0} 관측 CT 수단)"
         fi
     done <<< "$syms"
 }
@@ -76,13 +93,14 @@ check_pair "constant_time" "CtLess" "ct-primitive"
 OBS_SYMS=$(find_symbols "hsm_attest" "verify_attest")
 if [ -n "$OBS_SYMS" ]; then
     while IFS= read -r sym; do
-        OBS_CNT=$(branch_count "$sym" | tr -d '[:space:]')
-        echo "[CI]  obs verify_attest ${sym} branch=${OBS_CNT:-0} (관측 전용)"
+        OBS_BODY=$(body_of "$sym")
+        OBS_JCC=$(jcc_count "$OBS_BODY" | tr -d '[:space:]')
+        echo "[CI]  obs verify_attest ${sym} jCC=${OBS_JCC:-0} (관측 전용 D-12 입력 독립 분기 합법)"
     done <<< "$OBS_SYMS"
 fi
 
 if $PASS; then
-    echo "[CI] PASS CT 함수 je/jne/jz/jnz 0 확인 (SC #8)"
+    echo "[CI] PASS CT 함수 secret-dependent jCC 0 확인 (SC #8 WR-03 jCC 전수 + cmov/set 관측 분리)"
     exit 0
 fi
 exit 1

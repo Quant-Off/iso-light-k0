@@ -159,10 +159,17 @@ pub trait Idt {
 #[allow(dead_code)]
 pub trait Console {
     /// 문자열 출력.
-    fn write_str(s: &str);
+    ///
+    /// # Safety
+    /// 콘솔 백엔드(x86 VGA base 등)가 유효하게 초기화된 상태에서만 호출해야 함.
+    /// 미초기화 상태 호출은 UB 이므로 safe 표면으로 노출하지 않음.
+    unsafe fn write_str(s: &str);
 
     /// 화면 소거.
-    fn clear();
+    ///
+    /// # Safety
+    /// `write_str` 와 동일하게 콘솔 백엔드 초기화 상태를 호출자가 보장해야 함.
+    unsafe fn clear();
 }
 
 /// Ring 3 최초 진입에 대한 arch-중립 계약.

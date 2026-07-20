@@ -486,6 +486,30 @@ pub fn wait_for_interrupt() {
     }
 }
 
+/// 인터럽트 비활성 (`cli`). 부팅 초기 임계 구역 진입 시 호출.
+///
+/// # Safety
+/// 커널 특권 레벨(Ring 0)에서만 호출하며 임계 구역 종료 시 `interrupts_enable` 로 복구해야 함.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn interrupts_disable() {
+    // SAFETY: cli 는 Ring 0 에서 실행 가능하며 호출자가 interrupts_enable 복구 계약을 승계
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// 인터럽트 활성 (`sti`). IDT/PIC 초기화 완료 후 호출.
+///
+/// # Safety
+/// IDT/벡터 테이블 초기화 완료 후에만 호출해야 함.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn interrupts_enable() {
+    // SAFETY: sti 는 IDT/PIC 초기화 완료 이후에만 호출됨을 호출자가 보장
+    unsafe {
+        core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+    }
+}
+
 //
 // aarch64 스텁
 //

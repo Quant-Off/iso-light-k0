@@ -444,7 +444,7 @@ ci-phase8: check-alloc-zero check-machete check-jitter-lto check-virtio-sentinel
 #   4) check-jitter-lto       Phase 8 standing (ENTR-08 LTO 보호 objdump CI)
 #   5) check-arch-cfg-gate    Phase 9 신규 (HAL-06 cfg(target_arch) src/arch/ 외부 0 수렴 9-C 전 비-0 FAIL 예상)
 #   6) check-ct-branches      Phase 9 신규 (SC #8 CT 함수 je/jne/jz/jnz 0 objdump Phase 12 MTRX-05(c) prior art)
-#   7) check-secure-zero      Phase 9 신규 (HAL-05 memset U-entry 0 + secure_zero 심볼 nm)
+#   7) check-secure-zero      Phase 9 신규 (HAL-05 memset U-entry 0 + k0_secure_zero 심볼 nm)
 #   8) check-body-untouched   Phase 9 신규 (HAL-04 본체 diff-stat 2-tier base=scripts/phase9-base-commit)
 #   9) check-mmu-typestate    Phase 9 신규 (HAL-07 Mmu typestate E0599 음성 probe)
 #  10) qemu-smoke             Phase 1 standing (macOS 차단 시 Linux+KVM lane 이연 Phase 8 선례)

@@ -22,8 +22,10 @@ static mut BOOT_INFO: BootInfo = BootInfo::empty();
 ///
 /// boot_stub 의 `.Lkernel_entry` 간접 점프 대상으로 RDI = mb2_addr (mb2 info 물리
 /// 주소) 를 수신한다. 파싱 실패 시 기존 fail-safe(`unwrap_or_else(empty)`) 동작을
-/// lossless 이식하며 그 밖의 BootInfo 필드는 empty 초기값을 유지한다 (신규 파싱
-/// 로직 0, Security Domain V5). 이후 `crate::_kernel_start(&BootInfo)` 로 합류한다.
+/// lossless 이식하며 memory_map 과 kaslr_offset 을 채운다 (신규 파싱 로직 0 기존
+/// parse_multiboot2 / parse_kaslr_offset 재사용, Security Domain V5). 나머지
+/// BootInfo 필드는 empty 초기값을 유지한다. 이후 `crate::_kernel_start(&BootInfo)`
+/// 로 합류한다.
 ///
 /// # Safety
 /// boot_stub 이 부팅 초기 단일 코어 identity mapping 상태에서 RDI 규약으로만
@@ -35,6 +37,9 @@ pub extern "C" fn _boot_adapter_mb2(mb2_addr: u64) -> ! {
     unsafe {
         (*(&raw mut BOOT_INFO)).memory_map =
             parse_multiboot2(mb2_addr).unwrap_or_else(|_| MemoryMap::empty());
+        // KASLR 물리맵 오프셋 태그 파싱 배선 복원 어댑터가 allocator init 이전에
+        // 실행되므로 mb2 info 영역이 온전하며 태그 부재 시 0(미제공) 을 채움
+        (*(&raw mut BOOT_INFO)).kaslr_offset = parse_kaslr_offset(mb2_addr).unwrap_or(0);
         crate::_kernel_start(&*(&raw const BOOT_INFO))
     }
 }
@@ -202,12 +207,12 @@ struct Mb2KaslrTag {
 /// 태그가 없거나 정렬 요건을 만족하지 않으면 `None` 반환.
 /// 호출자는 `None` 수신 시 `Mmu::initialize(None)`으로 기본값을 사용해야 함.
 ///
-/// 현재 boot 어댑터는 본 태그를 배선하지 않으며 `BootInfo::kaslr_offset` 은
-/// 0 (미제공) 으로 유지됨. 실사용 배선은 Phase 11 (LIVE-09) 에서 채운다.
+/// `_boot_adapter_mb2` 가 부팅 1회 호출하여 `BootInfo::kaslr_offset` 을 채운다.
+/// 표준 grub-mkrescue ISO 는 본 커스텀 태그를 방출하지 않으므로 런타임 값은
+/// 통상 `None`(0) 이며 부트로더가 태그를 삽입한 경우에만 오프셋이 흐른다.
 ///
 /// # Safety
 /// `parse_multiboot2()`와 동일한 전제 조건 적용.
-#[allow(dead_code)]
 pub unsafe fn parse_kaslr_offset(info_addr: u64) -> Option<u64> {
     if info_addr == 0 || info_addr & 7 != 0 {
         return None;

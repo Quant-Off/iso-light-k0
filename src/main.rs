@@ -227,7 +227,7 @@ pub extern "C" fn _kernel_start(boot_info: &'static crate::boot::BootInfo) -> ! 
     // boot_stub._start에서 cli를 실행했지만, 64-bit 진입 후에도 명시적으로 보장
     // SAFETY: GDT/IDT 설정 전, 인터럽트 비활성화 안전
     unsafe {
-        core::arch::asm!("cli", options(nostack, preserves_flags));
+        crate::arch::active::cpu::interrupts_disable();
     }
 
     //
@@ -353,8 +353,8 @@ pub extern "C" fn _kernel_start(boot_info: &'static crate::boot::BootInfo) -> ! 
             vga::Color::Green,
         );
     }
-    // kaslr_offset 은 mb2 어댑터가 배선하지 않으므로 0(미제공) -> None
-    // 실사용 KASLR 배선은 Phase 11 (LIVE-09) 에서 채움
+    // kaslr_offset 은 mb2 어댑터(_boot_adapter_mb2)가 parse_kaslr_offset 로 배선함
+    // 태그 부재 시 0(미제공) -> None 부트로더가 KASLR 태그 삽입 시에만 Some
     let kaslr_offset: Option<u64> = if boot_info.kaslr_offset == 0 {
         None
     } else {
@@ -787,7 +787,7 @@ pub extern "C" fn _kernel_start(boot_info: &'static crate::boot::BootInfo) -> ! 
     // IDT, GDT, TSS, PIC 초기화 완료 후 STI로 인터럽트 수신 시작
     // SAFETY: IDT/GDT/TSS/PIC/IPC 초기화 완료, 이제 인터럽트 수신 안전
     unsafe {
-        core::arch::asm!("sti", options(nostack, preserves_flags));
+        crate::arch::active::cpu::interrupts_enable();
         vga::println(b"[iso-light-k0] All Task Done.", vga::Color::Green);
     }
 
@@ -2124,9 +2124,6 @@ unsafe fn gap_phase6_smoke_test() {
 /// TODO: IPC 수신 큐 처리, Capability 검증, 스케줄러 연동
 fn kernel_main_loop() -> ! {
     loop {
-        // SAFETY: hlt는 다음 인터럽트 발생 시 재개되는 안전한 CPU 대기 명령어
-        unsafe {
-            core::arch::asm!("hlt", options(nostack, preserves_flags));
-        }
+        crate::arch::active::cpu::wait_for_interrupt();
     }
 }

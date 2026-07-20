@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Phase 9 HAL-05 nm 게이트 (a) memset U-entry 0 (b) secure_zero 심볼 존재 (T 또는 t)
-# Task 3 (secure_zero 구현) 전에는 (b) FAIL 이 예상 상태
+# Phase 9 HAL-05 nm 게이트 (a) memset U-entry 0 (b) k0_secure_zero 심볼 존재 (T 또는 t)
+# WR-06 zeroize::secure_zero 와 심볼 충돌 회피 위해 커널 raw buffer 소거 심볼을
+# k0_ 접두어로 개명 nm 게이트도 동기 갱신함
 set -euo pipefail
 
 KERNEL_BIN="${KERNEL_BIN:-target/x86_64-unknown-none/release/iso-light-k0}"
 
 if [ ! -f "$KERNEL_BIN" ]; then
-    echo "[CI] FAIL secure_zero 검증용 release 바이너리 미존재 $KERNEL_BIN" >&2
+    echo "[CI] FAIL k0_secure_zero 검증용 release 바이너리 미존재 $KERNEL_BIN" >&2
     echo "       먼저 make build-rel 실행" >&2
     exit 1
 fi
@@ -34,18 +35,18 @@ if [ "${MEMSET_U:-0}" != "0" ]; then
     FAIL_REASONS+=("memset U-entry ${MEMSET_U} 건 검출 (외부 memset 링크 금지)")
 fi
 
-# (b) secure_zero 심볼 존재 (T 또는 t) 검증
-if ! $NM_CMD "$KERNEL_BIN" 2>/dev/null | grep -qE " [Tt] secure_zero"; then
+# (b) k0_secure_zero 심볼 존재 (T 또는 t) 검증
+if ! $NM_CMD "$KERNEL_BIN" 2>/dev/null | grep -qE " [Tt] k0_secure_zero"; then
     PASS=false
-    FAIL_REASONS+=("secure_zero 심볼 미존재 (#[inline(never)] + #[unsafe(no_mangle)] 확인 필요)")
+    FAIL_REASONS+=("k0_secure_zero 심볼 미존재 (#[inline(never)] + #[unsafe(no_mangle)] 확인 필요)")
 fi
 
 if $PASS; then
-    echo "[CI] PASS secure_zero 심볼 존재 + memset U-entry 0 (HAL-05)"
+    echo "[CI] PASS k0_secure_zero 심볼 존재 + memset U-entry 0 (HAL-05)"
     exit 0
 fi
 
-echo "[CI] FAIL HAL-05 secure_zero nm 게이트" >&2
+echo "[CI] FAIL HAL-05 k0_secure_zero nm 게이트" >&2
 for r in "${FAIL_REASONS[@]}"; do
     echo "  - $r" >&2
 done
