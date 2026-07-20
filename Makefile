@@ -108,7 +108,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external check-machete ci-phase7 ci-phase8 check-jitter-lto check-virtio-sentinel check-entropy-mutex qemu-tcg qemu-kvm entropy-host-test
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external check-machete ci-phase7 ci-phase8 check-jitter-lto check-virtio-sentinel check-entropy-mutex qemu-tcg qemu-kvm entropy-host-test check-arch-cfg-gate check-ct-branches check-secure-zero check-body-untouched check-mmu-typestate ci-phase9
 
 all: iso
 
@@ -433,3 +433,40 @@ qemu-kvm: qemu-smoke-smoke
 
 ci-phase8: check-alloc-zero check-machete check-jitter-lto check-virtio-sentinel qemu-kvm qemu-tcg
 	@echo "[CI] Phase 8 ci 게이트 전체 통과 (ENTR-01..ENTR-08 + 13 marker PASS)"
+
+#
+# Phase 9 CI 게이트 (HAL-01..HAL-09 종료 게이트)
+#
+# 10-leg 구조
+#   1) check-alloc-zero       Phase 1 standing (BSS 가산 회귀)
+#   2) check-machete          Phase 7 standing (dead-dep 가드)
+#   3) check-entropy-mutex    Phase 8 standing (ENTR-05 compile_error mutex)
+#   4) check-jitter-lto       Phase 8 standing (ENTR-08 LTO 보호 objdump CI)
+#   5) check-arch-cfg-gate    Phase 9 신규 (HAL-06 cfg(target_arch) src/arch/ 외부 0 수렴 9-C 전 비-0 FAIL 예상)
+#   6) check-ct-branches      Phase 9 신규 (SC #8 CT 함수 je/jne/jz/jnz 0 objdump Phase 12 MTRX-05(c) prior art)
+#   7) check-secure-zero      Phase 9 신규 (HAL-05 memset U-entry 0 + secure_zero 심볼 nm)
+#   8) check-body-untouched   Phase 9 신규 (HAL-04 본체 diff-stat 2-tier base=scripts/phase9-base-commit)
+#   9) check-mmu-typestate    Phase 9 신규 (HAL-07 Mmu typestate E0599 음성 probe)
+#  10) qemu-smoke             Phase 1 standing (macOS 차단 시 Linux+KVM lane 이연 Phase 8 선례)
+#
+check-arch-cfg-gate:
+	@bash scripts/check-arch-cfg-gate.sh
+
+check-ct-branches: build-rel
+	@bash scripts/check-ct-branches.sh
+
+check-secure-zero: build-rel
+	@bash scripts/check-secure-zero.sh
+
+check-body-untouched:
+	@bash scripts/check-body-untouched.sh
+
+# Phase 9 HAL-07 Mmu typestate 음성 probe 게이트
+# E0599 grep 성공 = 잘못된 typestate 호출이 컴파일 거부됨 (check-entropy-mutex 패턴 변형)
+check-mmu-typestate:
+	@$(CARGO) check --target $(TARGET) --features mmu-typestate-probe 2>&1 | grep -q "E0599" \
+	    || (echo "[CI] FAIL HAL-07 Mmu typestate E0599 미검출" && exit 1)
+	@echo "[CI] PASS HAL-07 Mmu typestate activate 오호출 컴파일 거부 확인"
+
+ci-phase9: check-alloc-zero check-machete check-entropy-mutex check-jitter-lto check-arch-cfg-gate check-ct-branches check-secure-zero check-body-untouched check-mmu-typestate qemu-smoke
+	@echo "[CI] Phase 9 ci 게이트 전체 통과 (HAL standing + 신규 5 leg PASS)"

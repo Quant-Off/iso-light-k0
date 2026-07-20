@@ -18,6 +18,9 @@ entropy-degraded-ok = []
 # Phase 8 BLOCKER-5 구조 feature 기본 ON 커널 산출물 영향 0
 # host test (`--no-default-features`) 시 kernel bin 을 빌드 대상에서 제외
 kernel-bin = []
+# Phase 9 HAL-07 Mmu typestate 음성 컴파일 probe 전용 production 빌드 미포함
+# check-mmu-typestate leg 가 E0599 컴파일 거부를 grep 검증
+mmu-typestate-probe = []
 
 # Phase 5.1 D-01 trust root dual-path build.rs 가 K0_TRUST_ROOT_KEYSTORE env →
 # cargo:rustc-cfg=k0_trust_root_keystore 노출 (Rust 1.80+ unexpected_cfgs lint 명시)
