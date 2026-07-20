@@ -24,7 +24,6 @@
 //! # Authors
 //! Q. T. Felix
 
-use crate::boot::{USER_CS, USER_DS};
 use crate::elf::{self, Elf64Image, ProgramHeader};
 use crate::mmu::{self, AddressSpace, PAGE_SIZE, PageTableFlags};
 use crate::stack;
@@ -495,41 +494,15 @@ unsafe fn load_segment(
 pub unsafe fn enter_ring3(pid: ProcessId) -> ! {
     let p = match get(pid) {
         Some(p) => p,
-        None => loop {
-            // SAFETY: 잘못된 pid → 즉시 정지 (방어적 fail-stop)
-            unsafe {
-                core::arch::asm!("cli", "hlt", options(nostack, preserves_flags));
-            }
-        },
+        // 잘못된 pid -> 즉시 정지 (방어적 fail-stop)
+        None => crate::arch::active::cpu::halt_loop(),
     };
     let cr3 = p.pml4_phys;
     let rip = p.entry_rip;
     let rsp = p.user_rsp;
 
-    // SAFETY: 아래 asm 블록은 단일 atomic 시퀀스로 CR3 적재 → swapgs →
-    //         iretq 순으로 실행. 사이에 어떤 high-level 연산도 끼지 않음.
-    //         iretq 는 RFLAGS = 0x202 (IF=1, reserved=1) 와 CS:RIP, SS:RSP 를
-    //         적재하여 Ring 3 으로 권한 강하.
-    unsafe {
-        core::arch::asm!(
-            // 1. 사용자 PML4 활성화
-            "mov cr3, {cr3}",
-            // 2. swapgs: 커널 GS=&PerCpu → KERNEL_GS_BASE,
-            //            KERNEL_GS_BASE(=0) → GS_BASE (사용자 GS=0)
-            "swapgs",
-            // 3. iretq 스택 frame: 역순 push (SS, RSP, RFLAGS, CS, RIP)
-            "push {ss}",
-            "push {rsp}",
-            "push 0x202",                       // RFLAGS = IF=1 + bit1
-            "push {cs}",
-            "push {rip}",
-            "iretq",
-            cr3 = in(reg) cr3,
-            ss  = in(reg) USER_DS as u64,
-            cs  = in(reg) USER_CS as u64,
-            rsp = in(reg) rsp,
-            rip = in(reg) rip,
-            options(noreturn),
-        );
-    }
+    // SAFETY: cr3 적재 -> swapgs -> iretq 단일 atomic 시퀀스는 arch 표면
+    //         (process_entry::enter_user) 으로 추출됨. 호출자가 enter_ring3 의
+    //         안전 계약 (Loaded 상태 + syscall/tss 설치 완료) 을 그대로 승계함.
+    unsafe { crate::arch::active::process_entry::enter_user(cr3, rip, rsp) }
 }

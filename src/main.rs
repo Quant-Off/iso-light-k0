@@ -10,10 +10,13 @@
 
 pub mod allocator;
 pub mod arch; // Phase 8: arch 디렉토리 골격 (D-01 Forward) + entropy 서브트리
+// Phase 9 9-A/9-B HAL-04 ISA 의존 모듈은 src/arch/x86_64/ 로 이동하고 명시 목록 re-export 로 본체 경로 보존 (OQ6)
+pub use crate::arch::active::{boot_stub, cpu, gdt, idt, mmu, syscall, tss, vga};
+// Phase 9 9-C 펌웨어-중립 boot 계층 (BootInfo + multiboot2/uefi 어댑터, HAL-08)
 pub mod boot;
-pub mod boot_stub; // Multiboot2 헤더 + 32-bit 부팅 스텁 (global_asm)
+// 중립 메모리맵 타입은 boot 계층으로 2차 이동됨 crate::memory_map 경로는 별칭으로 보존 (allocator 본체 무변경)
+pub use crate::boot::memory_map;
 pub mod capability; // Capability-based Access Control
-pub mod cpu; // CPU 특수 레지스터 / SIMD·FPU 컨텍스트 활성화
 pub mod crypto_service; // EP_CRYPTO 엔드포인트 암호화 서비스 디스패처
 pub mod sign_service;   // EP_SIGN 엔드포인트 ML-DSA PQ 서명 서비스
 pub mod elf; // ELF64 정적 실행 파일 파서
@@ -22,20 +25,12 @@ pub mod hsm_registry; // Phase 1: HSM 멀티 슬롯 레지스트리 (capability-
 pub mod hsm_attest; // Phase 5: ML-DSA-44 attest verifier + AUDIT_RING + ATTEST_BUF
 pub mod air_gap; // Phase 6: air-gap 이중 게이트 + sys_hsm_status + 2 층 self-check
 pub mod bus; // Phase 2: 외부 버스 드라이버 추상화 (BusDriver trait + enum-dispatch)
-pub mod idt;
 pub mod ipc; // IPC 메시지 패싱 (동기 rendezvous)
 pub mod keystore; // 소프트 PSK 키 저장소 (HSM 폴백)
-pub mod memory_map;
-pub mod mmu;
 mod panic;
-#[cfg(target_arch = "x86_64")]
 pub mod process; // 정적 프로세스 슬롯 + Ring 3 진입
 pub mod stack; // 커널 스택 + 가드 페이지 레이아웃
-#[cfg(target_arch = "x86_64")]
-pub mod syscall; // syscall/sysret 사용자 ↔ 커널 진입 경로
 pub mod tls; // TLS 1.3 PSK (psk_dhe_ke / psk_pq_hybrid_ke)
-pub mod tss;
-pub mod vga;
 // 보안 메모리 소거는 외부 `zeroize` 크레이트(elib-k0-nt) 사용
 
 use mmu::{AddressSpace, KERNEL_VMA_BASE, Mmu, PageTableFlags, Uninitialized};
@@ -225,12 +220,11 @@ fn format_jitter_dump_line<'a>(buf: &'a mut [u8; 600], data: &[u8], line_idx: u8
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
+pub extern "C" fn _kernel_start(boot_info: &'static crate::boot::BootInfo) -> ! {
     //
     // 1. 인터럽트 재확인 비활성화
     //
     // boot_stub._start에서 cli를 실행했지만, 64-bit 진입 후에도 명시적으로 보장
-    #[cfg(target_arch = "x86_64")]
     // SAFETY: GDT/IDT 설정 전, 인터럽트 비활성화 안전
     unsafe {
         core::arch::asm!("cli", options(nostack, preserves_flags));
@@ -255,7 +249,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // #UD 없이 실행되도록 x87/SSE, 가능 시 AVX를 활성화함
     // IDT 설치 전에 수행해도 되지만, 치명 예외 발생 시 fatal_halt로 떨어지도록
     // IDT 설치 직후에 한 번 더 상태를 확정함 (아래 4단계 직후 finalize)
-    #[cfg(target_arch = "x86_64")]
     // SAFETY: 단일 코어, CLI 상태에서 CR0/CR4/XCR0 MSR 조작
     unsafe {
         cpu::enable_simd_fpu();
@@ -279,7 +272,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     //
     // 2. TSS 초기화 (#DF IST 스택 설정)
     //
-    #[cfg(target_arch = "x86_64")]
     // SAFETY: 인터럽트 비활성화 상태, 단일 코어 부팅 초기
     unsafe {
         vga::println(b"[iso-light-k0] TSS Init...", vga::Color::Green);
@@ -291,18 +283,16 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // 3. GDT 초기화 + TSS 등록 + LTR
     //
     // boot_stub의 boot_gdt64를 Rust 커널 GDT(+ TSS)로 교체함
-    #[cfg(target_arch = "x86_64")]
     // SAFETY: CLI 상태, TSS 초기화 완료, KERNEL_GDT 유효
     unsafe {
         vga::println(b"[iso-light-k0] GDT Init & Apply TSS...", vga::Color::Green);
-        boot::init_gdt(tss::base_addr(), tss::limit());
+        gdt::init_gdt(tss::base_addr(), tss::limit());
         vga::println(b"[iso-light-k0] Done.", vga::Color::Green);
     }
 
     //
     // 4. IDT 초기화 + 8259 PIC 재매핑 + LIDT
     //
-    #[cfg(target_arch = "x86_64")]
     // SAFETY: CLI 상태, GDT/TSS 로드 완료
     unsafe {
         vga::println(b"[iso-light-k0] IDT Init...", vga::Color::Green);
@@ -313,7 +303,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     //
     // 4.5. SIMD/FPU 최종 확정 (예외 핸들러 가용 상태에서 재검증)
     //
-    #[cfg(target_arch = "x86_64")]
     // SAFETY: IDT가 로드된 이후이므로 XSETBV가 GP를 일으키면 #GP 핸들러로 진입 가능
     unsafe {
         cpu::finalize_simd_fpu();
@@ -325,7 +314,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // CR0.WP, CR4.SMEP/SMAP/UMIP, IA32_EFER.SCE 를 한 번에 켜서 Ring 3
     // 사용자 프로세스가 진입하기 전에 격리 경계를 확립함.
     // SAFETY: enable_simd_fpu() 로 CpuFeatures 가 캐싱됨, IDT 활성, CLI 상태
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         cpu::enable_security_bits();
         vga::println(
@@ -341,7 +329,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // RSP0 는 부트 스택 최상단(boot_stack_top) 으로 설정 — 인터럽트가 사용자
     // 모드에서 발생하면 자동으로 본 RSP 가 적재됨. syscall stub 은 GS-relative
     // 로 동일 값을 사용함.
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         let (_, kstack_top) = stack::boot_stack_range();
         // 16-byte 정렬 — System V x86_64 ABI 요구사항
@@ -355,38 +342,35 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     }
 
     //
-    // 5. Multiboot2 메모리 맵 파싱
+    // 5. BootInfo 메모리 맵 소비 (파싱은 boot 어댑터가 수행 완료)
     //
-    // mb2_addr은 _kernel_start의 매개변수(RDI)로 안전하게 전달됨
-    // boot_stub._start에서 ESI에 저장했고, _start64에서 RDI로 복사함
-    #[cfg(target_arch = "x86_64")]
-    let memory_map = unsafe {
+    // 어댑터(_boot_adapter_mb2)가 mb2 핸드오프를 파싱해 boot_info.memory_map 을
+    // 채운 뒤 진입시켰으므로 _kernel_start 는 펌웨어-중립 참조만 소비함 (신규 파싱 0)
+    let memory_map = &boot_info.memory_map;
+    unsafe {
         vga::println(
-            b"[iso-light-k0] Multiboot2 Memory Map Parsing(1/2)...",
+            b"[iso-light-k0] BootInfo Memory Map Consumed.",
             vga::Color::Green,
         );
-        memory_map::parse_multiboot2(mb2_addr).unwrap_or_else(|_| memory_map::MemoryMap::empty())
-    };
-    #[cfg(target_arch = "x86_64")]
-    let kaslr_offset: Option<u64> = unsafe {
-        vga::println(
-            b"[iso-light-k0] Multiboot2 Memory Map Parsing(2/2)...",
-            vga::Color::Green,
-        );
-        memory_map::parse_kaslr_offset(mb2_addr)
+    }
+    // kaslr_offset 은 mb2 어댑터가 배선하지 않으므로 0(미제공) -> None
+    // 실사용 KASLR 배선은 Phase 11 (LIVE-09) 에서 채움
+    let kaslr_offset: Option<u64> = if boot_info.kaslr_offset == 0 {
+        None
+    } else {
+        Some(boot_info.kaslr_offset)
     };
 
     //
     // 6. 물리 프레임 할당자 초기화
     //
     // SAFETY: 부팅 초기 단일 코어, MMU 활성화 전
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         vga::println(
             b"[iso-light-k0] Physic Frame Allocator Init...",
             vga::Color::Green,
         );
-        allocator::init(&memory_map);
+        allocator::init(memory_map);
 
         //
         // (a) 하위 1 MiB 예약: BIOS/VGA/IVT 영역
@@ -415,12 +399,11 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
         allocator::mark_used(0x100000, phys_end_aligned - 0x100000);
 
         //
-        // (c) Multiboot2 info 구조체 보호
+        // (c) 펌웨어 핸드오프(mb2 info) 구조체는 boot 어댑터가 이미 전량 소비했음
         //
-        // total_size는 헤더 첫 4바이트; 4KiB 올림으로 안전하게 예약
-        let mb2_total = (mb2_addr as *const u32).read() as u64;
-        let mb2_size_aligned = (mb2_total + 0xFFF) & !0xFFF;
-        allocator::mark_used(mb2_addr, mb2_size_aligned);
+        // 파싱 결과가 BootInfo(커널 .bss, (b) 로 이미 보호됨)로 복사되었으므로
+        // 원본 mb2 info 영역은 더 이상 참조되지 않는다. 펌웨어-중립 _kernel_start
+        // 는 mb2_addr 을 보유하지 않으며 죽은 핸드오프 영역의 별도 예약은 불필요함
 
         vga::println(b"[iso-light-k0] Done.", vga::Color::Green);
     }
@@ -428,9 +411,7 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     //
     // 7. MMU Typestate 초기화 + KASLR 오프셋 주입
     //
-    #[cfg(target_arch = "x86_64")]
     let mmu: Mmu<Uninitialized> = Mmu::new();
-    #[cfg(target_arch = "x86_64")]
     let mmu_init = mmu.initialize(kaslr_offset);
 
     unsafe {
@@ -444,9 +425,7 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // 8. 직접 선형 매핑 구축
     //
     // SAFETY: 부팅 초기 단일 코어, KERNEL_ADDR_SPACE 단독 접근
-    #[cfg(target_arch = "x86_64")]
     let kernel_space = unsafe { &mut *(&raw mut KERNEL_ADDR_SPACE) };
-    #[cfg(target_arch = "x86_64")]
     let _ = mmu_init.build_linear_map(kernel_space, memory_map.highest_addr());
 
     unsafe {
@@ -474,7 +453,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // 물리 주소: phys = VMA - KERNEL_VMA_BASE  (linker.ld 보장)
     // phys는 boot_page_table의 identity map(PML4[0]) 범위에 있으므로
     // alloc_or_get_table이 할당한 중간 테이블 프레임도 정상 접근 가능
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         let text_start = (&raw const _text_start) as u64;
         let rodata_start = (&raw const _rodata_start) as u64;
@@ -537,7 +515,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     //
     // 현재는 부트 페이지 테이블 identity map(0xB8000)으로 VGA 를 계속 사용함
     // TODO: activate() 구현 시 아래 주석 해제
-    #[cfg(target_arch = "x86_64")]
     let _vga_virt = unsafe { mmu_init.phys_to_virt_mut::<u16>(0xB8000) };
     // unsafe { vga::update_base(_vga_virt); }  <- activate() 직후에 활성화
 
@@ -570,7 +547,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // HashDRBGSHA256 을 인스턴스화함. 이후 Capability 토큰 생성은 모두
     // 이 DRBG 를 통해 이루어짐 (구 XOR-shift PRNG 는 완전히 제거됨)
     // SAFETY: cpu::enable_simd_fpu() 완료 후 단일 코어에서 최초 1회 호출
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         // (1) virtio-rng PCI probe 부팅 시 1 회
         // SAFETY BSP single-core boot MMU identity map 가정
@@ -677,7 +653,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // Phase 5 ENROLL D-01 D-09 부팅 시 1 회 신뢰 루트 dual-path 초기화 + BOOT_CHALLENGE 생성
     // capability::init_prng 직후 + ipc::init 직전 위치 BOOT_CHALLENGE 생성은 CAP_DRBG 만 의존
     // SAFETY 단일 코어 부팅 초기 capability::init_prng 완료 가정
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         hsm_attest::init_trust_root();
         vga::println(
@@ -689,7 +664,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // Phase 6 GAP D-02 D-06 부팅 시 1 회 NETWORK_ATTACH + AUDIT_READ cap mint (양 프로필 공통 + cfg)
     // 호출 위치 hsm_attest::init_trust_root 직후 capability::init_prng + init_trust_root 완료 가정
     // SAFETY 단일 코어 부팅 초기 BSP single-core invariant 양 init_*_cap 의 단일 진입 갱신
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         air_gap::init_audit_read_cap();
         vga::println(
@@ -811,7 +785,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // 15. 인터럽트 활성화 + 커널 메인 이벤트 루프
     //
     // IDT, GDT, TSS, PIC 초기화 완료 후 STI로 인터럽트 수신 시작
-    #[cfg(target_arch = "x86_64")]
     // SAFETY: IDT/GDT/TSS/PIC/IPC 초기화 완료, 이제 인터럽트 수신 안전
     unsafe {
         core::arch::asm!("sti", options(nostack, preserves_flags));
@@ -821,7 +794,6 @@ pub extern "C" fn _kernel_start(mb2_addr: u64) -> ! {
     // Phase 6 GAP D-07 Layer 2 self-check 모든 init + syscall::install + dispatcher arm 등록 직후
     // 호출 위치 syscall::install (L226) 후 + try_spawn_user 진입 전 정확한 fail-stop 경계
     // SAFETY 모든 init_* + STAR/LSTAR MSR 등록 완료 Ring 3 진입 이전 단일 코어
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         air_gap::gap_self_check();
         vga::println(b"[iso-light-k0] gap_self_check OK.", vga::Color::Green);
@@ -2152,16 +2124,9 @@ unsafe fn gap_phase6_smoke_test() {
 /// TODO: IPC 수신 큐 처리, Capability 검증, 스케줄러 연동
 fn kernel_main_loop() -> ! {
     loop {
-        #[cfg(target_arch = "x86_64")]
         // SAFETY: hlt는 다음 인터럽트 발생 시 재개되는 안전한 CPU 대기 명령어
         unsafe {
             core::arch::asm!("hlt", options(nostack, preserves_flags));
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: wfi는 다음 인터럽트 발생 시 재개되는 안전한 대기 명령어
-        unsafe {
-            core::arch::asm!("wfi", options(nostack, preserves_flags));
         }
     }
 }

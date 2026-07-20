@@ -16,7 +16,7 @@
 
 use core::mem::size_of;
 
-use crate::boot::KERNEL_CS;
+use crate::arch::x86_64::gdt::KERNEL_CS;
 use crate::tss::{IST_DOUBLE_FAULT, IST_MACHINE_CHECK, IST_NMI, IST_PAGE_FAULT};
 #[cfg(debug_assertions)]
 use crate::vga;

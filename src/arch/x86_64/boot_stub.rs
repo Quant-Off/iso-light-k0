@@ -235,18 +235,19 @@ global_asm!(
            32-bit ESI -> EDI 이동: RAX 상위 32-bit 자동 0-확장 -> 올바른 RDI */
         mov edi, esi
 
-        /* Higher-Half _kernel_start로 간접 점프
-           _kernel_start VMA = 0xFFFFFFFF80XXXXXX (64-bit, 32-bit 범위 초과)
+        /* Higher-Half 펌웨어-중립 어댑터(_boot_adapter_mb2)로 간접 점프
+           어댑터 VMA = 0xFFFFFFFF80XXXXXX (64-bit, 32-bit 범위 초과)
            -> direct call/jmp 불가 (상대 오프셋 32-bit 범위 초과)
-           -> .Lkernel_entry에서 64-bit 절대 주소를 로드하여 간접 점프 */
+           -> .Lkernel_entry에서 64-bit 절대 주소를 로드하여 간접 점프
+           어댑터가 RDI(mb2 info)로 파싱 후 _kernel_start(&BootInfo)로 합류함 */
         mov rax, qword ptr [rip + .Lkernel_entry]
-        jmp rax                     /* _kernel_start -> ! (never returns) */
+        jmp rax                     /* _boot_adapter_mb2 -> ! (never returns) */
 
-    /* _kernel_start의 64-bit 절대 VMA (R_X86_64_64 릴로케이션, -no-pie 허용) */
+    /* _boot_adapter_mb2의 64-bit 절대 VMA (R_X86_64_64 릴로케이션, -no-pie 허용) */
     .Lkernel_entry:
-        .quad _kernel_start
+        .quad _boot_adapter_mb2
 
-    /* 안전장치: _kernel_start가 반환될 경우 (발생하면 안 됨) */
+    /* 안전장치: 어댑터가 반환될 경우 (발생하면 안 됨) */
     .Lhalt64:
         cli
         hlt

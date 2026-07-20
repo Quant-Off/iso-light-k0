@@ -16,9 +16,9 @@ scope: src/*.rs (30 파일 14,583 lines) — Plan 01 raw evidence 17 행 (E-01..
 
 `07-CONTEXT.md` §Claude's Discretion 의 "G3 의 dispatch 표면 범위" 항목을 본 plan 이 **4 축 합집합**(intersection 아님) 으로 해소한다. 근거는 `07-02-PLAN.md` L47 — D-04 narrow 정의("dispatch table / match arm 에 이름별로 명시 등록")가 4 축 어디서나 발생 가능하므로 합집합이 자연스러운 보존적 선택이고, intersection 은 syscall-only stub 같은 false negative 위험을 만든다.
 
-### Axis 1: Ring 3 syscall (src/syscall.rs SyscallNum)
+### Axis 1: Ring 3 syscall (src/arch/x86_64/syscall.rs SyscallNum)
 
-`src/syscall.rs:127-172` 의 `SyscallNum` enum 카탈로그 (17 변종):
+`src/arch/x86_64/syscall.rs:127-172` 의 `SyscallNum` enum 카탈로그 (17 변종):
 
 ```rust
 #[repr(u64)]
@@ -45,7 +45,7 @@ pub enum SyscallNum {
 }
 ```
 
-`src/syscall.rs:335-362` 의 `dispatch()` 함수 match arm 매핑 (이름별 명시 등록):
+`src/arch/x86_64/syscall.rs:335-362` 의 `dispatch()` 함수 match arm 매핑 (이름별 명시 등록):
 
 | variant | dispatch entry (match arm) | resolves to |
 |---------|---------------------------|-------------|
@@ -109,9 +109,9 @@ pub enum WireCmd {
 
 세 entry 모두 in-src 호출자 ≥ 1 이므로 IPC 표면 자체가 orphan 은 아니다.
 
-### Axis 4: IDT (src/idt.rs handler vector)
+### Axis 4: IDT (src/arch/x86_64/idt.rs handler vector)
 
-`src/idt.rs:583-723` 의 `init_idt()` 가 등록하는 IDT 256 슬롯 (이름별 명시 등록 vs. default fill):
+`src/arch/x86_64/idt.rs:583-723` 의 `init_idt()` 가 등록하는 IDT 256 슬롯 (이름별 명시 등록 vs. default fill):
 
 | IDT vector | dispatch entry (이름별 등록 핸들러) | resolves to |
 |-----------|--------------------------------------|-------------|
@@ -154,11 +154,11 @@ Plan 01 의 17 raw evidence 행 (E-01..E-17) 전수 매핑. 추적은 **unbounde
 
 | E-NN | file:lines | axis | dispatch entry | resolves to | orphan? |
 |------|-----------|------|----------------|-------------|---------|
-| E-01 | src/idt.rs:233 | IDT | `IDT[0x20] irq0_handler` (L681) AND `IDT[0x21..0x27] irq_default_handler` (L685) | `pic_eoi_master` (call sites idt.rs:549, idt.rs:557) | no (reachable via IDT IRQ0..7 벡터, depth=2; cycle 부재) |
-| E-02 | src/idt.rs:247 | IDT | `IDT[0x28..0x2F] irq_slave_default_handler` (L691) | `pic_eoi_slave` (call site idt.rs:565) | no (reachable via IDT IRQ8..15 벡터, depth=2) |
-| E-03 | src/idt.rs:265 | none | (no IDT slot, no `set_handler` call, no in-src caller after unbounded trace) | `enable_irq` 본문 (PIC mask 해제 helper) | orphan-handler (G4 verdict consistent) |
+| E-01 | src/arch/x86_64/idt.rs:233 | IDT | `IDT[0x20] irq0_handler` (L681) AND `IDT[0x21..0x27] irq_default_handler` (L685) | `pic_eoi_master` (call sites idt.rs:549, idt.rs:557) | no (reachable via IDT IRQ0..7 벡터, depth=2; cycle 부재) |
+| E-02 | src/arch/x86_64/idt.rs:247 | IDT | `IDT[0x28..0x2F] irq_slave_default_handler` (L691) | `pic_eoi_slave` (call site idt.rs:565) | no (reachable via IDT IRQ8..15 벡터, depth=2) |
+| E-03 | src/arch/x86_64/idt.rs:265 | none | (no IDT slot, no `set_handler` call, no in-src caller after unbounded trace) | `enable_irq` 본문 (PIC mask 해제 helper) | orphan-handler (G4 verdict consistent) |
 | E-04 | src/keystore.rs:38 | none | (const 데이터, not a function) | `TRUST_ROOT_PSK_SLOT: u8 = 0xFE` | data-only (G2 documented future-purpose; orphan 분석 N/A) |
-| E-05 | src/vga.rs:20 | none | (enum 타입 — variants 중 일부는 사용, 일부는 미사용) | `Color` enum (Blue/Magenta/Brown 3 variants 사용 0; Black/DarkGray/Green/LightGray/LightRed/Red/White/Yellow 8 variants 사용 ≥ 1) | data-only partial (G4 consistent — 3 variants truly dead but enum-as-whole 은 reachable type) |
+| E-05 | src/arch/x86_64/vga.rs:20 | none | (enum 타입 — variants 중 일부는 사용, 일부는 미사용) | `Color` enum (Blue/Magenta/Brown 3 variants 사용 0; Black/DarkGray/Green/LightGray/LightRed/Red/White/Yellow 8 variants 사용 ≥ 1) | data-only partial (G4 consistent — 3 variants truly dead but enum-as-whole 은 reachable type) |
 | E-06 | src/main.rs:51 | syscall (boot init, debug-only) | (const 데이터; main.rs:633 `try_spawn_user(USER_HELLO_ELF, ...)` 진입 — `#[cfg(all(target_arch = "x86_64", debug_assertions))]` 게이트) | `USER_HELLO_ELF: &[u8]` (embedded ELF) | no (reachable via `_kernel_start` → main.rs:633 try_spawn_user, depth=2, debug 빌드 한정) |
 | E-07 | src/main.rs:53 | syscall (boot init, debug-only) | (const 데이터; main.rs:632 `try_spawn_user(USER_LUMEN_ELF, ...)` 진입 — 동일 cfg 게이트) | `USER_LUMEN_ELF: &[u8]` | no (E-06 와 동일 cluster, depth=2, debug 빌드 한정) |
 | E-08 | src/hsm_registry.rs:55 | none | (const 데이터 — `HsmRights::NETWORK_ATTACH` bitmask 슬롯, 사용처 0) | `HsmRights(1 << 5)` const | data-only (G2 documented Phase 6 reserved; orphan 분석 N/A; Phase 6 가 대안 mechanism FSM 채택) |

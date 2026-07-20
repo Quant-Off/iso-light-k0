@@ -217,3 +217,11 @@ impl Entropy for QuorumEntropy {
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64 as active;
+
+// Phase 9 9-D aarch64 두 번째 구현체 진입 표면 (HAL-02 cfg-conditional re-export 양방향 완성)
+// aarch64 hub 는 unimplemented! 골격이며 aarch64-unknown-none-softfloat 타깃 미설치로
+// 컴파일 배제 상태 (OQ4) — x86_64 산출물에 심볼 미유입, Phase 10 ARM-01 이 첫 컴파일
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64 as active;

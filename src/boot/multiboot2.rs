@@ -1,117 +1,41 @@
-//! 물리 메모리 맵 파싱을 수행하는 모듈입니다.
+//! Multiboot2 핸드오프를 펌웨어-중립 메모리 맵으로 파싱하는 어댑터 모듈입니다.
 //!
-//! 부트로더(GRUB Multiboot2)가 전달하는 메모리 맵을 파싱하여 어떤 물리 주소
-//! 범위가 사용 가능한지를 확정하며, 이 정보를 기반으로 물리 프레임 할당자가
-//! 초기화됩니다.
+//! # Features
+//! GRUB이 전달한 Multiboot2 info 구조를 순회하여 물리 메모리 맵 태그(type=6)와
+//! KASLR 커스텀 태그를 파싱하고, 결과를 `super::memory_map::MemoryMap` 중립
+//! 자료형으로 반환합니다. 파싱 로직은 기존 구현을 그대로 재배치한 것으로 신규
+//! 파싱 로직은 도입하지 않습니다 (Security Domain V5). 동적 할당은 전혀 없으며
+//! 부팅 초기 identity mapping 단일 코어 시점에서만 호출되어야 합니다.
+
+use super::BootInfo;
+use super::memory_map::{MemoryKind, MemoryMap, MemoryRegion, ParseError};
 
 //
-// 에러 타입
+// mb2 -> BootInfo 어댑터
 //
 
-#[derive(Debug)]
-pub enum ParseError {
-    /// 전달된 Multiboot2 info 주소가 유효하지 않음 (null 또는 정렬 불량)
-    InvalidAddress,
-    /// 헤더의 total_size가 비정상적 범위
-    InvalidSize,
-}
+/// 펌웨어-중립 부팅 정보의 static BSS 인스턴스 (부팅 1회 어댑터가 채움).
+static mut BOOT_INFO: BootInfo = BootInfo::empty();
 
-//
-// 메모리 영역 타입
-//
-
-/// 물리 메모리 영역의 용도 분류 (Multiboot2 Type 필드 기반)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemoryKind {
-    /// 자유롭게 사용 가능한 RAM
-    Usable,
-    /// BIOS·하드웨어에 예약된 영역
-    Reserved,
-    /// ACPI 정보 파싱 후 재사용 가능
-    AcpiReclaimable,
-    /// ACPI Non-Volatile Storage (전원 유지 필요)
-    AcpiNvs,
-    /// 불량 메모리 (사용 금지)
-    BadMemory,
-}
-
-/// 단일 물리 메모리 영역
-#[derive(Clone, Copy, Debug)]
-pub struct MemoryRegion {
-    /// 영역의 시작 물리 주소 (bytes)
-    pub base: u64,
-    /// 영역의 크기 (bytes)
-    pub length: u64,
-    pub kind: MemoryKind,
-}
-
-impl MemoryRegion {
-    /// 영역의 끝 주소 (exclusive)
-    pub fn end(self) -> u64 {
-        self.base + self.length
-    }
-}
-
-//
-// 메모리 맵
-//
-
-/// 물리 메모리 맵이 포함할 수 있는 최대 영역 수.
-/// x86_64 시스템 기준 일반적으로 10~20개이므로 64는 충분한 여유.
-const MAX_REGIONS: usize = 64;
-
-const DEFAULT_REGION: MemoryRegion = MemoryRegion {
-    base: 0,
-    length: 0,
-    kind: MemoryKind::Reserved,
-};
-
-/// 파싱된 물리 메모리 맵.
-/// 고정 크기 배열을 사용하여 동적 할당 없이 no_std 환경을 지원함.
-pub struct MemoryMap {
-    regions: [MemoryRegion; MAX_REGIONS],
-    count: usize,
-}
-
-impl MemoryMap {
-    pub const fn empty() -> Self {
-        Self {
-            regions: [DEFAULT_REGION; MAX_REGIONS],
-            count: 0,
-        }
-    }
-
-    /// 새 메모리 영역을 맵에 추가함.
-    pub fn add_region(&mut self, region: MemoryRegion) -> Result<(), ParseError> {
-        if self.count >= MAX_REGIONS {
-            // 공간 부족: 영역을 무시하고 계속 진행 (ParseError 없이)
-            return Ok(());
-        }
-        self.regions[self.count] = region;
-        self.count += 1;
-        Ok(())
-    }
-
-    /// 파싱된 모든 메모리 영역을 순회함
-    pub fn regions(&self) -> &[MemoryRegion] {
-        &self.regions[..self.count]
-    }
-
-    /// `Usable` 영역만 필터링하여 순회함
-    pub fn usable_regions(&self) -> impl Iterator<Item = &MemoryRegion> {
-        self.regions()
-            .iter()
-            .filter(|r| r.kind == MemoryKind::Usable)
-    }
-
-    /// 전체 사용 가능한 물리 메모리 크기 (bytes)
-    pub fn total_usable_bytes(&self) -> u64 {
-        self.usable_regions().fold(0u64, |acc, r| acc + r.length)
-    }
-
-    /// 감지된 물리 메모리의 최상위 주소
-    pub fn highest_addr(&self) -> u64 {
-        self.regions().iter().fold(0u64, |acc, r| acc.max(r.end()))
+/// Multiboot2 핸드오프를 파싱하여 static `BootInfo` 를 채운 뒤 커널 합류점으로
+/// 진입하는 어댑터 진입점.
+///
+/// boot_stub 의 `.Lkernel_entry` 간접 점프 대상으로 RDI = mb2_addr (mb2 info 물리
+/// 주소) 를 수신한다. 파싱 실패 시 기존 fail-safe(`unwrap_or_else(empty)`) 동작을
+/// lossless 이식하며 그 밖의 BootInfo 필드는 empty 초기값을 유지한다 (신규 파싱
+/// 로직 0, Security Domain V5). 이후 `crate::_kernel_start(&BootInfo)` 로 합류한다.
+///
+/// # Safety
+/// boot_stub 이 부팅 초기 단일 코어 identity mapping 상태에서 RDI 규약으로만
+/// 진입시킨다. `BOOT_INFO` 는 본 부팅 단일 스레드 시점에만 기록되며 이후에는
+/// 공유 참조(`&'static`)로만 소비된다 (T-09-01).
+#[unsafe(no_mangle)]
+pub extern "C" fn _boot_adapter_mb2(mb2_addr: u64) -> ! {
+    // SAFETY: BOOT_INFO 는 부팅 단일 코어 진입에서만 기록된 후 공유 참조로만 소비됨
+    unsafe {
+        (*(&raw mut BOOT_INFO)).memory_map =
+            parse_multiboot2(mb2_addr).unwrap_or_else(|_| MemoryMap::empty());
+        crate::_kernel_start(&*(&raw const BOOT_INFO))
     }
 }
 
@@ -278,8 +202,12 @@ struct Mb2KaslrTag {
 /// 태그가 없거나 정렬 요건을 만족하지 않으면 `None` 반환.
 /// 호출자는 `None` 수신 시 `Mmu::initialize(None)`으로 기본값을 사용해야 함.
 ///
+/// 현재 boot 어댑터는 본 태그를 배선하지 않으며 `BootInfo::kaslr_offset` 은
+/// 0 (미제공) 으로 유지됨. 실사용 배선은 Phase 11 (LIVE-09) 에서 채운다.
+///
 /// # Safety
 /// `parse_multiboot2()`와 동일한 전제 조건 적용.
+#[allow(dead_code)]
 pub unsafe fn parse_kaslr_offset(info_addr: u64) -> Option<u64> {
     if info_addr == 0 || info_addr & 7 != 0 {
         return None;

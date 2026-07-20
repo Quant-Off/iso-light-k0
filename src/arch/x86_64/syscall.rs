@@ -35,7 +35,7 @@ use core::arch::naked_asm;
 
 use zeroize::volatile::secure_zero;
 
-use crate::boot::{SYSCALL_CS_BASE, SYSRET_CS_BASE};
+use crate::arch::x86_64::gdt::{SYSCALL_CS_BASE, SYSRET_CS_BASE};
 use crate::cpu::{IA32_EFER, rdmsr, wrmsr};
 
 //

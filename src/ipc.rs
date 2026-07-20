@@ -654,11 +654,7 @@ pub unsafe fn ipc_call(
             return Ok(reply); // 응답 수신 성공 (Secret Drop 적용됨)
         }
         // 안전한 CPU 대기 (인터럽트 발생 시 재확인)
-        // SAFETY: hlt는 다음 인터럽트까지 CPU를 일시 정지시키는 안전한 명령
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("hlt", options(nostack, preserves_flags))
-        };
+        crate::arch::active::cpu::wait_for_interrupt();
     }
 }
 

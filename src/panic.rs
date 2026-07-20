@@ -6,16 +6,6 @@ use core::panic::PanicInfo;
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     // 향후 디버깅 모드일 때만 UART 등으로 제한적인 로깅을 수행하도록 설계해야 함
-    // 현재는 공격 방어를 위해 무한 루프와 CPU Halt 명령어만 실행함
-    loop {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("cli", "hlt", options(nomem, nostack, preserves_flags));
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-        }
-    }
+    // 현재는 공격 방어를 위해 CPU 영구 정지 (arch 표면 위임)
+    crate::arch::active::cpu::halt_loop()
 }

@@ -34,11 +34,11 @@ pub fn cycle_counter() -> u64 {
 pub fn timer_frequency() -> Option<(u64, TimerKind)> {
     #[cfg(target_arch = "x86_64")]
     {
-        let (eax, ebx, ecx, _edx) = crate::cpu::cpuid(0x15, 0);
+        let (eax, ebx, ecx, _edx) = crate::arch::x86_64::cpu::cpuid(0x15, 0);
         if eax != 0 && ebx != 0 && ecx != 0 {
             return Some(((ecx as u64) * (ebx as u64) / (eax as u64), TimerKind::InvariantTsc));
         }
-        let (eax16, _ebx16, _ecx16, _edx16) = crate::cpu::cpuid(0x16, 0);
+        let (eax16, _ebx16, _ecx16, _edx16) = crate::arch::x86_64::cpu::cpuid(0x16, 0);
         if (eax16 & 0xFFFF) != 0 {
             return Some((((eax16 & 0xFFFF) as u64) * 1_000_000, TimerKind::InvariantTsc));
         }

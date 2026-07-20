@@ -458,6 +458,35 @@ pub unsafe fn clac() {
 }
 
 //
+// panic/ipc 본체 외과수술 소비 표면 (Phase 9 9-C)
+//
+
+/// 복구 불가 상태의 CPU 영구 정지 루프 (panic fail-stop 경로 전용).
+///
+/// `cli` 로 인터럽트를 차단한 뒤 `hlt` 로 CPU 를 정지시키며 spurious wake 에
+/// 대비해 무한 루프로 감쌈. 결코 반환하지 않음.
+#[cfg(target_arch = "x86_64")]
+pub fn halt_loop() -> ! {
+    loop {
+        // SAFETY: cli+hlt 는 Ring 0 에서 임의 시점 안전 실행 가능하며 부작용 없음
+        unsafe {
+            core::arch::asm!("cli", "hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// 다음 인터럽트까지 CPU 를 일시 정지시키는 대기 명령 (`hlt`).
+///
+/// 인터럽트가 발생하면 정지가 해제되어 호출부가 조건을 재확인함.
+#[cfg(target_arch = "x86_64")]
+pub fn wait_for_interrupt() {
+    // SAFETY: hlt 는 다음 인터럽트까지 CPU 를 정지시키는 안전한 명령
+    unsafe {
+        core::arch::asm!("hlt", options(nostack, preserves_flags));
+    }
+}
+
+//
 // aarch64 스텁
 //
 // aarch64 타겟에서는 CPACR_EL1 구성을 통해 FP/SIMD(Advanced SIMD & NEON) 트랩을
