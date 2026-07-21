@@ -8,7 +8,6 @@
 //! 필드는 고정 크기이며 static BSS 에 배치되어 동적 할당이 전혀 없습니다.
 
 pub mod memory_map;
-pub mod multiboot2;
 pub mod uefi;
 
 use memory_map::MemoryMap;

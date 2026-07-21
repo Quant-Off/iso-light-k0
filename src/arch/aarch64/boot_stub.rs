@@ -10,8 +10,10 @@
 //!
 //! x86_64 `boot_stub.rs` 의 Multiboot2 헤더 + Long Mode 전환 구조를 mirror 하되
 //! asm 은 전량 divergent 합니다. GRUB/GDT/TSS 가 부재하며 EL 기반 특권 모델을
-//! 사용합니다. 커널 arch-중립 합류점(BootInfo 디스패치)은 후속 wave(10-C 이후)가
-//! 배선하며 본 wave 는 `el1_entry` 도달과 특권 레지스터 정규화가 목표입니다.
+//! 사용합니다. `el1_entry` 는 특권 정규화 + EL=1 early print 후 `aarch64_kernel_entry`
+//! 로 bl 분기하며(`boot.rs` 커널 합류점 MMU stage1 + GIC + PSCI 7-line proof), 진입 함수는
+//! `-> !` 이므로 반환 시 방어적 trap 으로 낙하합니다. DTB 파싱과 arch-중립 `_kernel_start`
+//! 합류는 Phase 11 LIVE-01 로 이연됩니다.
 
 use core::arch::global_asm;
 
@@ -82,18 +84,21 @@ el1_entry:
 
     mov  x0, x19                    // DTB phys addr 복원 (커널 합류점 1 번째 인수 A4)
 
-    // TODO 10-C 이후 arch-중립 커널 합류점(BootInfo 디스패치 MMU stage1 enable)으로 분기
-    //      본 wave 는 el1_entry 도달과 특권 정규화 + EL=1 early print 가 목표이므로 park
+    //
+    // § 5. 커널 부팅 합류점 분기 (Pattern 1 boot.rs aarch64_kernel_entry 는 -> !)
+    //      함수는 반환하지 않으므로 bl 후 방어적 trap 으로 낙하 (정상 경로 미도달)
+    //
+    bl   aarch64_kernel_entry
 
     //
-    // § 5. 반환 방지 halt trap (x86 cli hlt jmp 대응)
+    // § 5b. 반환 방지 halt trap (aarch64_kernel_entry 이탈 시 방어 halt x86 cli hlt jmp 대응)
     //
-.Lel1_park:
+.Lel1_trap:
     wfi
-    b    .Lel1_park
+    b    .Lel1_trap
 
     //
-    // § 6. EL=1 early print 마커 문자열 (park 뒤 배치 실행 경로 미도달)
+    // § 6. EL=1 early print 마커 문자열 (trap 뒤 배치 실행 경로 미도달)
     //
 .Lel1_marker_el1:
     .asciz "EL=1\r\n"

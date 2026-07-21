@@ -487,7 +487,7 @@ ci-phase9: check-alloc-zero check-machete check-entropy-mutex check-jitter-lto c
 #   3)  check-secure-zero aarch64  memset U-entry 0 + bl memset 0 + k0_secure_zero (ARM-11)
 #   4)  check-ct-branches aarch64  조건부 분기 6 mnemonic 카운트 0 (ARM-12)
 #   5)  arch_parity                5 알고리즘 x86 aarch64 byte-diff 0 host test (ARM-10 HOST_TRIPLE)
-#   6)  qemu-test-aarch64          7-line 마커 (boot-join 이연이라 EL 마커만 honest deferral 비-fatal)
+#   6)  qemu-test-aarch64          7-line 마커 전량 하드 판정 (boot-join 종결 10.1-01)
 #   7)  ci-phase9                  x86 HAL standing 회귀 leg 상속 (하드)
 #
 ci-phase10:
@@ -500,12 +500,8 @@ ci-phase10:
 	@ARCH=aarch64 AARCH64_ELF=$(AARCH64_ELF) bash scripts/check-ct-branches.sh
 	@HOST_TRIPLE=$$(rustc -vV | sed -n 's/^host: //p') && \
 	 $(CARGO) test --no-default-features --target $$HOST_TRIPLE --test arch_parity
-	@echo "[CI] qemu-test-aarch64 leg boot-join 이연 EL 마커만 honest 판정 (MMU GICR CHILDREN GRP1 IRQ PSCI 6 마커 Phase 11 인계)"
-	@AARCH64_ELF=$(PSCI_ELF) EXPECTED_MARKERS=EL QEMU_TIMEOUT=20 bash scripts/qemu-test-aarch64.sh; \
-	 QRC=$$?; \
-	 if [ $$QRC -eq 0 ]; then echo "[CI]  ok  qemu-test-aarch64 runtime EL=1 마커 검출 (6 마커 boot-join 이연 deferred-items 기록)"; \
-	 elif [ $$QRC -eq 3 ]; then echo "[CI] SKIP-HONEST qemu-test-aarch64 미가용 부팅 마커 검증 이연 (deferred-items 기록)"; \
-	 else echo "[CI] DEFER qemu-test-aarch64 EL 마커 미도달 boot-join 이연 (deferred-items 기록 static host leg 는 GREEN)"; fi
+	@echo "[CI] qemu-test-aarch64 leg 7-line 마커 전량 하드 판정 (boot-join 종결 10.1-01 EL MMU GICR CHILDREN GRP1 IRQ PSCI)"
+	@AARCH64_ELF=$(PSCI_ELF) EXPECTED_MARKERS="EL MMU GICR CHILDREN GRP1 IRQ PSCI" QEMU_TIMEOUT=30 bash scripts/qemu-test-aarch64.sh
 	@echo "[CI] x86 회귀 leg ci-phase9 standing 상속 실행"
 	@$(MAKE) ci-phase9
-	@echo "[CI] Phase 10 ci 게이트 전체 통과 (ARM-01..ARM-12 static host GREEN + qemu 7-line boot-join honest 이연)"
+	@echo "[CI] Phase 10 ci 게이트 전체 통과 (ARM-01..ARM-12 static host GREEN + qemu 7-line 마커 전량 하드 판정)"

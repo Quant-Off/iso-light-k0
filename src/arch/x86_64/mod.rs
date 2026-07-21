@@ -22,6 +22,26 @@ pub mod syscall;
 // Phase 9 9-C BootEntry 표면 (구 process.rs enter_ring3 asm lossless 추출본)
 pub mod process_entry;
 
+// Phase 10.1 HAL-06 복원 (D-2) x86 전용 부팅 진입 시퀀스 + GRUB Multiboot2 어댑터
+// (구 src/main.rs::_kernel_start + src/boot/multiboot2.rs lossless 이관본, body arch-cfg 0)
+pub mod kernel_start;
+pub mod multiboot2;
+
+/// 스택 캐너리 순회용 IST 가드 범위 HAL 표면 (x86 실범위 4 종).
+///
+/// `stack::install_canaries` 와 `validate_canaries` 가 arch 분기 없이 소비하도록
+/// tss 의 IST 가드 4 종을 write-once static 슬라이스로 노출함 (HAL-06 복원).
+/// aarch64 대칭 표면은 빈 슬라이스를 반환하여 IST 부재(SP_EL1 dedicated panic 스택)를 표현함
+pub fn ist_guard_ranges() -> &'static [(u64, u64)] {
+    // 부팅 초기 단일 코어 write-once 후 공유 참조로만 소비되는 정적 백업 저장소
+    static mut IST_GUARD_RANGES: [(u64, u64); 4] = [(0, 0); 4];
+    // SAFETY 부팅 초기 단일 코어에서만 기록되며 반환 슬라이스는 정적 수명 공유 참조로만 소비됨
+    unsafe {
+        *(&raw mut IST_GUARD_RANGES) = tss::ist_guard_ranges();
+        &*(&raw const IST_GUARD_RANGES)
+    }
+}
+
 //
 // 6 HAL trait x86_64 첫 구현체 (HAL-03 ZST + inline(always) 전수)
 //

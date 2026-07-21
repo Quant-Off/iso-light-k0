@@ -39,6 +39,18 @@ pub const KERNEL_VMA_BASE: u64 = 0xFFFF_0000_0000_0000;
 /// QEMU virt PL011 UART MMIO 물리 기본 주소 (A1 폴백 DTB/BootInfo 우선)
 pub const UART_PHYS: u64 = 0x0900_0000;
 
+/// QEMU virt GICv3 distributor MMIO 물리 기본 주소 (gic.rs GICD_PHYS_BASE 와 동일 값 aarch64 내부 공유)
+pub const GICD_PHYS: u64 = 0x0800_0000;
+
+/// QEMU virt GICv3 redistributor MMIO 물리 기본 주소 (gic.rs GICR_PHYS_BASE 와 동일 값 aarch64 내부 공유)
+pub const GICR_PHYS: u64 = 0x080A_0000;
+
+/// GICD distributor register block 매핑 크기 (64 KiB)
+const GICD_MMIO_SIZE: u64 = 0x1_0000;
+
+/// GICR redistributor 코어당 RD+SGI 프레임 매핑 크기 (64 KiB * 2 = 128 KiB)
+const GICR_MMIO_SIZE: u64 = 0x2_0000;
+
 //
 // 내부 상수
 //
@@ -445,6 +457,10 @@ impl AddressSpace {
             // UART MMIO Device-nGnRE writable-NX (self_test 대상 Pitfall 3)
             let uart = uart_phys & !(PAGE_SIZE_U64 - 1);
             self.map_range(linear, uart, uart + PAGE_SIZE_U64, true, false, true)?;
+            // GICD distributor MMIO Device-nGnRE writable-NX (MMU on 후 gic::setup 접근 확보 Pitfall 3)
+            self.map_range(linear, GICD_PHYS, GICD_PHYS + GICD_MMIO_SIZE, true, false, true)?;
+            // GICR redistributor MMIO Device-nGnRE writable-NX (RD+SGI 프레임 128 KiB)
+            self.map_range(linear, GICR_PHYS, GICR_PHYS + GICR_MMIO_SIZE, true, false, true)?;
         }
         Ok(())
     }
@@ -739,14 +755,17 @@ impl Mmu<Initialized> {
 /// MMU enable 직후 UART MMIO 매핑 attribute 를 검증함 (Pitfall 3 self_test).
 ///
 /// `AT S1E1R, <uart_va>` 로 stage1 EL1 read 변환을 강제 실행한 뒤 PAR_EL1 을 읽어
-/// F(fault) 미set 과 SH(shareability) == 0(Device 메모리 non-shareable)을 확인한다. UART 가
-/// 실수로 Normal cacheable 로 오매핑되면 SH != 0 으로 조기 검출된다(직렬 소실/speculative fault 차단).
+/// F(fault) 미set 과 ATTR(bits[63:56]) == Device-nGnRE(0x04)를 확인한다. PAR_EL1.ATTR 은
+/// MAIR Attr 인코딩을 그대로 반환하므로 UART 가 실수로 Normal cacheable(0xFF)로 오매핑되면
+/// ATTR != 0x04 로 조기 검출된다(직렬 소실/speculative fault 차단). 아키텍처상 Device 메모리의
+/// PAR_EL1.SH 는 Outer Shareable(0b10)로 강제되므로 shareability 가 아니라 memory attribute 로
+/// Device 여부를 판정한다.
 ///
 /// # Safety
 /// `Mmu<Initialized>::activate` 완료 후 MMU 활성 상태에서만 호출해야 함
 ///
 /// # Errors
-/// 변환 실패(PAR_EL1.F set) 시 `SelfTestFault`, Device attribute 아니면(SH != 0) `SelfTestAttr`
+/// 변환 실패(PAR_EL1.F set) 시 `SelfTestFault`, Device attribute 아니면(ATTR != 0x04) `SelfTestAttr`
 pub unsafe fn self_test(uart_va: u64) -> Result<(), MmuError> {
     let par: u64;
     // SAFETY AT S1E1R 은 변환만 수행하며 ISB 로 PAR_EL1 갱신 가시화 후 read
@@ -764,8 +783,8 @@ pub unsafe fn self_test(uart_va: u64) -> Result<(), MmuError> {
     if par & 1 != 0 {
         return Err(MmuError::SelfTestFault);
     }
-    // PAR_EL1.SH (bits[8:7]) Device 메모리는 0 (non-shareable) 이어야 함
-    if (par >> 7) & 0b11 != 0 {
+    // PAR_EL1.ATTR (bits[63:56]) 이 Device-nGnRE(MAIR Attr1 0x04)가 아니면 오매핑
+    if (par >> 56) & 0xFF != MAIR_ATTR1_DEVICE_NGNRE {
         return Err(MmuError::SelfTestAttr);
     }
     Ok(())

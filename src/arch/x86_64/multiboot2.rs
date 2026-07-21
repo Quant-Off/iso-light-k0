@@ -7,8 +7,8 @@
 //! 파싱 로직은 도입하지 않습니다 (Security Domain V5). 동적 할당은 전혀 없으며
 //! 부팅 초기 identity mapping 단일 코어 시점에서만 호출되어야 합니다.
 
-use super::BootInfo;
-use super::memory_map::{MemoryKind, MemoryMap, MemoryRegion, ParseError};
+use crate::boot::BootInfo;
+use crate::boot::memory_map::{MemoryKind, MemoryMap, MemoryRegion, ParseError};
 
 //
 // mb2 -> BootInfo 어댑터
@@ -32,8 +32,8 @@ static mut BOOT_INFO: BootInfo = BootInfo::empty();
 /// 진입시킨다. `BOOT_INFO` 는 본 부팅 단일 스레드 시점에만 기록되며 이후에는
 /// 공유 참조(`&'static`)로만 소비된다 (T-09-01).
 // Multiboot2 는 x86/GRUB 펌웨어 핸드오프 전용이며 x86 `_kernel_start` 로 합류함.
-// aarch64 는 DTB/BootInfo 별도 경로이므로 본 어댑터를 컴파일 대상에서 배제함.
-#[cfg(target_arch = "x86_64")]
+// 본 모듈은 crate::arch::x86_64 하위이므로 모듈 전체가 이미 arch cfg 게이트되어
+// aarch64 컴파일 대상에서 배제된다 (per-item arch cfg 불요 HAL-06)
 #[unsafe(no_mangle)]
 pub extern "C" fn _boot_adapter_mb2(mb2_addr: u64) -> ! {
     // SAFETY: BOOT_INFO 는 부팅 단일 코어 진입에서만 기록된 후 공유 참조로만 소비됨
@@ -43,7 +43,7 @@ pub extern "C" fn _boot_adapter_mb2(mb2_addr: u64) -> ! {
         // KASLR 물리맵 오프셋 태그 파싱 배선 복원 어댑터가 allocator init 이전에
         // 실행되므로 mb2 info 영역이 온전하며 태그 부재 시 0(미제공) 을 채움
         (*(&raw mut BOOT_INFO)).kaslr_offset = parse_kaslr_offset(mb2_addr).unwrap_or(0);
-        crate::_kernel_start(&*(&raw const BOOT_INFO))
+        super::kernel_start::_kernel_start(&*(&raw const BOOT_INFO))
     }
 }
 

@@ -17,9 +17,9 @@
 use core::mem::size_of;
 
 use crate::arch::x86_64::gdt::KERNEL_CS;
-use crate::tss::{IST_DOUBLE_FAULT, IST_MACHINE_CHECK, IST_NMI, IST_PAGE_FAULT};
+use crate::arch::x86_64::tss::{IST_DOUBLE_FAULT, IST_MACHINE_CHECK, IST_NMI, IST_PAGE_FAULT};
 #[cfg(debug_assertions)]
-use crate::vga;
+use crate::arch::x86_64::vga;
 
 //
 // PIC 8259 I/O 포트 상수

@@ -19,6 +19,8 @@ use crate::arch::common::entropy::EntropyError;
 pub mod cpu;
 // boot_stub 는 _start EL2->EL1 eret 강하 + el1_entry 특권 정규화 global_asm
 pub mod boot_stub;
+// boot 는 el1_entry 가 bl 로 진입하는 커널 부팅 합류점(aarch64_kernel_entry) 배선 (10.1 ARM-01)
+pub mod boot;
 // vectors 는 16-entry .vector_table + VBAR_EL1 로드 + SPSel #1 panic 스택 (Pitfall 14)
 pub mod vectors;
 // console 은 PL011 UART MMIO 직렬 콘솔 (arm-pl011-uart 위임 + MMU 전/후 base 갱신)
@@ -41,6 +43,15 @@ pub mod entropy;
 // 크레이트를 직접 import 하지 않고 아래 재노출 별칭(Hvc / psci_version_call / psci_cpu_on_call)만 경유함
 pub(crate) use smccc::Hvc;
 pub(crate) use smccc::psci::{cpu_on as psci_cpu_on_call, version as psci_version_call};
+
+/// 스택 캐너리 순회용 IST 가드 범위 HAL 표면 (aarch64 는 IST 부재로 빈 슬라이스).
+///
+/// aarch64 는 x86 TSS/IST 대신 SP_EL1 dedicated panic 스택을 사용하므로 순회할
+/// IST 가드가 없다. `stack` 본체가 arch 분기 없이 0 회 순회하도록 빈 슬라이스를
+/// 반환함 (x86 `ist_guard_ranges` 대칭 HAL 표면 HAL-06)
+pub fn ist_guard_ranges() -> &'static [(u64, u64)] {
+    &[]
+}
 
 //
 // 6 HAL trait aarch64 두 번째 구현체 골격 (HAL-03 ZST 대칭)
