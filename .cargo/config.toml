@@ -13,3 +13,13 @@ rustflags = [
     # R_X86_64_32S 릴로케이션으로 부호 확장 32비트 절대 주소 참조 가능
     "-C", "code-model=kernel",
 ]
+
+# Phase 10 aarch64 크로스 빌드 엔트리 (기본 [build] target 은 x86_64 유지)
+# aarch64 는 GRUB 없이 QEMU virt -kernel 직접 부팅 -> linker-aarch64.ld 사용
+# x86 전용 code-model=kernel 은 aarch64 부적용이므로 제외
+[target.aarch64-unknown-none-softfloat]
+rustflags = [
+    "-C", "link-arg=-Tlinker-aarch64.ld",
+    "-C", "link-arg=-e_start",
+    "-C", "link-arg=-no-pie",
+]
