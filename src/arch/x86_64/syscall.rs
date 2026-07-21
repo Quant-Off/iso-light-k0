@@ -38,6 +38,14 @@ use zeroize::volatile::secure_zero;
 use crate::arch::x86_64::gdt::{SYSCALL_CS_BASE, SYSRET_CS_BASE};
 use crate::cpu::{IA32_EFER, rdmsr, wrmsr};
 
+// arch-중립 syscall 표면(번호/에러/컨텍스트/주소 판정)은 arch/common 으로 추출됨.
+// 본 모듈은 이를 re-export 하여 기존 `crate::syscall::{...}` 소비 경로를 보존함
+// (본체 import byte-diff 0). SyscallContext 는 naked syscall_entry 의 push 순서와
+// 동일 레이아웃(pc/flags/num/arg0..arg5)으로 결합됨.
+pub use crate::arch::common::syscall::{
+    SyscallContext, SyscallError, SyscallNum, is_user_address,
+};
+
 //
 // MSR 인덱스 (AMD64 APM Vol.2 §6.1)
 //
@@ -99,96 +107,10 @@ static mut BSP_PER_CPU: PerCpu = PerCpu {
 };
 
 //
-// SyscallContext (asm 과 레이아웃 결합)
+// SyscallNum / SyscallError / SyscallContext / is_user_address 는 arch/common 으로
+// 추출됨(위 pub use 로 re-export). SyscallContext 레이아웃(pc/flags/num/arg0..arg5)은
+// 아래 naked syscall_entry 의 push 순서와 결합됨.
 //
-
-/// `syscall` 진입 stub 이 스택에 push 한 사용자 컨텍스트 스냅샷.
-///
-/// 필드는 push 순서의 *역순* 으로 선언되어 메모리 레이아웃 = stub 의 stack
-/// 모양이 됨. asm 이 RSP+0 으로 전달하므로 `#[repr(C)]` 가 필수.
-#[repr(C)]
-pub struct SyscallContext {
-    pub rip: u64,    // [+0]  RCX (사용자 RIP)
-    pub rflags: u64, // [+8]  R11 (사용자 RFLAGS)
-    pub rax: u64,    // [+16] syscall 번호 / 반환값
-    pub rdi: u64,    // [+24] arg0
-    pub rsi: u64,    // [+32] arg1
-    pub rdx: u64,    // [+40] arg2
-    pub r10: u64,    // [+48] arg3 (RCX 자리 대용)
-    pub r8: u64,     // [+56] arg4
-    pub r9: u64,     // [+64] arg5
-}
-
-//
-// syscall 번호
-//
-
-/// 알려진 syscall 번호 목록.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u64)]
-pub enum SyscallNum {
-    /// 사용자 프로세스 정상 종료
-    Exit = 0,
-    /// `write(fd, buf, len)` — 현재는 fd=2(stderr) → VGA 출력만 지원
-    Write = 1,
-    /// `ipc_call(cap_ptr, msg_type, payload_ptr, payload_len, reply_buf, reply_cap)`
-    IpcCall = 2,
-    /// `ipc_recv(endpoint_id, buf_ptr, buf_cap)`
-    IpcRecv = 3,
-    /// `ipc_reply(endpoint_id, reply_type, payload_ptr, payload_len)`
-    IpcReply = 4,
-    /// `getrandom(buf, len, flags)` — 커널 DRBG 출력
-    GetRandom = 5,
-    /// `cap_request(endpoint_id, rights)` — 커널이 정책 검증 후 발급
-    CapRequest = 6,
-    HsmAttach = 7,    // Phase 1: 정적 HSM 슬롯 부착 (비인증; Phase 5 attestation gate 예정)
-    HsmDetach = 8,    // Phase 1: HSM 슬롯 해제 + zeroize (post-attach CAP 검사)
-    HsmEnumerate = 9, // Phase 1: 부착된 슬롯 enumerate (post-attach CAP 검사)
-    HsmWrite = 10,    // Phase 3: USE cap → SoftHSM mode-aware write (D-02)
-    HsmRelay = 11,    // Phase 3: src(RELAY_SRC) + dst(RELAY_DST) dual-cap kernel-internal transfer (D-03)
-    HsmRead = 12,     // Phase 4: USE cap → wire frame response 회수 (D-06)
-    /// Phase 5.1 D-04 attest_payload 3733 옥텟 fixture export (feature smoke 한정)
-    ///
-    /// lumen 측 mldsa 의존 부재 우회 kernel 이 attest_phase5_1_wire_smoke_test 에서
-    /// 채운 WIRE_ATTEST_FIXTURE BSS 를 사용자 공간으로 복사 closed 빌드 cfg-out
-    #[cfg(feature = "smoke")]
-    AttestFixtureExport = 13,
-    /// Phase 6 GAP D-03 NETWORK_ATTACH cap one-shot Ring 3 인도 (tls-external 한정)
-    ///
-    /// out_ptr 16 옥텟 HsmCapability 응답 first-caller-wins after-take Denied
-    /// closed 빌드 cfg-out variant 자체 부재 호출 시 Unknown 폴백 (RAX -1)
-    #[cfg(feature = "tls-external")]
-    NetworkCapTake = 14,
-    /// Phase 6 GAP D-06 AUDIT_READ cap one-shot Ring 3 인도 (양 프로필 공통)
-    ///
-    /// out_ptr 16 옥텟 HsmCapability 응답 first-caller-wins after-take Denied
-    /// audit query 보유자만 sys_hsm_status 진입 가능
-    AuditCapTake = 15,
-    /// Phase 6 GAP D-05 sys_hsm_status atomic 456 옥텟 응답 (AUDIT_READ cap 보유자만)
-    ///
-    /// out_ptr rdi out_len rsi caller_cap_token rdx ABI 잠금
-    /// 호출 자체는 AUDIT_RING 미기록 (D-05 audit-of-audit 회피)
-    HsmStatus = 16,
-}
-
-/// 사용자에 노출되는 음수 에러 코드 (Linux errno 와 호환되지 않음, 자체 ABI).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(i64)]
-pub enum SyscallError {
-    Unknown = -1,
-    BadArg = -2,
-    BadAddress = -3,
-    Denied = -4,
-    NoMessage = -5,
-    Internal = -6,
-}
-
-impl SyscallError {
-    #[inline]
-    pub const fn as_rax(self) -> u64 {
-        self as i64 as u64
-    }
-}
 
 //
 // MSR 설치
@@ -282,7 +204,8 @@ pub unsafe extern "C" fn syscall_entry() -> ! {
         "mov rsp, gs:[0]",          // RSP ← kernel_stack_top
 
         // ── 2. SyscallContext 구성 (push 순서 = struct 역순) ───────
-        // struct: rip, rflags, rax, rdi, rsi, rdx, r10, r8, r9
+        // struct: pc, flags, num, arg0, arg1, arg2, arg3, arg4, arg5
+        //   ←매핑: rcx(rip), r11(rflags), rax, rdi, rsi, rdx, r10, r8, r9
         // push   : r9, r8, r10, rdx, rsi, rdi, rax, r11, rcx
         "push r9",
         "push r8",
@@ -327,15 +250,15 @@ pub unsafe extern "C" fn syscall_entry() -> ! {
 
 /// 사용자 컨텍스트를 인자로 받아 syscall 번호별 핸들러를 호출함.
 ///
-/// `ctx.rax` 는 호출 시 syscall 번호이며, 반환 시 결과값으로 덮어씀.
+/// `ctx.num` 은 호출 시 syscall 번호이며, 반환 시 결과값으로 덮어씀.
 /// 음수 결과는 `SyscallError` 매핑.
 #[unsafe(no_mangle)]
 extern "C" fn dispatch(ctx: &mut SyscallContext) {
-    let num = ctx.rax;
+    let num = ctx.num;
     let result: u64 = match num {
-        x if x == SyscallNum::Exit as u64 => sys_exit(ctx.rdi),
-        x if x == SyscallNum::Write as u64 => sys_write(ctx.rdi, ctx.rsi, ctx.rdx),
-        x if x == SyscallNum::GetRandom as u64 => sys_getrandom(ctx.rdi, ctx.rsi),
+        x if x == SyscallNum::Exit as u64 => sys_exit(ctx.arg0),
+        x if x == SyscallNum::Write as u64 => sys_write(ctx.arg0, ctx.arg1, ctx.arg2),
+        x if x == SyscallNum::GetRandom as u64 => sys_getrandom(ctx.arg0, ctx.arg1),
         x if x == SyscallNum::HsmAttach as u64 => crate::hsm_registry::handle_attach(ctx),
         x if x == SyscallNum::HsmDetach as u64 => crate::hsm_registry::handle_detach(ctx),
         x if x == SyscallNum::HsmEnumerate as u64 => crate::hsm_registry::handle_enumerate(ctx),
@@ -361,7 +284,7 @@ extern "C" fn dispatch(ctx: &mut SyscallContext) {
         }
         _ => SyscallError::Unknown.as_rax(),
     };
-    ctx.rax = result;
+    ctx.num = result;
 }
 
 //
@@ -473,18 +396,5 @@ fn sys_getrandom(buf_ptr: u64, len: u64) -> u64 {
 }
 
 //
-// 사용자 주소 검증
+// is_user_address 는 arch/common/syscall.rs 로 추출됨 (상단 pub use 로 re-export).
 //
-
-/// `va` 가 사용자 가상 주소(canonical lower half, PML4[0..255]) 범위인지.
-///
-/// 사용자 매핑은 첫 페이지(NULL 페이지)를 제외한
-/// 0x1000..0x0000_8000_0000_0000 범위에 위치. NULL 페이지와 그 외(커널 직접
-/// 선형 매핑, 커널 세그먼트 등)는 차단. NULL 하한은 미매핑 0 페이지로의
-/// copy 가 fatal #PF 를 유발하는 경로(SYS-05)를 조기 차단함
-#[inline]
-pub fn is_user_address(va: u64) -> bool {
-    const USER_MIN: u64 = 0x1000;
-    const USER_MAX: u64 = 0x0000_8000_0000_0000;
-    (USER_MIN..USER_MAX).contains(&va)
-}

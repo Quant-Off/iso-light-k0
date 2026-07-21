@@ -81,3 +81,9 @@ virtio-drivers = { version = "0.13", default-features = false }
 # Phase 10 ARM-07 aarch64 PL011 UART MMIO 직렬 콘솔 (arch 무관 등재 cfg-gate 는 코드)
 # trustedfirmware.org 유지 slopcheck [OK] Approved deprecated pl011-uart 회피
 arm-pl011-uart = "0.5.0"
+# Phase 10 ARM-05 aarch64 GICv3 distributor + redistributor (GICR_WAKER/ChildrenAsleep/ProcessorSleep)
+# google/arm-gic 유지 slopcheck [OK] Approved GicV3::setup redistributor wake 순서 내장 (Pitfall 11)
+arm-gic = "0.8.1"
+# Phase 10 ARM-06 aarch64 PSCI over HVC (PSCI_VERSION/CPU_ON) Hvc 타입 파라미터 conduit 고정
+# google 유지 slopcheck [OK] Approved 구 psci 크레이트 renamed 대체 SMCCC 1.4 + PSCI 1.1
+smccc = "0.2.3"

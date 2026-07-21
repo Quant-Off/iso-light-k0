@@ -144,7 +144,8 @@ pub unsafe fn install_canaries() {
         fill_canary(bs, be);
     }
 
-    // IST 가드 영역 4종
+    // IST 가드 영역 4종 (x86 TSS/IST 전용, aarch64 는 SP_EL1 dedicated panic 스택으로 대체)
+    #[cfg(target_arch = "x86_64")]
     for (s, e) in crate::tss::ist_guard_ranges().iter() {
         // SAFETY: 각 IstStack.guard 배열은 쓰기 가능한 4 KiB 정적 배열
         unsafe {
@@ -168,6 +169,8 @@ pub unsafe fn validate_canaries() -> Result<(), u64> {
             return Err(bs);
         }
     }
+    // x86 TSS/IST 가드 (aarch64 는 SP_EL1 panic 스택으로 대체 IST 개념 부재)
+    #[cfg(target_arch = "x86_64")]
     for (s, e) in crate::tss::ist_guard_ranges().iter() {
         unsafe {
             if !check_canary(*s, *e) {

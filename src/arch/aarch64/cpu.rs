@@ -63,6 +63,29 @@ pub unsafe fn user_access_end() {
     }
 }
 
+/// x86 `stac`(SMAP AC set) 표면과 이름을 맞춘 PAN 개방 별칭.
+///
+/// 본체(hsm_registry/air_gap)가 `crate::cpu::stac()` 로 arch-중립 소비하므로 x86
+/// SMAP 표면명을 aarch64 PAN(`user_access_begin`)으로 매핑함. 본체 byte-diff 0.
+///
+/// # Safety
+/// `user_access_begin` 과 동일하게 `clac` 과 반드시 쌍으로 호출해야 함.
+#[inline(always)]
+pub unsafe fn stac() {
+    // SAFETY user_access_begin 의 PAN 개방 안전 계약을 그대로 승계함
+    unsafe { user_access_begin() }
+}
+
+/// x86 `clac`(SMAP AC clear) 표면과 이름을 맞춘 PAN 폐쇄 별칭.
+///
+/// # Safety
+/// `user_access_end` 와 동일하게 `stac` 직후 user 작업 종료 즉시 호출해야 함.
+#[inline(always)]
+pub unsafe fn clac() {
+    // SAFETY user_access_end 의 PAN 폐쇄 안전 계약을 그대로 승계함
+    unsafe { user_access_end() }
+}
+
 /// 인터럽트 비활성(IRQ mask, x86 `cli` 대응).
 ///
 /// # Safety

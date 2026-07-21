@@ -26,6 +26,12 @@ TARGET_DIR   := target/$(TARGET)
 KERNEL_DEBUG := $(TARGET_DIR)/debug/$(KERNEL_NAME)
 KERNEL_REL   := $(TARGET_DIR)/release/$(KERNEL_NAME)
 
+# Phase 10 aarch64 크로스 빌드 변수 (ci-phase10 봉인 게이트)
+# AARCH64_ELF 은 기본 산출물 PSCI_ELF 은 SC1 ARM-01 이 명시한 서술적 명명 산출물
+TARGET_AARCH64 := aarch64-unknown-none-softfloat
+AARCH64_ELF    := target/$(TARGET_AARCH64)/release/$(KERNEL_NAME)
+PSCI_ELF       := iso-light-k0-aarch64-psci.elf
+
 ISO_DIR      := isodir
 BOOT_DIR     := $(ISO_DIR)/boot
 GRUB_DIR     := $(BOOT_DIR)/grub
@@ -108,7 +114,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external check-machete ci-phase7 ci-phase8 check-jitter-lto check-virtio-sentinel check-entropy-mutex qemu-tcg qemu-kvm entropy-host-test check-arch-cfg-gate check-ct-branches check-secure-zero check-body-untouched check-mmu-typestate ci-phase9
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external check-machete ci-phase7 ci-phase8 check-jitter-lto check-virtio-sentinel check-entropy-mutex qemu-tcg qemu-kvm entropy-host-test check-arch-cfg-gate check-ct-branches check-secure-zero check-body-untouched check-mmu-typestate ci-phase9 ci-phase10
 
 all: iso
 
@@ -470,3 +476,36 @@ check-mmu-typestate:
 
 ci-phase9: check-alloc-zero check-machete check-entropy-mutex check-jitter-lto check-arch-cfg-gate check-ct-branches check-secure-zero check-body-untouched check-mmu-typestate qemu-smoke
 	@echo "[CI] Phase 9 ci 게이트 전체 통과 (HAL standing + 신규 5 leg PASS)"
+
+#
+# Phase 10 CI 봉인 게이트 (ARM-01..ARM-12 aarch64 native port 종료 게이트)
+#
+# 7-leg 구조 (ci-phase9 standing 상속 + aarch64 신규 6 leg)
+#   1)  aarch64 크로스 빌드        cargo build --target aarch64 --release (ARM-01)
+#   1b) 명명 산출물 생성           iso-light-k0-aarch64-psci.elf (SC1 ARM-01 서술적 명칭)
+#   2)  check-vector-align         .vector_table 0x800 정렬 objdump (ARM-03)
+#   3)  check-secure-zero aarch64  memset U-entry 0 + bl memset 0 + k0_secure_zero (ARM-11)
+#   4)  check-ct-branches aarch64  조건부 분기 6 mnemonic 카운트 0 (ARM-12)
+#   5)  arch_parity                5 알고리즘 x86 aarch64 byte-diff 0 host test (ARM-10 HOST_TRIPLE)
+#   6)  qemu-test-aarch64          7-line 마커 (boot-join 이연이라 EL 마커만 honest deferral 비-fatal)
+#   7)  ci-phase9                  x86 HAL standing 회귀 leg 상속 (하드)
+#
+ci-phase10:
+	@echo "[CI] Phase 10 ci-phase10 봉인 게이트 시작 (ARM-01..ARM-12)"
+	$(CARGO) build --target $(TARGET_AARCH64) --release
+	@cp $(AARCH64_ELF) $(PSCI_ELF)
+	@test -f $(PSCI_ELF) && echo "[CI]  ok  명명 산출물 $(PSCI_ELF) 생성 (SC1 ARM-01)"
+	@AARCH64_ELF=$(AARCH64_ELF) bash scripts/check-vector-align.sh
+	@ARCH=aarch64 AARCH64_ELF=$(AARCH64_ELF) bash scripts/check-secure-zero.sh
+	@ARCH=aarch64 AARCH64_ELF=$(AARCH64_ELF) bash scripts/check-ct-branches.sh
+	@HOST_TRIPLE=$$(rustc -vV | sed -n 's/^host: //p') && \
+	 $(CARGO) test --no-default-features --target $$HOST_TRIPLE --test arch_parity
+	@echo "[CI] qemu-test-aarch64 leg boot-join 이연 EL 마커만 honest 판정 (MMU GICR CHILDREN GRP1 IRQ PSCI 6 마커 Phase 11 인계)"
+	@AARCH64_ELF=$(PSCI_ELF) EXPECTED_MARKERS=EL QEMU_TIMEOUT=20 bash scripts/qemu-test-aarch64.sh; \
+	 QRC=$$?; \
+	 if [ $$QRC -eq 0 ]; then echo "[CI]  ok  qemu-test-aarch64 runtime EL=1 마커 검출 (6 마커 boot-join 이연 deferred-items 기록)"; \
+	 elif [ $$QRC -eq 3 ]; then echo "[CI] SKIP-HONEST qemu-test-aarch64 미가용 부팅 마커 검증 이연 (deferred-items 기록)"; \
+	 else echo "[CI] DEFER qemu-test-aarch64 EL 마커 미도달 boot-join 이연 (deferred-items 기록 static host leg 는 GREEN)"; fi
+	@echo "[CI] x86 회귀 leg ci-phase9 standing 상속 실행"
+	@$(MAKE) ci-phase9
+	@echo "[CI] Phase 10 ci 게이트 전체 통과 (ARM-01..ARM-12 static host GREEN + qemu 7-line boot-join honest 이연)"

@@ -7,6 +7,7 @@
 //! 대체하지 않는 커널 raw buffer 보완 표면이며 심볼명 접두어로 명확히 분리됩니다.
 
 pub mod entropy;
+pub mod syscall;
 
 /// 컴파일러가 제거(elide) 할 수 없는 raw buffer zeroization.
 ///

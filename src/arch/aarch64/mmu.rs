@@ -19,7 +19,17 @@ use core::marker::PhantomData;
 // 공개 상수
 //
 
-pub const PAGE_SIZE: u64 = 4096;
+/// 4KiB 페이지 크기 (x86 `mmu::PAGE_SIZE: usize` 공개 표면과 정합).
+///
+/// 본체(process.rs/elf.rs)가 `crate::mmu::PAGE_SIZE` 를 usize 로 소비하므로 x86 과
+/// 동일 타입으로 노출함. 내부 물리/가상 산술은 `PAGE_SIZE_U64` 를 사용함.
+pub const PAGE_SIZE: usize = 4096;
+
+/// PAGE_SIZE 의 u64 별칭 (내부 디스크립터/주소 산술 전용).
+const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
+
+/// 2 MiB 대용량 페이지 크기 (x86 `mmu::SIZE_2MIB` 공개 표면 정합, boot/multiboot2 KASLR 정렬 검증 소비).
+pub const SIZE_2MIB: u64 = 2 * 1024 * 1024;
 
 /// 커널 선형 매핑 상위 절반 VMA 기저 (TTBR1 T1SZ=16 상위 절반 시작 주소)
 ///
@@ -66,6 +76,8 @@ const DESC_PAGE: u64 = 1 << 1;
 const DESC_ATTRINDX_SHIFT: u64 = 2;
 const DESC_AP_RW_EL1: u64 = 0b00 << 6; // RW EL1 (EL0 미허용)
 const DESC_AP_RO_EL1: u64 = 0b10 << 6; // RO EL1
+const DESC_AP_RW_EL1_EL0: u64 = 0b01 << 6; // RW EL1+EL0 (user 쓰기 가능 페이지)
+const DESC_AP_RO_EL1_EL0: u64 = 0b11 << 6; // RO EL1+EL0 (user 읽기/실행 페이지)
 const DESC_SH_NONE: u64 = 0b00 << 8; // Device non-shareable
 const DESC_SH_INNER: u64 = 0b11 << 8; // Normal Inner Shareable
 const DESC_AF: u64 = 1 << 10; // Access Flag (미set 시 첫 접근 fault)
@@ -137,6 +149,68 @@ pub enum MmuError {
     SelfTestFault,
     /// self_test UART attribute 오매핑 (PAR_EL1.SH != 0 non-Device)
     SelfTestAttr,
+}
+
+//
+// arch-중립 페이지 플래그 (x86 mmu::PageTableFlags 공개 표면 mirror)
+//
+
+/// 본체(process.rs)가 소비하는 arch-중립 페이지 매핑 의도 플래그.
+///
+/// x86 `mmu::PageTableFlags` 의 공개 API(PRESENT/WRITABLE/USER_ACCESSIBLE/NO_EXECUTE
+/// /HUGE_PAGE + empty/bits/contains/union/remove)를 동일 표면으로 노출함. 비트 값은
+/// aarch64 descriptor 인코딩과 무관한 의도 비트이며 `AddressSpace::map_page` 가
+/// aarch64 stage1 leaf descriptor(AP/UXN/PXN)로 번역함(x86 은 직접 PTE 비트).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct PageTableFlags(u64);
+
+impl PageTableFlags {
+    /// 매핑 존재 (x86 PRESENT 대응, aarch64 DESC_VALID 로 번역)
+    pub const PRESENT: Self = Self(1 << 0);
+    /// 쓰기 가능 (aarch64 AP RW + UXN/PXN W^X 자동 강제)
+    pub const WRITABLE: Self = Self(1 << 1);
+    /// 사용자(EL0) 접근 가능 (aarch64 AP EL1+EL0)
+    pub const USER_ACCESSIBLE: Self = Self(1 << 2);
+    /// 실행 금지 (x86 NO_EXECUTE, aarch64 UXN+PXN)
+    pub const NO_EXECUTE: Self = Self(1 << 3);
+    /// 대용량 페이지 (x86 HUGE_PAGE; aarch64 런타임 process 경로는 4KiB 만 사용)
+    pub const HUGE_PAGE: Self = Self(1 << 4);
+
+    #[inline]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    #[inline]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+    #[inline]
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+    #[inline]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+    #[inline]
+    pub const fn remove(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
+//
+// 사용자 영역 판정 헬퍼 (x86 mmu::is_user_va 공개 표면 mirror)
+//
+
+/// `va` 가 사용자 가상 주소(TTBR0 하위 절반) 범위이며 4KiB 정렬인지.
+///
+/// aarch64 TTBR0 는 VA 하위 절반을 담당하며 커널(TTBR1) 은 상위 절반(0xFFFF_...)
+/// 이므로 사용자 매핑은 `0x0 .. 0x0000_8000_0000_0000` 범위 + 페이지 정렬만 허용함
+/// (x86 canonical lower half 계약 계승).
+#[inline]
+pub fn is_user_va(va: u64) -> bool {
+    va < 0x0000_8000_0000_0000 && (va & (PAGE_SIZE_U64 - 1)) == 0
 }
 
 //
@@ -234,7 +308,7 @@ impl AddressSpace {
         if writable && executable {
             return Err(MmuError::WxPolicyViolation);
         }
-        if pa & (PAGE_SIZE - 1) != 0 {
+        if pa & (PAGE_SIZE_U64 - 1) != 0 {
             return Err(MmuError::UnalignedAddress);
         }
         let mut d = DESC_VALID | DESC_PAGE | DESC_AF | (pa & PA_MASK);
@@ -257,11 +331,11 @@ impl AddressSpace {
         Ok(d)
     }
 
-    /// 한 VA -> PA 매핑을 지정 루트(high=TTBR1)로 4KiB 페이지 배선함.
+    /// 한 VA -> PA 매핑을 지정 루트(high=TTBR1)로 4KiB 페이지 배선함(EL1 leaf_desc).
     ///
     /// # Errors
     /// 풀 소진 시 `TableExhausted`, 재매핑 시 `AlreadyMapped`, W^X/정렬 위반은 leaf_desc 전파
-    fn map_page(
+    fn map_leaf(
         &mut self,
         high: bool,
         va: u64,
@@ -271,6 +345,17 @@ impl AddressSpace {
         device: bool,
     ) -> Result<(), MmuError> {
         let leaf = Self::leaf_desc(pa, writable, executable, device)?;
+        self.map_desc(high, va, leaf)
+    }
+
+    /// 이미 조립된 L3 leaf 디스크립터를 지정 루트로 4-level walk 배선함.
+    ///
+    /// L0..L2 미존재 중간 테이블은 정적 풀에서 할당하며 L3 재매핑은 거부함.
+    /// `map_leaf`(EL1)와 사용자 매핑(`map_user_page`, EL0 AP) 이 공용으로 소비함.
+    ///
+    /// # Errors
+    /// 풀 소진 시 `TableExhausted`, 재매핑 시 `AlreadyMapped`
+    fn map_desc(&mut self, high: bool, va: u64, leaf: u64) -> Result<(), MmuError> {
         let mut table_pa = if high {
             self.ttbr1_root_pa()
         } else {
@@ -315,15 +400,15 @@ impl AddressSpace {
         executable: bool,
         device: bool,
     ) -> Result<(), MmuError> {
-        let start = pa_start & !(PAGE_SIZE - 1);
-        let end = (pa_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let start = pa_start & !(PAGE_SIZE_U64 - 1);
+        let end = (pa_end + PAGE_SIZE_U64 - 1) & !(PAGE_SIZE_U64 - 1);
         let mut pa = start;
         while pa < end {
             // TTBR0 하위 절반 identity 매핑 (MMU 전 실행 주소 연속성)
-            self.map_page(false, pa, pa, writable, executable, device)?;
+            self.map_leaf(false, pa, pa, writable, executable, device)?;
             // TTBR1 상위 절반 커널 선형 매핑 (linear + pa)
-            self.map_page(true, linear + pa, pa, writable, executable, device)?;
-            pa += PAGE_SIZE;
+            self.map_leaf(true, linear + pa, pa, writable, executable, device)?;
+            pa += PAGE_SIZE_U64;
         }
         Ok(())
     }
@@ -344,7 +429,7 @@ impl AddressSpace {
         kaslr_offset: u64,
         uart_phys: u64,
     ) -> Result<(), MmuError> {
-        let linear = KERNEL_VMA_BASE.wrapping_add(kaslr_offset & !(PAGE_SIZE - 1));
+        let linear = KERNEL_VMA_BASE.wrapping_add(kaslr_offset & !(PAGE_SIZE_U64 - 1));
         let text = &raw const _text_start as u64;
         let rodata = &raw const _rodata_start as u64;
         let data = &raw const _data_start as u64;
@@ -358,10 +443,150 @@ impl AddressSpace {
             // .data + .bss RW-NX (W^X writable 은 UXN+PXN 자동 강제)
             self.map_range(linear, data, end, true, false, false)?;
             // UART MMIO Device-nGnRE writable-NX (self_test 대상 Pitfall 3)
-            let uart = uart_phys & !(PAGE_SIZE - 1);
-            self.map_range(linear, uart, uart + PAGE_SIZE, true, false, true)?;
+            let uart = uart_phys & !(PAGE_SIZE_U64 - 1);
+            self.map_range(linear, uart, uart + PAGE_SIZE_U64, true, false, true)?;
         }
         Ok(())
+    }
+
+    //
+    // 런타임 process 주소 공간 표면 (x86 mmu::AddressSpace 공개 API mirror, DEF-10A-01)
+    //
+    // 본체(process.rs)는 x86 과 동일한 map_page/map_user_page/walk_to_phys/
+    // inherit_kernel_mappings 표면을 소비함. 아래 구현은 aarch64 stage1 4KiB leaf
+    // descriptor 로 번역하며, x86 W^X·사용자 격리 계약을 계승함. 사용자 페이지는
+    // TTBR0 하위 절반, 커널 매핑은 TTBR1 상위 절반으로 배선됨.
+    //
+
+    /// 사용자(EL0) 4KiB leaf descriptor 를 조립함 (W^X 자동 강제).
+    ///
+    /// 데이터(`writable = true`) 는 RW EL1+EL0 + UXN+PXN(NX), 코드(`writable = false`)
+    /// 는 RO EL1+EL0 + PXN(커널 실행 금지, 사용자 실행 허용).
+    ///
+    /// # Errors
+    /// `pa` 가 4KiB 정렬이 아니면 `MmuError::UnalignedAddress`
+    fn leaf_desc_user(pa: u64, writable: bool) -> Result<u64, MmuError> {
+        if pa & (PAGE_SIZE_U64 - 1) != 0 {
+            return Err(MmuError::UnalignedAddress);
+        }
+        let mut d = DESC_VALID
+            | DESC_PAGE
+            | DESC_AF
+            | (pa & PA_MASK)
+            | (ATTRIDX_NORMAL << DESC_ATTRINDX_SHIFT)
+            | DESC_SH_INNER;
+        if writable {
+            // 사용자 데이터 RW EL1+EL0 실행 금지(UXN+PXN) — W^X 자동
+            d |= DESC_AP_RW_EL1_EL0 | DESC_UXN | DESC_PXN;
+        } else {
+            // 사용자 코드 RO EL1+EL0 사용자 실행 허용(UXN=0) 커널 실행 금지(PXN)
+            d |= DESC_AP_RO_EL1_EL0 | DESC_PXN;
+        }
+        Ok(d)
+    }
+
+    /// 4KiB 페이지 매핑 (x86 `AddressSpace::map_page` 대응). 플래그를 aarch64 leaf
+    /// descriptor 로 번역하여 TTBR0(하위)/TTBR1(상위) 루트에 배선함.
+    ///
+    /// # Errors
+    /// - `UnalignedAddress`: `virt_addr`/`phys_addr` 가 4KiB 정렬이 아닐 때
+    /// - `WxPolicyViolation`: WRITABLE 이면서 NO_EXECUTE 부재(실행 가능)일 때
+    /// - `AlreadyMapped` / `TableExhausted`: walk 배선 실패
+    pub fn map_page(
+        &mut self,
+        virt_addr: u64,
+        phys_addr: u64,
+        flags: PageTableFlags,
+    ) -> Result<(), MmuError> {
+        if virt_addr & (PAGE_SIZE_U64 - 1) != 0 || phys_addr & (PAGE_SIZE_U64 - 1) != 0 {
+            return Err(MmuError::UnalignedAddress);
+        }
+        let writable = flags.contains(PageTableFlags::WRITABLE);
+        let executable = !flags.contains(PageTableFlags::NO_EXECUTE);
+        // x86 W^X 계약: WRITABLE 은 NO_EXECUTE 필수
+        if writable && executable {
+            return Err(MmuError::WxPolicyViolation);
+        }
+        let high = virt_addr >= 0x0000_8000_0000_0000;
+        let leaf = if flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            Self::leaf_desc_user(phys_addr, writable)?
+        } else {
+            Self::leaf_desc(phys_addr, writable, executable, false)?
+        };
+        self.map_desc(high, virt_addr, leaf)
+    }
+
+    /// 사용자 페이지 매핑 (x86 `AddressSpace::map_user_page` 대응, EL0 접근 + W^X).
+    ///
+    /// 코드(`writable = false`) 는 RO+X(EL0), 데이터(`writable = true`) 는 RW+NX(EL0).
+    /// TTBR0 하위 절반에만 배선하여 커널(TTBR1) 격리를 유지함.
+    ///
+    /// # Errors
+    /// - `UnalignedAddress`: `virt_addr` 가 사용자 영역(TTBR0 하위 절반) 밖이거나 미정렬
+    /// - `AlreadyMapped` / `TableExhausted`: walk 배선 실패
+    pub fn map_user_page(
+        &mut self,
+        virt_addr: u64,
+        phys_addr: u64,
+        writable: bool,
+    ) -> Result<(), MmuError> {
+        if !is_user_va(virt_addr) {
+            return Err(MmuError::UnalignedAddress);
+        }
+        let leaf = Self::leaf_desc_user(phys_addr, writable)?;
+        self.map_desc(false, virt_addr, leaf)
+    }
+
+    /// 가상 주소 `va` 의 4KiB 페이지 물리 주소를 페이지 테이블 워크로 산출함
+    /// (x86 `AddressSpace::walk_to_phys` 대응). 매핑 없거나 block(대용량) leaf 면 `None`.
+    ///
+    /// # Safety
+    /// build 단계(선형 매핑 미활성) 중간 테이블이 identity 물리 주소로 접근 가능하다고
+    /// 가정함. 활성화 이후에는 선형 매핑 경로로 전환되어야 하며 사용 전제 변경 시 갱신 필요.
+    pub unsafe fn walk_to_phys(&self, va: u64) -> Option<u64> {
+        let high = va >= 0x0000_8000_0000_0000;
+        let mut table_pa = if high {
+            self.ttbr1_root_pa()
+        } else {
+            self.ttbr0_root_pa()
+        };
+        for level in 0u8..3 {
+            let idx = table_index(va, level);
+            let slot = entry_ptr(table_pa, idx);
+            // SAFETY identity build 단계 중간 테이블 접근
+            let cur = unsafe { *slot };
+            if cur & DESC_VALID == 0 {
+                return None;
+            }
+            // block descriptor(bit1==0) 는 4KiB process 경로 미사용 -> None
+            if cur & DESC_PAGE == 0 {
+                return None;
+            }
+            table_pa = cur & PA_MASK;
+        }
+        let idx = table_index(va, 3);
+        let slot = entry_ptr(table_pa, idx);
+        // SAFETY L3 leaf 슬롯 접근
+        let leaf = unsafe { *slot };
+        if leaf & DESC_VALID == 0 {
+            return None;
+        }
+        Some(leaf & PA_MASK)
+    }
+
+    /// 다른 `AddressSpace` 의 커널 상위 절반(TTBR1 루트 전 엔트리) 을 계승함
+    /// (x86 `inherit_kernel_mappings` 의 PML4[256..512] 계승 대응).
+    ///
+    /// 사용자 하위 절반(TTBR0) 은 변경하지 않으므로 사용자 격리는 유지됨. 계승된
+    /// 엔트리는 `from` 의 중간 테이블 풀을 가리켜 커널 매핑을 공유함.
+    ///
+    /// # Safety
+    /// - `from` 의 TTBR1 루트가 유효한 커널 매핑(build_stage1_map 완료) 을 보유해야 함.
+    /// - 본 객체 TTBR1 루트 상위 절반이 비어 있거나 동일 매핑이어야 함.
+    pub unsafe fn inherit_kernel_mappings(&mut self, from: &AddressSpace) {
+        for i in 0..TABLE_ENTRIES {
+            self.ttbr1_root.entries[i] = from.ttbr1_root.entries[i];
+        }
     }
 }
 
@@ -424,7 +649,7 @@ impl Mmu<Uninitialized> {
     /// `None` 이면 KASLR 오프셋 0(고정 KERNEL_VMA_BASE)을 사용함. 오프셋은 4KiB 정렬로
     /// 보정되어 TTBR1 선형 매핑 기저 `PHYS_MAP_OFFSET` 에 저장됨.
     pub fn initialize(self, kaslr_offset: Option<u64>) -> Mmu<Initialized> {
-        let aligned = kaslr_offset.unwrap_or(0) & !(PAGE_SIZE - 1);
+        let aligned = kaslr_offset.unwrap_or(0) & !(PAGE_SIZE_U64 - 1);
         // SAFETY 부팅 초기 단일 코어 이 함수는 1 회만 호출됨
         unsafe {
             *(&raw mut PHYS_MAP_OFFSET) = KERNEL_VMA_BASE.wrapping_add(aligned);

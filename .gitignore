@@ -2,6 +2,8 @@ target/
 .idea/
 dist/
 *.iso
+# Phase 10 ci-phase10 이 생성하는 aarch64 명명 산출물 (SC1 ARM-01 빌드 아티팩트)
+iso-light-k0-aarch64-psci.elf
 Cargo.lock
 isodir/boot/kernel.bin
 /AIR-GAP.md

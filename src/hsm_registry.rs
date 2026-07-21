@@ -545,13 +545,13 @@ pub unsafe fn attach_kernel_side_with_attest(
 
 pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
     // Phase 0: D-15 register snapshot — rdi=BusKind, rsi=init_ptr, rdx=init_len, r8=out_ptr.
-    let bus_kind_raw = ctx.rdi;
-    let init_ptr = ctx.rsi;
-    let init_len = ctx.rdx;
-    let out_ptr = ctx.r8;
+    let bus_kind_raw = ctx.arg0;
+    let init_ptr = ctx.arg1;
+    let init_len = ctx.arg2;
+    let out_ptr = ctx.arg4;
     // Phase 5 D-04 attest payload register snapshot r10 ptr r9 len
-    let attest_ptr = ctx.r10;
-    let attest_len = ctx.r9;
+    let attest_ptr = ctx.arg3;
+    let attest_len = ctx.arg5;
 
     // Phase 1: T-02-04: Usb..SmartCard stub variants 거부 — BusInstance::new() 에 도달 0
     // Phase 6 GAP D-01 D-02 Network=6 cfg-split tls-external 분기 NETWORK_CAP_STATE Taken 검증
@@ -712,8 +712,8 @@ pub fn handle_attach(ctx: &mut SyscallContext) -> u64 {
 }
 
 pub fn handle_detach(ctx: &mut SyscallContext) -> u64 {
-    let in_ptr = ctx.rdi;
-    let user_cap_size = ctx.rdx;
+    let in_ptr = ctx.arg0;
+    let user_cap_size = ctx.arg2;
 
     // (1) 크기 sanity
     if user_cap_size != core::mem::size_of::<HsmCapability>() as u64 {
@@ -757,9 +757,9 @@ pub fn handle_detach(ctx: &mut SyscallContext) -> u64 {
 }
 
 pub fn handle_enumerate(ctx: &mut SyscallContext) -> u64 {
-    let cap_ptr = ctx.rdi;
-    let out_ptr = ctx.rsi;
-    let count = ctx.rdx;
+    let cap_ptr = ctx.arg0;
+    let out_ptr = ctx.arg1;
+    let count = ctx.arg2;
 
     // (1) cap 입력 sanity — 정확한 ABI 크기 보장
     let cap_size = core::mem::size_of::<HsmCapability>() as u64;
@@ -838,9 +838,9 @@ pub fn handle_enumerate(ctx: &mut SyscallContext) -> u64 {
 //   (5) with_relay_buf 진입 → SMAP-2 data copy → slot.bus.write
 //   (6) Pitfall 4 cap.zeroize  Pitfall 7 BusError → Internal collapse
 pub fn handle_write(ctx: &mut SyscallContext) -> u64 {
-    let cap_ptr_va = ctx.rdi;
-    let data_ptr_va = ctx.rsi;
-    let data_len = ctx.rdx as usize;
+    let cap_ptr_va = ctx.arg0;
+    let data_ptr_va = ctx.arg1;
+    let data_len = ctx.arg2 as usize;
 
     // (1) data_len ∈ (0, CHAN_MAX]  CT 분기 (CtLess::lt / CtEqOps::ne) — '<' / '==' direct 금지 (Pitfall 2 CT)
     //     상한은 CHAN_MAX 포함  D-13 4 KiB 정확 등호도 허용  CtLess::lt(&len, &(CHAN_MAX+1)) 로 ≤ CHAN_MAX 표현
@@ -932,9 +932,9 @@ pub fn handle_write(ctx: &mut SyscallContext) -> u64 {
 //   (5) with_relay_buf 진입 → src.read → dst.write atomic (D-20/D-21 CtEqOps::eq)
 //   (6) src_cap + dst_cap zeroize (Pitfall 4) + Pitfall 7 collapse
 pub fn handle_relay(ctx: &mut SyscallContext) -> u64 {
-    let src_cap_ptr_va = ctx.rdi;
-    let dst_cap_ptr_va = ctx.rsi;
-    let byte_len = ctx.rdx as usize;
+    let src_cap_ptr_va = ctx.arg0;
+    let dst_cap_ptr_va = ctx.arg1;
+    let byte_len = ctx.arg2 as usize;
 
     // (1) byte_len ∈ (0, CHAN_MAX]  CT 분기 (CtLess::lt / CtEqOps::ne)
     let lt_max: u8 = CtLess::lt(&byte_len, &(CHAN_MAX + 1)).unwrap_u8();
@@ -1064,9 +1064,9 @@ pub fn handle_relay(ctx: &mut SyscallContext) -> u64 {
 ///   (7) SMAP-2 staging → user out_ptr (별도 stac/clac 윈도우) + 모든 exit path zeroize
 pub fn handle_read(ctx: &mut SyscallContext) -> u64 {
     // (1) Argument 추출
-    let cap_ptr_va = ctx.rdi;
-    let out_ptr_va = ctx.rsi;
-    let out_len = ctx.rdx as usize;
+    let cap_ptr_va = ctx.arg0;
+    let out_ptr_va = ctx.arg1;
+    let out_len = ctx.arg2 as usize;
 
     // (2) out_len ∈ [16, WIRE_FRAME_MAX] CT 분기 — handle_write line 707-708 패턴 일관
     //     ge_min  CtLess::lt(&15, &out_len)  ↔  out_len > 15  ↔  out_len ≥ 16

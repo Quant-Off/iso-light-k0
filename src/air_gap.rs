@@ -206,7 +206,7 @@ pub unsafe fn gap_self_check() {
 #[cfg(feature = "tls-external")]
 pub fn take_network_cap(ctx: &mut SyscallContext) -> u64 {
     // Phase 0 register snapshot D-15 단일 인자 out only
-    let out_ptr = ctx.rdi;
+    let out_ptr = ctx.arg0;
 
     // Phase 1 dual-range Shared-3 BadAddress 도 Denied 콜럐스 Shared-5
     let cap_size = core::mem::size_of::<HsmCapability>() as u64; // = 16
@@ -259,7 +259,7 @@ pub fn take_network_cap(ctx: &mut SyscallContext) -> u64 {
 /// take_network_cap 의 정확한 클론 NETWORK_* AUDIT_* slot 0xFE 0xFD bus_kind Network Software
 pub fn take_audit_read_cap(ctx: &mut SyscallContext) -> u64 {
     // Phase 0 register snapshot
-    let out_ptr = ctx.rdi;
+    let out_ptr = ctx.arg0;
 
     // Phase 1 dual-range BadAddress 도 Denied 콜럐스
     let cap_size = core::mem::size_of::<HsmCapability>() as u64; // = 16
@@ -313,9 +313,9 @@ pub fn take_audit_read_cap(ctx: &mut SyscallContext) -> u64 {
 /// 호출 자체는 AUDIT_RING 미기록 D-05 audit-of-audit 회피 cap-fail 만 result 2 기록
 pub fn handle_status(ctx: &mut SyscallContext) -> u64 {
     // Phase 0 register snapshot
-    let out_ptr = ctx.rdi;
-    let out_len = ctx.rsi;
-    let caller_cap_token = ctx.rdx;
+    let out_ptr = ctx.arg0;
+    let out_len = ctx.arg1;
+    let caller_cap_token = ctx.arg2;
 
     // Phase 1 out_len 정합성 BufferTooSmall = Denied 콜럐스 Pitfall 2 AUDIT 미기록
     // SMAP 윈도우 진입 *이전* + AUDIT 미기록 → caller-side 정보만 사용 정수 < 비교 충분

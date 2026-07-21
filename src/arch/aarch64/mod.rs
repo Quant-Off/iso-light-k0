@@ -25,6 +25,22 @@ pub mod vectors;
 pub mod console;
 // mmu 는 stage1 4KiB/48-bit VA/TTBR split 페이지 테이블 + 12-step activate + self_test
 pub mod mmu;
+// gic 는 GICv3 redistributor wake(Pitfall 11) + GRP1 + enable_irq/eoi (arm-gic 0.8.1 위임)
+pub mod gic;
+// psci 는 PSCI PSCI_VERSION/CPU_ON 을 HVC conduit 으로 호출하는 전원 표면 (smccc 0.2.3 위임)
+pub mod psci;
+// syscall 은 SVC #0 벡터 진입(ESR_EL1.EC==0b010101) + arch/common dispatch (10-E ARM-08)
+pub mod syscall;
+// process_entry 는 EL0 최초 진입 eret 시퀀스(ttbr0/tlbi/elr_el1/sp_el0/spsr_el1) (10-E ARM-09)
+pub mod process_entry;
+// entropy 는 FEAT_RNG RNDR/RNDRRS + CNTVCT jitter + virtio-rng 2-of-3 quorum 위임 (10-F ARM-01)
+pub mod entropy;
+
+// smccc 0.2.3 HVC conduit 표면을 psci 서브모듈에 재노출함
+// psci.rs 는 Secure Monitor Call conduit 미사용 하드 게이트(문자열 원천 부재)를 위해
+// 크레이트를 직접 import 하지 않고 아래 재노출 별칭(Hvc / psci_version_call / psci_cpu_on_call)만 경유함
+pub(crate) use smccc::Hvc;
+pub(crate) use smccc::psci::{cpu_on as psci_cpu_on_call, version as psci_version_call};
 
 //
 // 6 HAL trait aarch64 두 번째 구현체 골격 (HAL-03 ZST 대칭)
@@ -132,18 +148,23 @@ impl crate::arch::Idt for Aarch64Idt {
     #[inline(always)]
     unsafe fn init() {
         // SAFETY 부팅 초기 단일 코어 시퀀스에서 1 회 호출 계약 승계
-        //        VBAR_EL1 벡터 로드 + 초기 IRQ mask (GIC enable_irq/eoi 는 10-D)
-        unsafe { vectors::init() }
+        //        VBAR_EL1 벡터 로드 후 GICv3 redistributor wake FIRST + GRP1 활성 (Pitfall 11)
+        //        후 부팅 proof SGI 1 회 delivery -> IRQ N delivered
+        unsafe {
+            vectors::init();
+            gic::setup();
+            gic::deliver_boot_proof_irq();
+        }
     }
     #[inline(always)]
-    unsafe fn enable_irq(_irq: u8) {
-        // Phase 10 GICD_ISENABLER 세트로 채움
-        unimplemented!("ARM-01 aarch64 enable_irq")
+    unsafe fn enable_irq(irq: u8) {
+        // SAFETY setup() 완료 및 해당 IRQ 벡터 경로 준비 후 호출 GICD/GICR ISENABLER 세트 위임
+        unsafe { gic::enable_irq(irq) }
     }
     #[inline(always)]
-    unsafe fn eoi(_irq: u8) {
-        // Phase 10 GICC_EOIR 통지로 채움
-        unimplemented!("ARM-01 aarch64 eoi")
+    unsafe fn eoi(irq: u8) {
+        // SAFETY IRQ 핸들러 컨텍스트에서만 호출 ICC_EOIR1_EL1 통지 위임
+        unsafe { gic::eoi(irq) }
     }
 }
 
@@ -172,9 +193,10 @@ pub struct Aarch64BootEntry;
 
 impl crate::arch::BootEntry for Aarch64BootEntry {
     #[inline(always)]
-    unsafe fn enter_user(_addr_space_root: u64, _entry: u64, _stack: u64) -> ! {
-        // Phase 10 msr ttbr0_el1 + msr elr_el1 + msr sp_el0 + eret 로 채움
-        unimplemented!("ARM-01 aarch64 enter_user (eret 강하)")
+    unsafe fn enter_user(addr_space_root: u64, entry: u64, stack: u64) -> ! {
+        // SAFETY 호출자가 BootEntry::enter_user 계약(유효 TTBR0 루트 + 커널 매핑 계승 +
+        //        EL0 엔트리/스택)을 승계함. process_entry 가 ttbr0/tlbi/eret 시퀀스로 강하
+        unsafe { process_entry::enter_user(addr_space_root, entry, stack) }
     }
 }
 
@@ -184,8 +206,9 @@ pub struct Aarch64Entropy;
 
 impl crate::arch::Entropy for Aarch64Entropy {
     #[inline(always)]
-    unsafe fn collect(_buf: &mut [u8]) -> Result<(), EntropyError> {
-        // Phase 10 FEAT_RNG (mrs rndr/rndrrs) + jitter quorum 배선으로 채움
-        unimplemented!("ARM-01 aarch64 entropy collect")
+    unsafe fn collect(buf: &mut [u8]) -> Result<(), EntropyError> {
+        // SAFETY 호출자가 Entropy::collect 계약(단일 진입 + 출력 버퍼 유효)을 승계
+        //        entropy::collect 가 arch-중립 QuorumEntropy 2-of-3 quorum 으로 위임
+        unsafe { entropy::collect(buf) }
     }
 }

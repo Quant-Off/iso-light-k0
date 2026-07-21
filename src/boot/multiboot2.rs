@@ -31,6 +31,9 @@ static mut BOOT_INFO: BootInfo = BootInfo::empty();
 /// boot_stub 이 부팅 초기 단일 코어 identity mapping 상태에서 RDI 규약으로만
 /// 진입시킨다. `BOOT_INFO` 는 본 부팅 단일 스레드 시점에만 기록되며 이후에는
 /// 공유 참조(`&'static`)로만 소비된다 (T-09-01).
+// Multiboot2 는 x86/GRUB 펌웨어 핸드오프 전용이며 x86 `_kernel_start` 로 합류함.
+// aarch64 는 DTB/BootInfo 별도 경로이므로 본 어댑터를 컴파일 대상에서 배제함.
+#[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 pub extern "C" fn _boot_adapter_mb2(mb2_addr: u64) -> ! {
     // SAFETY: BOOT_INFO 는 부팅 단일 코어 진입에서만 기록된 후 공유 참조로만 소비됨

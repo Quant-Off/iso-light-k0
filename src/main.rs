@@ -11,7 +11,12 @@
 pub mod allocator;
 pub mod arch; // Phase 8: arch 디렉토리 골격 (D-01 Forward) + entropy 서브트리
 // Phase 9 9-A/9-B HAL-04 ISA 의존 모듈은 src/arch/x86_64/ 로 이동하고 명시 목록 re-export 로 본체 경로 보존 (OQ6)
+#[cfg(target_arch = "x86_64")]
 pub use crate::arch::active::{boot_stub, cpu, gdt, idt, mmu, syscall, tss, vga};
+// aarch64 는 gdt/idt/tss/vga(x86 전용 세그먼트/프레임버퍼) 부재 -> arch-중립 공통
+// 서브셋만 re-export (10-05 body 중립화 x86 boot 진입은 아래 cfg 게이트로 분리)
+#[cfg(target_arch = "aarch64")]
+pub use crate::arch::active::{boot_stub, cpu, mmu, syscall};
 // Phase 9 9-C 펌웨어-중립 boot 계층 (BootInfo + multiboot2/uefi 어댑터, HAL-08)
 pub mod boot;
 // 중립 메모리맵 타입은 boot 계층으로 2차 이동됨 crate::memory_map 경로는 별칭으로 보존 (allocator 본체 무변경)
@@ -33,7 +38,11 @@ pub mod stack; // 커널 스택 + 가드 페이지 레이아웃
 pub mod tls; // TLS 1.3 PSK (psk_dhe_ke / psk_pq_hybrid_ke)
 // 보안 메모리 소거는 외부 `zeroize` 크레이트(elib-k0-nt) 사용
 
-use mmu::{AddressSpace, KERNEL_VMA_BASE, Mmu, PageTableFlags, Uninitialized};
+use mmu::AddressSpace;
+// KERNEL_VMA_BASE/Mmu/PageTableFlags/Uninitialized 는 x86 _kernel_start boot 시퀀스
+// 전용 소비 (aarch64 는 boot_stub 별도 경로) -> arch cfg 로 미사용 import 경고 제거
+#[cfg(target_arch = "x86_64")]
+use mmu::{KERNEL_VMA_BASE, Mmu, PageTableFlags, Uninitialized};
 
 //
 // 사용자 ELF 페이로드 (build.rs 가 OUT_DIR 로 복사한 후 환경변수로 노출)
@@ -219,6 +228,10 @@ fn format_jitter_dump_line<'a>(buf: &'a mut [u8; 600], data: &[u8], line_idx: u8
     &buf[..at]
 }
 
+// x86_64 multiboot2 부팅 진입점(vga/gdt/tss/idt/build_linear_map/iretq 전용). aarch64 는
+// boot_stub el1_entry 에서 별도 부팅 경로(10-C MMU stage1 + park)를 밟으므로 본 진입점을
+// 호출하지 않음 -> arch cfg 게이트로 aarch64 컴파일 대상에서 배제 (x86 byte-diff 0)
+#[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 pub extern "C" fn _kernel_start(boot_info: &'static crate::boot::BootInfo) -> ! {
     //
@@ -2014,12 +2027,12 @@ unsafe fn attest_phase5_1_wire_smoke_test() {
 ///   반환 u64  성공 시 0, 음수 SyscallError as_rax
 ///
 /// # Safety
-/// 호출자 (lumen Ring 3) 가 ctx.rsi == 3733 정확 정합 후 호출 권장 본 함수 자체가 검증
+/// 호출자 (lumen Ring 3) 가 ctx.arg1 == 3733 정확 정합 후 호출 권장 본 함수 자체가 검증
 #[cfg(feature = "smoke")]
 pub fn handle_attest_fixture_export(ctx: &mut syscall::SyscallContext) -> u64 {
     use syscall::{SyscallError, is_user_address};
-    let out_ptr = ctx.rdi;
-    let out_len = ctx.rsi as usize;
+    let out_ptr = ctx.arg0;
+    let out_len = ctx.arg1 as usize;
     if out_len != 3733 {
         return SyscallError::BadArg.as_rax();
     }
