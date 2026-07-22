@@ -1,7 +1,11 @@
+# custom
 target/
 .idea/
 dist/
 *.iso
+task-*.md
+docker.md
+
 # Phase 10 ci-phase10 이 생성하는 aarch64 명명 산출물 (SC1 ARM-01 빌드 아티팩트)
 iso-light-k0-aarch64-psci.elf
 Cargo.lock
@@ -13,5 +17,5 @@ isodir/boot/kernel.bin
 .claude/
 CLAUDE.md
 
-# Phase 5 D-02 dev trust root secret keys
+# dev trust root secret keys
 keys/*.sk*
