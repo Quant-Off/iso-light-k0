@@ -47,39 +47,72 @@ if [ ! -f "$AARCH64_ELF" ]; then
     exit 3
 fi
 
-# gtimeout(Homebrew coreutils) -> timeout 폴백 실행 상한 바운드
-TIMEOUT_CMD=""
-if command -v gtimeout >/dev/null 2>&1; then
-    TIMEOUT_CMD="gtimeout"
-elif command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_CMD="timeout"
-fi
-
 SERIAL_LOG="$(mktemp -t k0-aarch64-serial.XXXXXX)"
-trap 'rm -f "$SERIAL_LOG"' EXIT
+QEMU_STDIO_LOG="$(mktemp -t k0-aarch64-stdio.XXXXXX)"
+QEMU_PID=""
+cleanup() {
+    if [ -n "$QEMU_PID" ] && kill -0 "$QEMU_PID" 2>/dev/null; then
+        kill "$QEMU_PID" 2>/dev/null || true
+    fi
+    rm -f "$SERIAL_LOG" "$QEMU_STDIO_LOG"
+}
+trap cleanup EXIT
 
-# -display none + -serial mon:stdio 로 PL011 직렬을 stdio 로 캡처
-# (-nographic 은 stdio 를 선점하여 -serial mon:stdio 와 이중 점유 충돌하므로 -display none 사용)
-# 정상 종료는 커널 PSCI SYSTEM_OFF 또는 timeout 상한 kill 로 바운드
+# -display none + -serial file: 로 PL011 직렬을 로그 파일로 직접 캡처
+# (백그라운드 실행에서 mon:stdio 는 stdin 점유로 SIGTTIN/조기 EOF 위험 -> file: 로 회피)
+# 커널은 7-line proof 후 wfi park 하여 스스로 종료하지 않으므로 요구 마커 전량 검출 시
+# 조기 kill 로 종결함 (기존 full-timeout grep 대비 PASS/FAIL 판정 동일 실행 시간만 단축)
 QEMU_ARGS=(
     -M virt,gic-version=3
     -cpu cortex-a72
     -m 512M
     -display none
-    -serial mon:stdio
+    -serial "file:$SERIAL_LOG"
     -kernel "$AARCH64_ELF"
 )
 
+# 요구 마커 키 전량이 로그에 존재하는지 판정 (조기 종료 조건)
+all_markers_present() {
+    local key pat
+    for key in $REQ_KEYS; do
+        pat="$(marker_pattern "$key")"
+        [ -z "$pat" ] && continue
+        grep -qE "$pat" "$SERIAL_LOG" 2>/dev/null || return 1
+    done
+    return 0
+}
+
 set +e
-if [ -n "$TIMEOUT_CMD" ]; then
-    "$TIMEOUT_CMD" "$QEMU_TIMEOUT" "$QEMU_BIN" "${QEMU_ARGS[@]}" > "$SERIAL_LOG" 2>&1
-    QEMU_EXIT=$?
-else
-    echo "[CI] WARN gtimeout/timeout 미존재 상한 없이 실행" >&2
-    "$QEMU_BIN" "${QEMU_ARGS[@]}" > "$SERIAL_LOG" 2>&1
-    QEMU_EXIT=$?
+"$QEMU_BIN" "${QEMU_ARGS[@]}" </dev/null > "$QEMU_STDIO_LOG" 2>&1 &
+QEMU_PID=$!
+
+# 1s 간격 폴링 상한 QEMU_TIMEOUT 초 마커 전량 검출 또는 QEMU 자체 종료 시 루프 탈출
+elapsed=0
+EARLY_EXIT=false
+while [ "$elapsed" -lt "$QEMU_TIMEOUT" ]; do
+    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+        break
+    fi
+    if all_markers_present; then
+        EARLY_EXIT=true
+        break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+# wfi park 은 스스로 종료하지 않으므로 SIGTERM 으로 종결
+if kill -0 "$QEMU_PID" 2>/dev/null; then
+    kill "$QEMU_PID" 2>/dev/null || true
 fi
+wait "$QEMU_PID" 2>/dev/null
+QEMU_EXIT=$?
+QEMU_PID=""
 set -e
+
+if $EARLY_EXIT; then
+    echo "[CI]  ok  요구 마커 전량 조기 검출 (${elapsed}s 경과 QEMU_TIMEOUT=${QEMU_TIMEOUT}s 미도달)"
+fi
 
 # 마커 fail-accumulator 누락 마커 전량 보고
 FAIL=false
@@ -98,13 +131,17 @@ for key in $REQ_KEYS; do
     fi
 done
 
-echo "[CI] qemu-system-aarch64 종료 코드 ${QEMU_EXIT} (124=timeout 상한)"
+echo "[CI] qemu-system-aarch64 종료 코드 ${QEMU_EXIT} (143=SIGTERM 조기 종결 / 124=timeout 상한)"
 
 if $FAIL; then
     echo "[CI] FAIL aarch64 부팅 마커 누락 (${#MISSING[@]} 건)" >&2
     for m in "${MISSING[@]}"; do
         echo "  - $m" >&2
     done
+    if [ -s "$QEMU_STDIO_LOG" ]; then
+        echo "[CI] --- qemu-system-aarch64 stdout/stderr ---" >&2
+        cat "$QEMU_STDIO_LOG" >&2
+    fi
     exit 1
 fi
 

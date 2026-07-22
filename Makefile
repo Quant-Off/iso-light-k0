@@ -45,6 +45,7 @@ ISO_REL      := $(KERNEL_NAME)-release.iso
 CARGO        := cargo
 GRUB_MKRES   := grub-mkrescue
 QEMU         := qemu-system-x86_64
+QEMU_AARCH64 := qemu-system-aarch64
 
 # macOS에서 Homebrew로 설치된 GRUB 위치 탐색
 ifeq ($(shell uname),Darwin)
@@ -77,6 +78,15 @@ ifeq ($(shell uname),Darwin)
     ifeq ($(QEMU),)
         QEMU := qemu-system-x86_64
     endif
+    QEMU_AARCH64 := $(shell \
+        for p in \
+            /opt/homebrew/bin/qemu-system-aarch64 \
+            /usr/local/bin/qemu-system-aarch64; do \
+            [ -x "$$p" ] && echo "$$p" && break; \
+        done)
+    ifeq ($(QEMU_AARCH64),)
+        QEMU_AARCH64 := qemu-system-aarch64
+    endif
 endif
 
 #
@@ -103,6 +113,34 @@ QEMU_DEBUG_FLAGS := \
     -D /tmp/qemu-$(KERNEL_NAME).log
 
 #
+# aarch64 QEMU 옵션 (GRUB/ISO 없이 -kernel 직접 부팅 + PL011 직렬)
+#
+# 헤드리스 마커 하네스는 scripts/qemu-test-aarch64.sh 가 자체적으로 -serial file: 로
+# 캡처하므로 여기서는 대화형 run 용 flag (mon:stdio 로 7-line proof 라이브 관측) 만 정의함.
+# 커널은 proof 후 wfi park 하여 스스로 종료하지 않으므로 run-aarch64 는 상한(timeout) 후
+# 자동 종결하되, 그 상한 만료(exit 124)는 정상 종료로 처리하고 진짜 QEMU 오류만 노출함.
+AARCH64_SMOKE_TIMEOUT := 30
+AARCH64_RUN_TIMEOUT   := 12
+
+QEMU_AARCH64_FLAGS := \
+    -M virt,gic-version=3 \
+    -cpu cortex-a72 \
+    -m 512M \
+    -display none \
+    -serial mon:stdio \
+    -no-reboot
+
+# 대화형 run 상한 종결용 timeout 커맨드 (gtimeout -> timeout 폴백 미존재 시 무상한)
+TIMEOUT_CMD := $(shell command -v gtimeout 2>/dev/null || command -v timeout 2>/dev/null || true)
+
+# run-aarch64 실행 커맨드 timeout 존재 시 상한 래핑 부재 시 무상한(사용자 Ctrl-A X 종료)
+ifeq ($(TIMEOUT_CMD),)
+RUN_AARCH64_CMD := $(QEMU_AARCH64) $(QEMU_AARCH64_FLAGS) -kernel $(PSCI_ELF)
+else
+RUN_AARCH64_CMD := $(TIMEOUT_CMD) $(AARCH64_RUN_TIMEOUT) $(QEMU_AARCH64) $(QEMU_AARCH64_FLAGS) -kernel $(PSCI_ELF)
+endif
+
+#
 # 사용자 ELF (Ring 3 스모크 테스트 / lumen 와이어 호환 검증)
 #
 USER_HELLO_DIR := crates/iso-user-hello
@@ -114,7 +152,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external check-machete ci-phase7 ci-phase8 check-jitter-lto check-virtio-sentinel check-entropy-mutex qemu-tcg qemu-kvm entropy-host-test check-arch-cfg-gate check-ct-branches check-secure-zero check-body-untouched check-mmu-typestate ci-phase9 ci-phase10
+.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external check-machete ci-phase7 ci-phase8 check-jitter-lto check-virtio-sentinel check-entropy-mutex qemu-tcg qemu-kvm entropy-host-test check-arch-cfg-gate check-ct-branches check-secure-zero check-body-untouched check-mmu-typestate ci-phase9 ci-phase10 build-aarch64 run-aarch64 qemu-smoke-aarch64 test-aarch64
 
 all: iso
 
@@ -196,6 +234,48 @@ run-rel: iso-rel
 run-dbg: iso
 	@echo "[DBG] QEMU 로그: /tmp/qemu-$(KERNEL_NAME).log"
 	$(QEMU) $(QEMU_DEBUG_FLAGS)
+
+#
+# aarch64 환경 테스트 (x86 build / run / qemu-smoke 대응 -kernel 직접 부팅 레인)
+#
+#   build-aarch64       aarch64 release ELF 빌드 + 명명 산출물 $(PSCI_ELF) 생성
+#   run-aarch64         QEMU virt 대화형 부팅 (PL011 직렬로 7-line proof 라이브 관측 상한 종결)
+#   qemu-smoke-aarch64  헤드리스 7-line proof 마커 전량 하드 판정 (조기 종료 하네스)
+#   test-aarch64        aarch64 전용 게이트 전량 (정적 3 + arch_parity + qemu-smoke) macOS GREEN 레인
+#
+build-aarch64:
+	$(CARGO) build --target $(TARGET_AARCH64) --release
+	@cp $(AARCH64_ELF) $(PSCI_ELF)
+	@echo "[aarch64] ELF 빌드 완료: $(PSCI_ELF)"
+
+run-aarch64: build-aarch64
+	@echo "[aarch64] QEMU virt 대화형 부팅 (Ctrl-A X 종료 상한 $(AARCH64_RUN_TIMEOUT)s)"
+	@rc=0; $(RUN_AARCH64_CMD) || rc=$$?; \
+	 case $$rc in \
+	   0)       echo "[aarch64] 부팅 세션 정상 종료 (rc=0)" ;; \
+	   124)     echo "[aarch64] 상한 $(AARCH64_RUN_TIMEOUT)s 도달 자동 종료 (정상 커널은 proof 후 wfi park 하여 스스로 멈추지 않음)" ;; \
+	   130|143) echo "[aarch64] 사용자 인터럽트 종료 (rc=$$rc)" ;; \
+	   *)       echo "[aarch64] QEMU 비정상 종료 rc=$$rc" >&2; exit $$rc ;; \
+	 esac
+
+qemu-smoke-aarch64: build-aarch64
+	@AARCH64_ELF=$(PSCI_ELF) \
+	    EXPECTED_MARKERS="EL MMU GICR CHILDREN GRP1 IRQ PSCI" \
+	    QEMU_TIMEOUT=$(AARCH64_SMOKE_TIMEOUT) \
+	    bash scripts/qemu-test-aarch64.sh
+	@echo "[aarch64] qemu-smoke-aarch64 7-line proof 마커 전량 검출 PASS"
+
+# aarch64 전용 회귀 레인 (ci-phase10 은 x86 ci-phase9 를 상속해 macOS 에서 FAIL 하므로
+# 그 x86 baggage 없이 aarch64 산출물만 검증하는 macOS GREEN 레인을 별도 제공)
+test-aarch64: qemu-smoke-aarch64
+	@echo "[aarch64] 정적 게이트 3종 (vector-align / secure-zero / ct-branches)"
+	@AARCH64_ELF=$(PSCI_ELF) bash scripts/check-vector-align.sh
+	@ARCH=aarch64 AARCH64_ELF=$(PSCI_ELF) bash scripts/check-secure-zero.sh
+	@ARCH=aarch64 AARCH64_ELF=$(PSCI_ELF) bash scripts/check-ct-branches.sh
+	@echo "[aarch64] arch_parity host test (5 알고리즘 x86 aarch64 byte-diff 0)"
+	@HOST_TRIPLE=$$(rustc -vV | sed -n 's/^host: //p') && \
+	    $(CARGO) test --no-default-features --target $$HOST_TRIPLE --test arch_parity
+	@echo "[aarch64] test-aarch64 전량 PASS (정적 3 + arch_parity + qemu-smoke)"
 
 #
 # 정리
