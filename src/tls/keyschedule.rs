@@ -1,22 +1,22 @@
 //! TLS 1.3 키 스케줄 (RFC 8446 §7.1, §7.2) 을 수행하는 모듈입니다.
 //!
 //! 각 단계의 도출 관계는 다음과 같습니다.
-//!   - PSK -> HKDF-Extract(0, PSK) -> EarlySecret.
-//!     EarlySecret 에서 Derive-Secret(_, "ext binder", "") -> BinderKey,
-//!     Derive-Secret(_, "derived", "") -> EarlyDerived 가 도출됨.
-//!   - EarlyDerived -> HKDF-Extract(_, ECDHE_SS) -> HandshakeSecret.
-//!     HandshakeSecret 에서 "c hs traffic" -> C-HS-TS,
-//!     "s hs traffic" -> S-HS-TS, "derived" -> HSDerived 가 도출됨.
-//!   - HSDerived -> HKDF-Extract(_, 0) -> MasterSecret.
-//!     MasterSecret 에서 "c ap traffic" -> C-AP-TS_0, "s ap traffic" ->
-//!     S-AP-TS_0 가 도출됨.
-//!   - per-direction:
+//!   - PSK 에 HKDF-Extract(0, PSK) 를 적용해 EarlySecret 을 얻습니다.
+//!     EarlySecret 에서 Derive-Secret(_, "ext binder", "") 로 BinderKey 를,
+//!     Derive-Secret(_, "derived", "") 로 EarlyDerived 를 도출합니다.
+//!   - EarlyDerived 에 HKDF-Extract(_, ECDHE_SS) 를 적용해 HandshakeSecret 을
+//!     얻습니다. HandshakeSecret 에서 "c hs traffic" 으로 C-HS-TS,
+//!     "s hs traffic" 으로 S-HS-TS, "derived" 로 HSDerived 를 도출합니다.
+//!   - HSDerived 에 HKDF-Extract(_, 0) 를 적용해 MasterSecret 을 얻습니다.
+//!     MasterSecret 에서 "c ap traffic" 으로 C-AP-TS_0, "s ap traffic" 으로
+//!     S-AP-TS_0 를 도출합니다.
+//!   - 방향별로 다음을 도출합니다.
 //!     key          = HKDF-Expand-Label(traffic_secret, "key", "", AEAD_KEY_LEN)
 //!     iv           = HKDF-Expand-Label(traffic_secret, "iv",  "", AEAD_IV_LEN)
 //!     finished_key = HKDF-Expand-Label(traffic_secret, "finished", "", hash_len)
 //!
-//! Hybrid 시 ECDHE_SS = X25519_SS ‖ ML-KEM-768_SS (draft-ietf-tls-hybrid),
-//! Classical 시 ECDHE_SS = X25519_SS 입니다.
+//! Hybrid 시 ECDHE_SS 는 X25519_SS 와 ML-KEM-768_SS 를 이어붙인 값이며
+//! (draft-ietf-tls-hybrid), Classical 시 ECDHE_SS 는 X25519_SS 입니다.
 
 use zeroize::Secret;
 
@@ -40,7 +40,7 @@ pub fn hkdf_expand_label(
     context: &[u8],
     out: &mut [u8],
 ) -> Result<(), TlsError> {
-    // "tls13 " 접두사 + label 합산 길이는 1 바이트 length 필드에 들어가야 함
+    // "tls13 " 접두사 + label 합산 길이는 1 바이트 length 필드에 수용
     let prefixed_label_len = 6usize + label.len();
     if prefixed_label_len > 255 || context.len() > 255 {
         return Err(TlsError::Internal);
@@ -139,7 +139,7 @@ pub fn derive_early_secrets<H: crate::hsm::HsmDriver>(
     hsm.psk_hkdf_extract(psk_id, &ZERO_HASH, out.early.expose_mut())?;
 
     // BinderKey = Derive-Secret(EarlySecret, "ext binder", "")
-    // "ext binder" 는 외부(외부 분배) PSK 에 사용. resumption_master_secret 이 아닌 PSK 임을 식별
+    // "ext binder" 는 외부 분배 PSK 용이며 resumption_master_secret 이 아닌 PSK 임을 식별
     let h_empty = sha256_of_empty();
     derive_secret(
         out.early.expose(),

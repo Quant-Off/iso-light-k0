@@ -20,7 +20,7 @@ use ed25519::{PublicKey as Ed25519Pk, SecretKey as Ed25519Sk, Signature as Ed255
 use ed448::{PublicKey as Ed448Pk, SecretKey as Ed448Sk, Signature as Ed448Sig};
 use sha2::{SHA2, SHA256};
 use sha3::{SHA3, SHA3_256, SHA3_512};
-use x448::{PublicKey as X448Pk, SecretKey as X448Sk};
+use x448::{PublicKey as X448Pk, SecretKey as X448Sk, SharedSecret as X448Shared};
 use zeroize::volatile::secure_zero;
 use zeroize::{Secret, Zeroize};
 
@@ -105,7 +105,7 @@ fn write_error_reply(buf: &mut [u8; IPC_MAX_PAYLOAD], err: CryptoError) {
     buf[0] = err as u8;
 }
 
-/// 성공 응답 페이로드를 조립 — CryptoPayload 레이아웃 재사용.
+/// 성공 응답 페이로드를 조립하며 CryptoPayload 레이아웃을 재사용한다.
 ///
 /// - `algo`      : 요청된 알고리즘 식별자 (에코)
 /// - `data`      : 결과 바이트 (ciphertext+tag, plaintext, digest, derived key 등)
@@ -118,7 +118,7 @@ fn write_ok_reply(
     if data.len() > CRYPTO_DATA_LEN {
         return Err(CryptoError::OutputTooLarge);
     }
-    // SAFETY: buf는 align(8) 보장 없음 -> unaligned write 로 CryptoPayload 필드를 채움
+    // SAFETY: buf는 align(8) 보장이 없으므로 unaligned write 로 CryptoPayload 필드를 채움
     //         fixed offsets 에 직접 기록함 (CRYPTO_DATA_OFFSET = 88)
     buf[0] = algo; // algo
     buf[1] = 0; // key_len (응답엔 키 없음)
@@ -137,7 +137,7 @@ fn write_ok_reply(
 // HMAC-SHA256
 //
 
-/// HMAC-SHA256 — RFC 2104.
+/// HMAC-SHA256 (RFC 2104).
 ///
 /// `data_chunks` 는 순서대로 연결된 메시지로 간주됨 (HKDF 내부에서 T(i-1) ‖ info ‖ i
 /// 를 계산할 때 할당 없이 streaming 연결을 위함).
@@ -186,7 +186,7 @@ pub(crate) fn hmac_sha256_multi(
     let outer = outer_h.finalize();
 
     out.copy_from_slice(outer.as_bytes());
-    // Secret drop 이 key_block/ipad/opad 소거 — 명시적 zeroize 불필요
+    // Secret drop 이 key_block/ipad/opad 를 소거하므로 명시적 zeroize 불필요
 }
 
 //
@@ -217,7 +217,7 @@ pub(crate) fn hkdf_expand(
     // 두 버퍼를 분리해 borrow checker 충돌(동시 immut/mut) 회피
     let mut t_prev = Secret::new([0u8; SHA256_OUTPUT_SIZE]);
     let mut t_curr = Secret::new([0u8; SHA256_OUTPUT_SIZE]);
-    let mut prev_len = 0usize; // 0 -> 첫 반복은 T(i-1) 미포함
+    let mut prev_len = 0usize; // 0 이면 첫 반복은 T(i-1) 미포함
     let mut produced = 0usize;
     let mut counter: u8 = 1;
 
@@ -238,7 +238,7 @@ pub(crate) fn hkdf_expand(
         okm[produced..produced + take].copy_from_slice(&t_curr.expose()[..take]);
         produced += take;
 
-        // T(i) -> T(i-1) 슬롯으로 회전 (t_prev = t_curr)
+        // T(i) 를 T(i-1) 슬롯으로 회전 (t_prev = t_curr)
         t_prev.expose_mut().copy_from_slice(t_curr.expose());
         prev_len = SHA256_OUTPUT_SIZE;
 
@@ -285,7 +285,7 @@ fn handle_encrypt(
             // ct_len 은 평문 길이와 동일 (AEAD)
             let total = ct_len + GCM_TAG_SIZE;
             if total > CRYPTO_DATA_LEN {
-                // 응답 버퍼 초과 — 실패로 전환 및 소거
+                // 응답 버퍼 초과 시 실패로 전환하고 소거
                 ciphertext.expose_mut().zeroize();
                 tag.zeroize();
                 return Err(CryptoError::OutputTooLarge);
@@ -369,23 +369,26 @@ fn encrypt_aes256gcm(
     let mut nonce = [0u8; GCM_NONCE_SIZE];
     nonce.copy_from_slice(&req.nonce[..GCM_NONCE_SIZE]);
 
-    // M3 GCM 논스 재사용은 GHASH 키 복원과 보편적 위조로 직결됨
+    // GCM 논스 재사용은 GHASH 키 복원과 보편적 위조로 직결
     // 전 유일성 강제는 와이어 계약 변경(커널측 논스 생성) 필요 사항이나
-    // 최소한 명백한 오용인 전영(all-zero) 논스는 암호화 시점에 거부함
+    // 최소한 명백한 오용인 전영(all-zero) 논스는 암호화 시점에 거부
     if nonce.iter().all(|&b| b == 0) {
         nonce.zeroize();
         key.expose_mut().zeroize();
         return Err(CryptoError::WeakNonce);
     }
 
-    let cipher = AES256GCM::new(key.expose());
-    cipher.encrypt(
-        &nonce,
-        &[], // AAD 없음 (확장 가능)
-        &plaintext.expose()[..pt_len],
-        &mut ciphertext.expose_mut()[..pt_len],
-        tag,
-    );
+    let mut cipher = AES256GCM::default();
+    cipher.init(key.expose());
+    cipher
+        .encrypt(
+            &nonce,
+            &[], // AAD 없음 (확장 가능)
+            &plaintext.expose()[..pt_len],
+            &mut ciphertext.expose_mut()[..pt_len],
+            tag,
+        )
+        .map_err(|_| CryptoError::InvalidDataLength)?;
     nonce.zeroize();
     // cipher / key 는 Drop 에서 소거
     Ok(pt_len)
@@ -411,9 +414,10 @@ fn decrypt_aes256gcm(
     let mut nonce = [0u8; GCM_NONCE_SIZE];
     nonce.copy_from_slice(&req.nonce[..GCM_NONCE_SIZE]);
 
-    let cipher = AES256GCM::new(key.expose());
+    let mut cipher = AES256GCM::default();
+    cipher.init(key.expose());
     // elib AES256GCM::decrypt 는 내부에서 constant-time 태그 비교 수행
-    let ok = cipher.decrypt(
+    let dec = cipher.decrypt(
         &nonce,
         &[],
         &ciphertext.expose()[..ct_len],
@@ -422,8 +426,8 @@ fn decrypt_aes256gcm(
     );
     nonce.zeroize();
 
-    if !ok {
-        // AEAD 인증 실패 — 평문 버퍼를 호출자에게 반환 전 소거 (업스트림에서 재소거해도 무해)
+    if dec.is_err() {
+        // AEAD 인증 실패 시 평문 버퍼를 호출자에게 반환 전 소거 (업스트림에서 재소거해도 무해)
         plaintext.expose_mut().zeroize();
         return Err(CryptoError::AuthenticationFailed);
     }
@@ -450,15 +454,16 @@ fn encrypt_chacha20poly(
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&req.nonce[..12]);
 
-    // M3 ChaCha20-Poly1305 논스 재사용은 키스트림 재사용과 인증 위조로 직결됨
-    // 전영(all-zero) 논스는 명백한 오용이므로 암호화 시점에 거부함
+    // ChaCha20-Poly1305 논스 재사용은 키스트림 재사용과 인증 위조로 직결
+    // 전영(all-zero) 논스는 명백한 오용이므로 암호화 시점에 거부
     if nonce.iter().all(|&b| b == 0) {
         nonce.zeroize();
         key.expose_mut().zeroize();
         return Err(CryptoError::WeakNonce);
     }
 
-    let aead = ChaCha20Poly1305::new(key.expose());
+    let mut aead = ChaCha20Poly1305::default();
+    aead.init(key.expose());
     aead.encrypt(
         &nonce,
         &[],
@@ -491,7 +496,8 @@ fn decrypt_chacha20poly(
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&req.nonce[..12]);
 
-    let aead = ChaCha20Poly1305::new(key.expose());
+    let mut aead = ChaCha20Poly1305::default();
+    aead.init(key.expose());
     // elib ChaCha20Poly1305::decrypt 는 내부 poly1305_verify 로 CT 태그 비교
     let r = aead.decrypt(
         &nonce,
@@ -564,7 +570,7 @@ fn handle_hash(req: &CryptoPayload, reply: &mut [u8; IPC_MAX_PAYLOAD]) -> Result
             let mut h = SHA3_512::new();
             h.update(msg);
             let digest = h.finalize();
-            // SHA3-512 출력 64B; CRYPTO_DATA_LEN(168)에 충분히 수용됨
+            // SHA3-512 출력 64B; CRYPTO_DATA_LEN(168)에 충분히 수용
             let mut out = [0u8; SHA3_512_OUTPUT_SIZE];
             out.copy_from_slice(&digest.as_bytes()[..SHA3_512_OUTPUT_SIZE]);
             let r = write_ok_reply(reply, req.algo, &out);
@@ -620,11 +626,11 @@ fn handle_kdf(req: &CryptoPayload, reply: &mut [u8; IPC_MAX_PAYLOAD]) -> Result<
 
     let salt = &req.nonce[..nonce_len];
 
-    // Extract -> PRK
+    // Extract 로 PRK 생성
     let mut prk = Secret::new([0u8; SHA256_OUTPUT_SIZE]);
     hkdf_extract(salt, &ikm.expose()[..key_len], prk.expose_mut());
 
-    // Expand -> OKM
+    // Expand 로 OKM 생성
     let mut okm = Secret::new([0u8; HKDF_MAX_OUTPUT]);
     match hkdf_expand(prk.expose(), info, &mut okm.expose_mut()[..okm_len]) {
         Ok(()) => {
@@ -685,7 +691,8 @@ fn handle_sign(
             }
             let mut raw = Secret::new([0u8; ED25519_SK_SIZE]);
             raw.expose_mut().copy_from_slice(&req.key[..ED25519_SK_SIZE]);
-            let sk = Ed25519Sk::from_bytes(raw.expose());
+            let mut sk = Ed25519Sk::default();
+            sk.init(raw.expose());
             let sig = ed25519::sign(&req.data[..data_len], &sk);
             write_ok_reply(reply, req.algo, sig.as_bytes())
             // sk, raw 은 Drop 시 자동 소거
@@ -697,7 +704,8 @@ fn handle_sign(
             let sk_arr: &[u8; ED448_SK_SIZE] = req.key[..ED448_SK_SIZE]
                 .try_into()
                 .map_err(|_| CryptoError::InvalidKeyLength)?;
-            let sk = Ed448Sk::from_bytes(sk_arr);
+            let mut sk = Ed448Sk::default();
+            sk.init(sk_arr);
             let sig = ed448::sign(&req.data[..data_len], &sk);
             write_ok_reply(reply, req.algo, sig.as_bytes())
         }
@@ -796,13 +804,15 @@ fn handle_dh(
             let pk_arr: [u8; X448_PK_SIZE] = req.data[..X448_PK_SIZE]
                 .try_into()
                 .map_err(|_| CryptoError::InvalidDataLength)?;
-            let sk = X448Sk::from_bytes(sk_arr);
-            // CRY-02 X448Sk 로 복사(Copy)된 개인키 로컬 원본 잔재를 즉시 소거
+            let mut sk = X448Sk::default();
+            sk.init(&sk_arr);
+            // X448Sk 로 복사된 개인키 로컬 원본 잔재를 즉시 소거
             sk_arr.zeroize();
             let peer_pk = X448Pk::from_bytes(pk_arr);
+            // 제자리 계산 공유비밀은 호출자가 둔 SharedSecret 에 직접 기록됨
+            let mut shared = X448Shared::default();
             // 소그룹 공격 방지: 저차수 점(공유비밀 0)은 라이브러리가 Err 로 거부
-            let shared = sk
-                .diffie_hellman(&peer_pk)
+            sk.diffie_hellman_into(&peer_pk, &mut shared)
                 .map_err(|_| CryptoError::AuthenticationFailed)?;
             write_ok_reply(reply, req.algo, shared.as_bytes())
             // shared: SharedSecret(Secret<[u8;56]>) 은 Drop 시 자동 소거
@@ -836,7 +846,7 @@ pub unsafe fn dispatch() -> Result<(), IpcError> {
     // SAFETY: 호출자가 동기화 보장
     let msg = unsafe { ipc_recv(EP_CRYPTO)? };
 
-    // 2. CryptoPayload 파싱 -> Secret
+    // 2. CryptoPayload 파싱 후 Secret 래핑
     let req_parse = parse_request(&msg);
 
     // 3. 응답 버퍼 (Secret 로 감싸 Drop 시 소거)
@@ -881,12 +891,12 @@ pub unsafe fn dispatch() -> Result<(), IpcError> {
     // 5. 결과에 따라 응답 조립
     let (final_type, final_len) = match result {
         Ok(()) => {
-            // 성공 — reply 는 write_ok_reply 로 이미 작성됨
+            // 성공 시 reply 는 write_ok_reply 로 이미 작성
             let payload_len = core::mem::size_of::<CryptoPayload>();
             (reply_type, payload_len)
         }
         Err(e) => {
-            // 에러 응답 — reply 를 다시 작성 (기존 성공-경로 내용 소거 후)
+            // 에러 응답 시 reply 를 다시 작성 (기존 성공 경로 내용 소거 후)
             // SAFETY: reply.expose_mut() 는 [u8; IPC_MAX_PAYLOAD]
             unsafe {
                 secure_zero(reply.expose_mut().as_mut_ptr(), IPC_MAX_PAYLOAD);

@@ -6,7 +6,7 @@
 //!   1. 슬롯은 정적 고정 풀 (`alloc` 금지).
 //!   2. 모든 키 자료는 `Secret<[u8; MAX_PSK_LEN]>` 으로 래핑하여 슬롯 Drop
 //!      시 volatile-write + 메모리 배리어로 자동 소거.
-//!   3. 슬롯 lifecycle 은 `Empty -> Provisioned -> Wiped` 이며 `Wiped` 는
+//!   3. 슬롯 lifecycle 은 `Empty` 에서 `Provisioned` 로, 다시 `Wiped` 로 진행하며 `Wiped` 는
 //!      단방향(재사용 금지) 으로, 누설된 메타데이터 식별자 자체를 재공급에
 //!      재사용할 수 없도록 차단.
 //!   4. PSK 길이는 슬롯별 가변(16..=64) 으로 TLS 1.3 PSK 식별자/키 길이의
@@ -17,7 +17,8 @@
 //! 본 모듈은 [`crate::hsm::HsmDriver`] 를 구현하여 TLS 키 스케줄에 HSM 환경과
 //! 동일한 인터페이스를 노출합니다.
 
-use constant_time::{Choice, CtEqOps};
+use constant_time::Choice;
+use constant_time::traits::CtEqOps;
 use zeroize::Secret;
 use zeroize::volatile::secure_zero;
 
@@ -33,19 +34,28 @@ pub const MAX_PSK_SLOTS: usize = 8;
 /// 더 긴 PSK 가 필요하면 본 풀과 분리된 별도 풀을 추가하여 대응.
 pub const MAX_PSK_LEN: usize = 64;
 
-// Phase 5 D-Discretion 신뢰 루트 PSK slot 네임스페이스 예약
-// RESEARCH §14.2 Option (iii) stub 본 const 는 본 페이즈에서 사용되지 않으며 향후 keystore provisioning 의 자리만 잡음
+// 신뢰 루트 PSK slot 네임스페이스 예약
+// 아직 쓰이지 않으며 향후 keystore provisioning 을 위한 자리만 잡음
 #[allow(dead_code)]
 pub const TRUST_ROOT_PSK_SLOT: u8 = 0xFE;
 
-// Phase 5.1 D-03 신뢰 루트 ML-DSA-44 PK 의 raw 1312-옥텟 슬롯
+// 신뢰 루트 ML-DSA-44 PK 의 raw 1312-옥텟 슬롯
 //
 // `k0_trust_root_keystore` cfg 활성 빌드에서만 부팅 시 채워질 수 있음
-// closed 빌드는 본 정적 자료 + helper 가 cfg-out → binary 심볼 0
+// closed 빌드는 본 정적 자료와 helper 가 cfg-out 되어 binary 심볼 0
 //
 // MAX_PSK_LEN = 64 와 별개의 raw 1312 옥텟 슬롯 책임 경계 분리
 #[cfg(k0_trust_root_keystore)]
 static mut TRUST_ROOT_PK_SLOT: Option<[u8; 1312]> = None;
+
+// 빌드 타임 임베드 프로덕션 신뢰 루트 (K0_TRUST_ROOT_KEYSTORE 경로 지정 빌드 전용)
+//
+// build.rs 가 지정 파일을 검증(길이 1312, 비 all-zero, 비 dev 지문)한 뒤 OUT_DIR 로
+// staging 하고 그 절대 경로를 K0_TRUST_ROOT_KEYSTORE_PATH 로 노출하고, 본 const 는
+// 그 프로덕션 PK 만 바이너리에 임베드하므로 dev 상수는 keystore 빌드에서 완전히 부재
+#[cfg(k0_trust_root_keystore)]
+pub const KEYSTORE_TRUST_ROOT_PK: [u8; 1312] =
+    *include_bytes!(env!("K0_TRUST_ROOT_KEYSTORE_PATH"));
 
 /// trust root 1312-옥텟 PK 를 raw 복사로 반환
 ///
@@ -58,16 +68,22 @@ pub fn read_trust_root_pk() -> Option<[u8; 1312]> {
     unsafe { (*(&raw const TRUST_ROOT_PK_SLOT)).clone() }
 }
 
-/// trust root 1312-옥텟 PK 의 provision (production 진입점 stub)
+/// trust root 1312-옥텟 PK 를 keystore 슬롯에 provision 한다 (production 진입점)
+///
+/// 공급 자료가 all-zero (미초기화, 무효 키 자료) 이면 거부한다. 길이는 타입으로 이미
+/// 1312 옥텟이 강제된다. 유효하면 슬롯을 채우고 이후 `read_trust_root_pk` 가 반환한다.
 ///
 /// # Safety
-/// 호출자가 BSP single-core 부팅 초기 invariant 보장
-/// 본 페이즈는 read 가능 상태만 잠금 실 provisioning 흐름은 향후 phase
+/// 호출자가 BSP single-core 부팅 초기 invariant 를 보장해야 한다 SMP 시 spinlock 필요
 ///
 /// # Errors
-/// 현재 항상 Ok(()) 향후 phase 가 validation 추가
+/// `pk` 가 all-zero 이면 `KeystoreError::InvalidLength`
 #[cfg(k0_trust_root_keystore)]
 pub unsafe fn provision_trust_root_pk(pk: &[u8; 1312]) -> Result<(), KeystoreError> {
+    // all-zero (미초기화, 무효) 공개키 자료 거부
+    if pk.iter().all(|&b| b == 0) {
+        return Err(KeystoreError::InvalidLength);
+    }
     // SAFETY 호출자가 invariant 보장 본 함수는 BSP single-core 가정
     unsafe {
         let slot = &mut *(&raw mut TRUST_ROOT_PK_SLOT);
@@ -76,9 +92,26 @@ pub unsafe fn provision_trust_root_pk(pk: &[u8; 1312]) -> Result<(), KeystoreErr
     Ok(())
 }
 
+/// 빌드 임베드 프로덕션 신뢰 루트로 keystore 슬롯을 채운다 (부팅 진입점)
+///
+/// `init_trust_root` 가 부팅 시 1 회 호출해 `KEYSTORE_TRUST_ROOT_PK` 를
+/// `provision_trust_root_pk` 로 공급한다. 이로써 provision 경로가 실제 호출자를 갖고
+/// dev 상수 폴백이 완전히 대체된다
+///
+/// # Safety
+/// 호출자가 BSP single-core 부팅 초기 invariant 를 보장해야 한다
+///
+/// # Errors
+/// 임베드 키가 all-zero 이면 `KeystoreError::InvalidLength`
+#[cfg(k0_trust_root_keystore)]
+pub unsafe fn provision_embedded_trust_root() -> Result<(), KeystoreError> {
+    // SAFETY 호출자가 BSP single-core 부팅 초기 invariant 보장
+    unsafe { provision_trust_root_pk(&KEYSTORE_TRUST_ROOT_PK) }
+}
+
 /// 슬롯 lifecycle.
 ///
-/// `Wiped` 는 단방향 종착 상태 — 같은 슬롯에 새 키를 다시 공급할 수 없음.
+/// `Wiped` 는 단방향 종착 상태로, 같은 슬롯에 새 키를 다시 공급할 수 없음.
 /// 이는 식별자 재사용 공격 / 운영 실수 모두를 차단함.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -253,7 +286,7 @@ impl HsmDriver for SoftKeystore {
             if slot.state == SlotState::Provisioned {
                 let mut eq = Choice::from_u8(1);
                 for (a, b) in slot.id.0.iter().zip(id.0.iter()) {
-                    eq &= CtEqOps::eq(a, b);
+                    eq &= CtEqOps::ct_eq(a, b);
                 }
                 acc |= eq;
             }
@@ -289,7 +322,7 @@ impl HsmDriver for SoftKeystore {
             slot.material_len = 0;
             slot.state = SlotState::Wiped;
         }
-        // 미존재는 idempotent — Ok 반환
+        // 미존재는 idempotent 이므로 Ok 반환
         Ok(())
     }
 }
@@ -298,7 +331,7 @@ impl HsmDriver for SoftKeystore {
 // 커널 전역 SoftKeystore (옵션)
 //
 // `Secret::new` 가 const fn 이 아니므로 `Option<SoftKeystore>` 로 시작하여
-// 첫 접근 시 lazy init 함. SMP 이전 단일 코어 환경 가정
+// 첫 접근 시 lazy init 하며 SMP 이전 단일 코어 환경 가정
 static mut SOFT_KEYSTORE: Option<SoftKeystore> = None;
 
 /// 전역 키 저장소에 대한 mut 참조. 첫 호출 시 lazy 초기화.

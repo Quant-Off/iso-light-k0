@@ -113,7 +113,7 @@ pub fn encrypt_record(
     let mut nonce = [0u8; AEAD_IV_LEN];
     build_nonce(keys.iv.expose(), keys.seq, &mut nonce);
 
-    // AEAD encrypt -> ciphertext (inner_len bytes) + tag (16 bytes)
+    // AEAD 암호화로 ciphertext (inner_len bytes) 와 tag (16 bytes) 생성
     let ct_off = RECORD_HEADER_LEN;
     let tag_off = ct_off + inner_len;
     {
@@ -127,12 +127,15 @@ pub fn encrypt_record(
             CipherSuite::Aes256GcmSha256 => {
                 let key_arr: &[u8; AEAD_KEY_LEN] = keys.key.expose();
                 let nonce_arr: &[u8; GCM_NONCE_SIZE] = &nonce;
-                let gcm = AES256GCM::new(key_arr);
-                gcm.encrypt(nonce_arr, &aad, &inner[..inner_len], ct_slot, tag_slot);
+                let mut gcm = AES256GCM::default();
+                gcm.init(key_arr);
+                gcm.encrypt(nonce_arr, &aad, &inner[..inner_len], ct_slot, tag_slot)
+                    .map_err(|_| TlsError::Internal)?;
             }
             CipherSuite::ChaCha20Poly1305Sha256 => {
                 let key_arr: &[u8; AEAD_KEY_LEN] = keys.key.expose();
-                let aead = ChaCha20Poly1305::new(key_arr);
+                let mut aead = ChaCha20Poly1305::default();
+                aead.init(key_arr);
                 aead.encrypt(&nonce, &aad, &inner[..inner_len], ct_slot, tag_slot)
                     .map_err(|_| TlsError::Internal)?;
             }
@@ -208,9 +211,10 @@ pub fn decrypt_record(
         CipherSuite::Aes256GcmSha256 => {
             let key_arr: &[u8; AEAD_KEY_LEN] = keys.key.expose();
             let nonce_arr: &[u8; GCM_NONCE_SIZE] = &nonce;
-            let gcm = AES256GCM::new(key_arr);
-            let ok = gcm.decrypt(nonce_arr, aad, ct, tag_arr, inner_slot);
-            if !ok {
+            let mut gcm = AES256GCM::default();
+            gcm.init(key_arr);
+            let res = gcm.decrypt(nonce_arr, aad, ct, tag_arr, inner_slot);
+            if res.is_err() {
                 // 실패 경로에서도 임시 버퍼 소거
                 // SAFETY: inner 는 stack 메모리, 길이 일정
                 unsafe { zeroize::volatile::secure_zero(inner.as_mut_ptr(), inner.len()) };
@@ -219,7 +223,8 @@ pub fn decrypt_record(
         }
         CipherSuite::ChaCha20Poly1305Sha256 => {
             let key_arr: &[u8; AEAD_KEY_LEN] = keys.key.expose();
-            let aead = ChaCha20Poly1305::new(key_arr);
+            let mut aead = ChaCha20Poly1305::default();
+            aead.init(key_arr);
             let res = aead.decrypt(&nonce, aad, ct, tag_arr, inner_slot);
             if res.is_err() {
                 unsafe { zeroize::volatile::secure_zero(inner.as_mut_ptr(), inner.len()) };

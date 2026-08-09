@@ -2,7 +2,7 @@ use crate::capability::EndpointId;
 use crate::capability::rand_bytes;
 use aes::{AES256GCM, GCM_NONCE_SIZE, GCM_TAG_SIZE};
 use blake::{BLAKE3_OUT_LEN, Blake3};
-use constant_time::CtEqOps;
+use constant_time::traits::CtEqOps;
 use mldsa;
 use serde::{Deserialize, Serialize};
 use zeroize::Secret;
@@ -12,36 +12,36 @@ use zeroize::Zeroize;
 // 상수 / 컴파일-타임 불변식
 //
 
-// Phase 3 Plan-01 SoftwareBus + role(1) + Option<SoftHsmAesGcmState>(~48) 수용
-// Phase 4 Plan 01 Ring3ProcessBus 가 WIRE_FRAME_MAX (4096) + response_len(2) + endpoint(2) + open_state(1) + padding 을
-// 인라인 보유하므로 4224 로 확장 (RESEARCH Pitfall 2 + Pattern 3)
+// SoftwareBus 는 role(1) 과 Option<SoftHsmAesGcmState>(약 48) 수용
+// Ring3ProcessBus 는 WIRE_FRAME_MAX (4096) + response_len(2) + endpoint(2) + open_state(1) + padding 인라인 보유
+// 최대치 4224 로 확장
 pub const BUS_INSTANCE_MAX: usize = 4224;
-pub const MAX_BUS_INIT_BLOB: usize = 32; // PLANNER CHOICE Plan-01 (RESEARCH §12 #2)
-pub const SW_BUS_BUF: usize = 64; // PLANNER CHOICE Plan-01 (RESEARCH §12 #3)
+pub const MAX_BUS_INIT_BLOB: usize = 32;
+pub const SW_BUS_BUF: usize = 64;
 
 //
-// Phase 4 Plan 01 Lumen Wire Contract ABI 표면 (D-01, D-02, D-03, D-17)
+// Lumen Wire Contract ABI 표면
 //
 
-/// 와이어 프레임 최대 크기 (D-02, RESEARCH Pattern 1)
+/// 와이어 프레임 최대 크기
 pub const WIRE_FRAME_MAX: usize = 4096;
 
 /// 와이어 페이로드 최대 크기 (= WIRE_FRAME_MAX - 16B 헤더)
 pub const WIRE_PAYLOAD_MAX: usize = WIRE_FRAME_MAX - 16;
 
-/// 와이어 프레임 magic 4 bytes (D-01)
+/// 와이어 프레임 magic 4 bytes
 pub const WIRE_MAGIC: [u8; 4] = *b"LWK0";
 
-/// 와이어 프로토콜 버전 (D-01)
+/// 와이어 프로토콜 버전
 pub const WIRE_VERSION: u16 = 0x0001;
 
-/// 응답 프레임을 가리키는 cmd MSB (RESEARCH Pattern 2)
+/// 응답 프레임을 가리키는 cmd MSB
 pub const WIRE_CMD_RESPONSE_BIT: u16 = 0x8000;
 
-/// 16-byte fixed wire frame 헤더 (D-01)
+/// 16-byte fixed wire frame 헤더
 ///
 /// `#[repr(C)]` 으로 ABI 고정, postcard 의 varint 함정 회피를 위해 모든 정수 필드는
-/// `postcard::fixint::le` 어댑터로 little-endian 정수 직렬화를 강제한다 (RESEARCH Pitfall 1)
+/// `postcard::fixint::le` 어댑터로 little-endian 정수 직렬화를 강제한다
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireFrameHeader {
@@ -58,7 +58,7 @@ pub struct WireFrameHeader {
     pub status: u16,
 }
 
-/// 와이어 cmd 카탈로그 5 종 (D-03)
+/// 와이어 cmd 카탈로그 5 종
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 #[non_exhaustive]
@@ -70,7 +70,7 @@ pub enum WireCmd {
     Error = 0xFFFF,
 }
 
-/// 와이어 status 코드 5 종 (D-17)
+/// 와이어 status 코드 5 종
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 #[non_exhaustive]
@@ -82,13 +82,13 @@ pub enum WireStatus {
     Internal = 4,
 }
 
-/// Phase 5.1 D-01 wire AttestSubmit payload 정확 길이 pk 1312 ‖ bus_kind 1 ‖ sig 2420 = 3733
+/// wire AttestSubmit payload 정확 길이 pk 1312 와 bus_kind 1 과 sig 2420 을 이어 3733
 ///
-/// Pitfall 1 회피 syscall attach 의 ATTEST_EXACT 3732 와 1 옥텟 차이
-/// wire 는 bus_kind 옥텟이 payload 안에 인라인 포함
+/// syscall attach 의 ATTEST_EXACT 3732 와 1 옥텟 차이가 나는 이유는
+/// wire 가 bus_kind 옥텟을 payload 안에 인라인 포함하기 때문이다
 pub const WIRE_ATTEST_LEN: usize = mldsa::MLDSA44::PK_LEN + 1 + mldsa::MLDSA44::SIG_LEN;
 
-// 컴파일-타임 size/align 핀 (RESEARCH Pattern 1 + PATTERNS SH-4)
+// 컴파일-타임 size/align 핀
 const _: () = assert!(core::mem::size_of::<WireFrameHeader>() == 16);
 const _: () = assert!(core::mem::align_of::<WireFrameHeader>() == 4);
 const _: () = assert!(core::mem::size_of::<WireCmd>() == 2);
@@ -97,11 +97,11 @@ const _: () = assert!(WIRE_PAYLOAD_MAX + 16 == WIRE_FRAME_MAX);
 const _: () = assert!(WIRE_ATTEST_LEN == 3733);
 
 //
-// Phase 4 Plan 02 Wire 헬퍼 6 함수 (D-08 / D-11 / D-16 / D-17 / D-18)
+// Wire 헬퍼 6 함수
 //
-// parse_header / write_header 는 postcard varint 함정을 우회한 수동 byte parse (Pitfall 1)
+// parse_header / write_header 는 postcard varint 함정을 우회한 수동 byte parse
 // build_response_frame / build_error_frame_inplace 는 Ring3ProcessBus::pending_response 적재 진입점
-// handle_blake3 / handle_ping 은 Tier 3 cmd dispatch 의 실 본문 (handle_blake3 는 Phase 1 authenticate + Phase 3 SoftHsmRole::Blake3 재사용)
+// handle_blake3 / handle_ping 은 Tier 3 cmd dispatch 의 실 본문 (handle_blake3 는 authenticate 와 SoftHsmRole::Blake3 재사용)
 //
 
 /// 16 byte raw frame 헤더를 6 필드 WireFrameHeader 로 디코드한다
@@ -126,7 +126,7 @@ pub fn write_header(h: &WireFrameHeader, out: &mut [u8; 16]) {
     out[14..16].copy_from_slice(&h.status.to_le_bytes());
 }
 
-/// 응답 프레임을 pending_response 슬롯에 적재한다  cmd 필드는 WIRE_CMD_RESPONSE_BIT OR
+/// 응답 프레임을 pending_response 슬롯에 적재한다. cmd 필드는 WIRE_CMD_RESPONSE_BIT 을 OR 한다
 pub fn build_response_frame(
     req_id: u32,
     cmd: WireCmd,
@@ -150,7 +150,7 @@ pub fn build_response_frame(
     16 + payload.len()
 }
 
-/// 에러 프레임을 적재한다  D-18 — payload_len = 0 으로 size-side-channel 제거
+/// 에러 프레임을 적재한다. payload_len = 0 으로 size-side-channel 을 제거한다
 pub fn build_error_frame_inplace(
     req_id: u32,
     status: WireStatus,
@@ -170,15 +170,15 @@ pub fn build_error_frame_inplace(
     16
 }
 
-/// Blake3Hash 디스패치  payload 첫 16B = cap_blake3, 이후 input  Phase 1 authenticate + Phase 3 SoftwareBus::write/read 재사용
+/// Blake3Hash 디스패치. payload 첫 16B 는 cap_blake3, 이후는 input. authenticate 와 SoftwareBus::write/read 를 재사용한다
 fn handle_blake3(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) -> usize {
-    // (1) cap_token slot 미달은 BadFrame 으로 surface  payload_len = 0
+    // (1) cap_token slot 미달 시 BadFrame surface, payload_len = 0
     if payload.len() < 16 {
         return build_error_frame_inplace(req_id, WireStatus::BadFrame, out);
     }
-    // (2) 위조 cap 도 일단 stack 으로 복사  authenticate CT-AND 가 무력화 책임
+    // (2) 위조 cap 도 일단 stack 복사, authenticate CT-AND 가 무력화 책임
     let mut cap = crate::hsm_registry::HsmCapability::invalid();
-    // SAFETY  payload[..16] 는 kernel internal 영역 (handle_write 가 RELAY_BUF 로 SMAP 통과 후 진입)  cap 16B 정확 복사
+    // SAFETY: payload[..16] 는 kernel internal 영역 (handle_write 가 RELAY_BUF 로 SMAP 통과 후 진입), cap 16B 정확 복사
     unsafe {
         core::ptr::copy_nonoverlapping(
             payload.as_ptr(),
@@ -186,8 +186,8 @@ fn handle_blake3(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) ->
             16,
         );
     }
-    // (3) Phase 1 CT-AND 5 invariant (token_nonzero & state_ok & token_eq & stored_rights_ok & cap_rights_ok)
-    // SAFETY  BSP 단일 코어  syscall 진입은 preempt-disable
+    // (3) CT-AND 5 invariant (token_nonzero & state_ok & token_eq & stored_rights_ok & cap_rights_ok)
+    // SAFETY: BSP 단일 코어, syscall 진입은 preempt-disable
     let auth_ok = unsafe {
         crate::hsm_registry::with_registry(|r| {
             r.authenticate(&cap, crate::hsm_registry::HsmRights::USE)
@@ -197,11 +197,11 @@ fn handle_blake3(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) ->
         cap.zeroize();
         return build_error_frame_inplace(req_id, WireStatus::Denied, out);
     }
-    // (4) Phase 3 SoftHsmRole::Blake3 슬롯의 SoftwareBus 가 hash 계산 + 32B ring 저장
+    // (4) SoftHsmRole::Blake3 슬롯의 SoftwareBus 가 hash 계산 + 32B ring 저장
     let slot_idx = cap.slot.0 as usize;
     let input = &payload[16..];
     let mut digest = [0u8; 32];
-    // SAFETY  with_registry 와 동일 단일 코어 invariant
+    // SAFETY: with_registry 와 동일 단일 코어 invariant
     let ok = unsafe {
         crate::hsm_registry::with_registry_mut(|r| match r.slot_bus_mut(slot_idx) {
             Some(bus) => {
@@ -213,7 +213,7 @@ fn handle_blake3(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) ->
             None => false,
         })
     };
-    // (5) cap 회수  Pitfall 4 zeroize 모든 경로에서 적용
+    // (5) cap 회수, 모든 경로에서 zeroize 적용
     cap.zeroize();
     if !ok {
         digest.zeroize();
@@ -225,28 +225,28 @@ fn handle_blake3(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) ->
     n
 }
 
-/// Ping 디스패치  빈 payload 의 Ok 응답 프레임 (D-Discretion)
+/// Ping 디스패치. 빈 payload 의 Ok 응답 프레임
 fn handle_ping(req_id: u32, out: &mut [u8; WIRE_FRAME_MAX]) -> usize {
     build_response_frame(req_id, WireCmd::Ping, WireStatus::Ok, &[], out)
 }
 
-/// Phase 5.1 D-01 wire AttestSubmit 디스패치  epoch-rollover 재 attestation
+/// wire AttestSubmit 디스패치. epoch-rollover 재-attestation
 ///
 /// # Safety
 /// 호출자가 Tier 1/2 sanity 통과한 payload 만 전달 data.len ∈ [16, 4096] + magic LWK0 + version 1
 ///
 /// # Errors
-/// payload.len() != WIRE_ATTEST_LEN 3733 → BadFrame
-/// bus_octet ∉ {0, 1} → BadFrame
-/// verify_attest Err → Denied audit_enqueue result=6 WireReattestFail
-/// 성공 → Ok audit_enqueue result=5 WireReattestOk slot mutation 0
+/// payload.len() != WIRE_ATTEST_LEN 3733 이면 BadFrame
+/// bus_octet ∉ {0, 1} 이면 BadFrame
+/// verify_attest Err 이면 Denied audit_enqueue result=6 WireReattestFail
+/// 성공 시 Ok audit_enqueue result=5 WireReattestOk slot mutation 0
 pub(crate) fn handle_attest_submit(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) -> usize {
-    // (1) payload 길이 정확 3733 옥텟 (Pitfall 1 회피)
+    // (1) payload 길이 정확 3733 옥텟
     if payload.len() != WIRE_ATTEST_LEN {
         return build_error_frame_inplace(req_id, WireStatus::BadFrame, out);
     }
-    // (2) split — wire layout fixed offset pk 1312 || bus_kind 1 || sig 2420
-    // SAFETY  payload.len == WIRE_ATTEST_LEN 검증 통과, repr 균등 byte stream
+    // (2) split wire layout 고정 offset pk 1312, bus_kind 1, sig 2420
+    // SAFETY: payload.len == WIRE_ATTEST_LEN 검증 통과, repr 균등 byte stream
     let pk: &[u8; mldsa::MLDSA44::PK_LEN] = unsafe {
         &*(payload.as_ptr() as *const [u8; mldsa::MLDSA44::PK_LEN])
     };
@@ -261,7 +261,7 @@ pub(crate) fn handle_attest_submit(req_id: u32, payload: &[u8], out: &mut [u8; W
         1 => BusKind::Ring3Process,
         _ => return build_error_frame_inplace(req_id, WireStatus::BadFrame, out),
     };
-    // (4) verify_attest 호출 Phase 5 가드 그대로 재사용 slot mutation 0
+    // (4) verify_attest 호출 가드 그대로 재사용 slot mutation 0
     let result = crate::hsm_attest::verify_attest(pk, bus_kind, sig);
     // (5) audit_enqueue wire-side re-attestation event slot=0xFE wire marker
     let prefix = crate::hsm_attest::pk_hash_prefix(pk);
@@ -270,7 +270,7 @@ pub(crate) fn handle_attest_submit(req_id: u32, payload: &[u8], out: &mut [u8; W
         Err(_) => (6u8, WireStatus::Denied),
     };
     crate::hsm_attest::audit_enqueue(0xFE, audit_result_code, bus_octet, prefix);
-    // (6) 응답 frame Ok 는 16B header only Denied 는 error frame
+    // (6) 응답 frame, Ok 는 16B header only, Denied 는 error frame
     match status {
         WireStatus::Ok => {
             build_response_frame(req_id, WireCmd::AttestSubmit, WireStatus::Ok, &[], out)
@@ -279,7 +279,7 @@ pub(crate) fn handle_attest_submit(req_id: u32, payload: &[u8], out: &mut [u8; W
     }
 }
 
-/// Phase 5.1 D-02 wire Status 디스패치  audit_snapshot 직렬화
+/// wire Status 디스패치. audit_snapshot 직렬화
 ///
 /// # Errors
 /// payload 가 비어있지 않으면 BadFrame
@@ -293,11 +293,11 @@ fn handle_status(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) ->
     let mut events_local = [crate::hsm_attest::EnrollEvent::default();
         crate::hsm_attest::AUDIT_RING_CAPACITY];
     let (written, total) = crate::hsm_attest::audit_snapshot(&mut events_local);
-    // (3) wire payload 직렬화 manual LE byte-level (Pitfall 2 transmute 미사용)
+    // (3) wire payload 직렬화 manual LE byte-level (transmute 미사용)
     let header_len: usize = 8; // written u16 + total u32 + reserved u16
     let event_bytes = written * core::mem::size_of::<crate::hsm_attest::EnrollEvent>();
     let payload_len = header_len + event_bytes;
-    debug_assert!(payload_len <= WIRE_PAYLOAD_MAX); // Pitfall 4 future-proof
+    debug_assert!(payload_len <= WIRE_PAYLOAD_MAX);
     // staging = 8 + 32 * 12 = 392 옥텟
     let mut staging = [0u8; 8
         + crate::hsm_attest::AUDIT_RING_CAPACITY
@@ -305,15 +305,15 @@ fn handle_status(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) ->
     staging[0..2].copy_from_slice(&(written as u16).to_le_bytes());
     staging[2..6].copy_from_slice(&total.to_le_bytes());
     // staging[6..8] reserved 이미 0 초기화
-    for i in 0..written {
+    for (i, ev) in events_local.iter().enumerate().take(written) {
         let off = 8 + i * core::mem::size_of::<crate::hsm_attest::EnrollEvent>();
-        // Pitfall 2 회피 명시 byte 조립 transmute 미사용
-        staging[off..off + 4].copy_from_slice(&events_local[i].seq.to_le_bytes());
-        staging[off + 4] = events_local[i].slot_idx;
-        staging[off + 5] = events_local[i].result;
-        staging[off + 6] = events_local[i].bus_kind;
-        staging[off + 7] = events_local[i]._pad;
-        staging[off + 8..off + 12].copy_from_slice(&events_local[i].pk_hash_prefix);
+        // 명시 byte 조립 transmute 미사용
+        staging[off..off + 4].copy_from_slice(&ev.seq.to_le_bytes());
+        staging[off + 4] = ev.slot_idx;
+        staging[off + 5] = ev.result;
+        staging[off + 6] = ev.bus_kind;
+        staging[off + 7] = ev._pad;
+        staging[off + 8..off + 12].copy_from_slice(&ev.pk_hash_prefix);
     }
     build_response_frame(
         req_id,
@@ -325,7 +325,7 @@ fn handle_status(req_id: u32, payload: &[u8], out: &mut [u8; WIRE_FRAME_MAX]) ->
 }
 
 //
-// BusKind — 외부 HSM 트랜스포트 분류 (BUS-02). #[non_exhaustive] 으로 후속 페이즈 variant 추가 backward-compat.
+// BusKind 외부 HSM 트랜스포트 분류, #[non_exhaustive] 으로 후속 variant 추가 시 backward-compat 보장
 //
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,7 +342,7 @@ pub enum BusKind {
 }
 
 //
-// BusError — internal-only. syscall 경계에서 SyscallError::{BadArg, Denied, Internal} 로 collapse (Pitfall 7, Plan 02).
+// BusError 는 internal-only, syscall 경계에서 SyscallError::{BadArg, Denied, Internal} 로 collapse
 //
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,7 +359,7 @@ pub enum BusError {
 }
 
 //
-// BusReady — poll() 결과 (D-07: 단순 3-bool 구조체).
+// BusReady 는 poll() 결과, 단순 3-bool 구조체
 //
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -370,7 +370,7 @@ pub struct BusReady {
 }
 
 //
-// BusDriver — 6 메서드 표면 (BUS-01). caller-provided slice 만 받음. alloc / Vec / Box 부재 grep 검증.
+// BusDriver 6 메서드 표면, caller-provided slice 만 수용, alloc / Vec / Box 부재 grep 검증
 //
 
 pub trait BusDriver {
@@ -383,7 +383,7 @@ pub trait BusDriver {
 }
 
 //
-// SoftHsmRole — SoftwareBus 의 mode-aware 디스패치 키 (D-07)  Echo 는 Phase 2 호환, Blake3/AesGcm 가 Phase 3 신규
+// SoftHsmRole 는 SoftwareBus 의 mode-aware 디스패치 키, Echo 는 기존 호환, Blake3/AesGcm 는 신규
 //
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -396,7 +396,7 @@ pub enum SoftHsmRole {
 }
 
 //
-// SoftHsmAesGcmState — AesGcm 모드 비밀 상태 (D-12)  key 는 attach 시점 fresh, nonce_counter 는 매 write 단조 증가
+// SoftHsmAesGcmState 는 AesGcm 모드 비밀 상태, key 는 attach 시점 fresh, nonce_counter 는 매 write 단조 증가
 //
 
 pub struct SoftHsmAesGcmState {
@@ -405,7 +405,7 @@ pub struct SoftHsmAesGcmState {
 }
 
 impl Zeroize for SoftHsmAesGcmState {
-    // secrets-first  key zeroize 먼저 (Pitfall 4), counter 는 단순 평문 metadata
+    // secrets-first, key zeroize 먼저, counter 는 평문 metadata
     fn zeroize(&mut self) {
         self.key.zeroize();
         self.nonce_counter = 0;
@@ -413,7 +413,7 @@ impl Zeroize for SoftHsmAesGcmState {
 }
 
 //
-// SoftwareBus — 64-byte 루프백 echo (D-10). 비밀 페이로드 아님, 그러나 Phase 1 일관성으로 zeroize 명시.
+// SoftwareBus 는 64-byte 루프백 echo, 비밀 페이로드 아니지만 일관성 위해 zeroize 명시
 //
 
 pub struct SoftwareBus {
@@ -421,8 +421,14 @@ pub struct SoftwareBus {
     write_len: usize,
     read_pos: usize,
     open_state: bool,
-    role: SoftHsmRole,                       // D-07 active role  Phase 2 backward compat 기본 Echo
-    aes_state: Option<SoftHsmAesGcmState>,   // D-12 AesGcm 만 Some  Echo/Blake3 는 None
+    role: SoftHsmRole,                       // active role, backward compat 기본 Echo
+    aes_state: Option<SoftHsmAesGcmState>,   // AesGcm 만 Some, Echo/Blake3 는 None
+}
+
+impl Default for SoftwareBus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SoftwareBus {
@@ -443,7 +449,7 @@ impl BusDriver for SoftwareBus {
         if self.open_state {
             return Err(BusError::AlreadyOpen);
         }
-        // init_blob[0] = role discriminant  빈 슬라이스는 Phase 2 호환 Echo
+        // init_blob[0] = role discriminant, 빈 슬라이스는 기존 호환 Echo
         let role = if init.is_empty() {
             SoftHsmRole::Echo
         } else {
@@ -454,7 +460,7 @@ impl BusDriver for SoftwareBus {
                 _ => return Err(BusError::BadInit),
             }
         };
-        // init_blob[1..] trailing zeros 강제  forward-reserve (Phase 5 attestation 헤드룸)
+        // init_blob[1..] trailing zeros 강제, forward-reserve (attestation 헤드룸)
         let mut i = 1usize;
         while i < init.len() {
             if init[i] != 0 {
@@ -465,7 +471,7 @@ impl BusDriver for SoftwareBus {
         // AesGcm 만 capability::rand_bytes 로 32B 키 prime
         if matches!(role, SoftHsmRole::AesGcm) {
             let mut key_bytes = [0u8; 32];
-            // SAFETY  BSP 단일 코어  capability::init_prng 는 부팅 시 완료 (Phase 1 D-05)
+            // SAFETY: BSP 단일 코어, capability::init_prng 는 부팅 시 완료
             unsafe {
                 rand_bytes(&mut key_bytes).map_err(|_| BusError::Internal)?;
             }
@@ -473,13 +479,13 @@ impl BusDriver for SoftwareBus {
                 key: Secret::new(key_bytes),
                 nonce_counter: 0,
             });
-            // Pitfall 4  Secret::new 가 소유권을 가져갔어도 스택 슬롯 명시 zeroize
+            // Secret::new 가 소유권을 가져갔어도 스택 슬롯 명시 zeroize
             key_bytes.zeroize();
         } else {
-            // Echo / Blake3 는 aes_state 없음  invariant tighten (재-open 방어)
+            // Echo / Blake3 는 aes_state 없음, invariant tighten (재-open 방어)
             self.aes_state = None;
         }
-        // commit (Phase 2 reset 의미 보존)
+        // commit (reset 의미 보존)
         self.role = role;
         self.ring = [0u8; SW_BUS_BUF];
         self.write_len = 0;
@@ -515,9 +521,9 @@ impl BusDriver for SoftwareBus {
             return Err(BusError::NotOpen);
         }
         match self.role {
-            // Echo  Phase 2 loopback echo 본문 verbatim 보존 (INV-3 regression guard)
+            // Echo, loopback echo 본문 verbatim 보존, regression 방어
             SoftHsmRole::Echo => {
-                // Pitfall 6  overflow 는 정직한 에러로 surface, silent drop 금지
+                // overflow 는 정직한 에러로 surface, silent drop 금지
                 if data.len() > SW_BUS_BUF.saturating_sub(self.write_len) {
                     return Err(BusError::BufferTooSmall);
                 }
@@ -525,9 +531,9 @@ impl BusDriver for SoftwareBus {
                 self.write_len += data.len();
                 Ok(data.len())
             }
-            // Blake3  hasher 빌더 → 32B digest → ring overwrite  digest 는 SecureBuffer Drop 으로 zeroize
+            // Blake3, hasher 빌더로 32B digest 생성 후 ring overwrite, digest 는 SecureBuffer Drop 으로 zeroize
             SoftHsmRole::Blake3 => {
-                // Pitfall 6  컴파일-타임 assert 가 보장하지만 defense-in-depth
+                // 컴파일-타임 assert 가 보장하지만 defense-in-depth
                 if SW_BUS_BUF < BLAKE3_OUT_LEN {
                     return Err(BusError::BufferTooSmall);
                 }
@@ -540,36 +546,39 @@ impl BusDriver for SoftwareBus {
                 self.read_pos = 0;
                 Ok(BLAKE3_OUT_LEN)
             }
-            // AesGcm  counter 증가 → encrypt out-param → ring 에 nonce||ct||tag 직렬화  stack nonce/tag 명시 zeroize
+            // AesGcm, counter 증가 후 encrypt out-param 거쳐 ring 에 nonce||ct||tag 직렬화, stack nonce/tag 명시 zeroize
             SoftHsmRole::AesGcm => {
                 let state = self.aes_state.as_mut().ok_or(BusError::Internal)?;
-                // D-12 fail-stop  counter overflow = (key, nonce) 재사용 차단
+                // fail-stop, counter overflow = (key, nonce) 재사용 차단
                 if state.nonce_counter == u64::MAX {
                     return Err(BusError::Internal);
                 }
-                // Pitfall 6  ring fit honest surface
+                // ring 용량 검사, 초과 시 정직하게 에러
                 let total = data.len() + GCM_NONCE_SIZE + GCM_TAG_SIZE;
                 if total > SW_BUS_BUF {
                     return Err(BusError::BufferTooSmall);
                 }
-                // counter 단조 증가  위 == u64::MAX 가드로 wrap 미발생
+                // counter 단조 증가, 위 == u64::MAX 가드로 wrap 미발생
                 state.nonce_counter = state.nonce_counter.wrapping_add(1);
                 let mut nonce = [0u8; GCM_NONCE_SIZE];
                 nonce[..8].copy_from_slice(&state.nonce_counter.to_le_bytes());
-                let cipher = AES256GCM::new(state.key.expose());
+                let mut cipher = AES256GCM::default();
+                cipher.init(state.key.expose());
                 let mut tag = [0u8; GCM_TAG_SIZE];
-                cipher.encrypt(
-                    &nonce,
-                    &[],
-                    data,
-                    &mut self.ring[GCM_NONCE_SIZE..GCM_NONCE_SIZE + data.len()],
-                    &mut tag,
-                );
+                cipher
+                    .encrypt(
+                        &nonce,
+                        &[],
+                        data,
+                        &mut self.ring[GCM_NONCE_SIZE..GCM_NONCE_SIZE + data.len()],
+                        &mut tag,
+                    )
+                    .map_err(|_| BusError::BufferTooSmall)?;
                 self.ring[..GCM_NONCE_SIZE].copy_from_slice(&nonce);
                 self.ring[GCM_NONCE_SIZE + data.len()..total].copy_from_slice(&tag);
                 self.write_len = total;
                 self.read_pos = 0;
-                // Pitfall 4  stack-local 명시 zeroize
+                // stack-local 명시 zeroize
                 nonce.zeroize();
                 tag.zeroize();
                 Ok(total)
@@ -596,8 +605,8 @@ impl BusDriver for SoftwareBus {
     }
 }
 
-// debug-only 접근자  Plan 04 chan_phase3_smoke_test (H4 검증 모델, RESEARCH §Risk #6)
-// release 빌드에서는 본 두 메서드 모두 부재  외부 가시 surface 0
+// debug-only 접근자, smoke test 검증용
+// release 빌드에서는 두 메서드 모두 부재, 외부 가시 surface 0
 #[cfg(debug_assertions)]
 impl SoftwareBus {
     pub fn debug_aes_state(&self) -> Option<&SoftHsmAesGcmState> {
@@ -608,7 +617,7 @@ impl SoftwareBus {
     }
 }
 
-// Zeroize cascade (D-15)  secrets-first  key → discriminant reset → ring → metadata
+// Zeroize cascade, secrets-first, key 부터 discriminant reset, ring, metadata 순서로 소거
 impl Zeroize for SoftwareBus {
     fn zeroize(&mut self) {
         if let Some(state) = self.aes_state.as_mut() {
@@ -625,23 +634,29 @@ impl Zeroize for SoftwareBus {
 }
 
 impl Drop for SoftwareBus {
-    // SAFETY-net: Drop 폴백 (Phase 1 voice). 정상 detach 경로가 우선 호출.
+    // SAFETY-net Drop 폴백, 정상 detach 경로가 우선 호출
     fn drop(&mut self) {
         self.zeroize();
     }
 }
 
 //
-// Ring3ProcessBus — Ring 3 IPC 엔드포인트 바인딩 (D-12). read/write/poll 는 WireNotReady (D-14).
+// Ring3ProcessBus, Ring 3 IPC 엔드포인트 바인딩, read/write/poll 는 WireNotReady
 //
 
 pub struct Ring3ProcessBus {
     endpoint: EndpointId,
     open_state: bool,
-    // Phase 4 Plan 01 single-flight 응답 버퍼 (D-08, Pattern 3)
-    // raw [u8; N] 사용 — Secret::new 가 non-const 라 BusInstance::new const fn 깨짐 회피 (Pitfall 4)
+    // single-flight 응답 버퍼
+    // raw [u8; N] 사용, Secret::new 가 non-const 라 BusInstance::new const fn 깨짐 회피
     pending_response: [u8; WIRE_FRAME_MAX],
     response_len: u16,
+}
+
+impl Default for Ring3ProcessBus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Ring3ProcessBus {
@@ -660,14 +675,14 @@ impl BusDriver for Ring3ProcessBus {
         if self.open_state {
             return Err(BusError::AlreadyOpen);
         }
-        // (1) init blob 길이 검증 — endpoint id 는 2 bytes (u16 LE)
+        // (1) init blob 길이 검증, endpoint id 는 2 bytes (u16 LE)
         if init.len() < 2 {
             return Err(BusError::BadInit);
         }
         // (2) decode EndpointId
         let id_raw = u16::from_le_bytes([init[0], init[1]]);
         let endpoint = EndpointId(id_raw);
-        // (3) forward-reserve zeros — init_blob[2..] 는 Phase 5 chunk header 헤드룸, Phase 2 에서는 zero 강제
+        // (3) forward-reserve zeros, init_blob[2..] 는 후속 chunk header 헤드룸, 현재는 zero 강제
         let mut i = 2usize;
         while i < init.len() {
             if init[i] != 0 {
@@ -679,7 +694,7 @@ impl BusDriver for Ring3ProcessBus {
         if endpoint == EndpointId::INVALID {
             return Err(BusError::BadInit);
         }
-        // (5) endpoint 존재성만 검증 (caller 권한 게이트는 Phase 5 — Pitfall B + A3)
+        // (5) endpoint 존재성만 검증, caller 권한 게이트는 후속
         if !crate::ipc::endpoint_exists(endpoint) {
             return Err(BusError::BadInit);
         }
@@ -698,7 +713,7 @@ impl BusDriver for Ring3ProcessBus {
         Ok(())
     }
 
-    // 응답 회수 (D-09)  happy path 직후 pending_response 명시 zeroize + response_len = 0
+    // 응답 회수, happy path 직후 pending_response 명시 zeroize, response_len = 0
     fn read(&mut self, out: &mut [u8]) -> Result<usize, BusError> {
         if !self.open_state {
             return Err(BusError::NotOpen);
@@ -707,46 +722,46 @@ impl BusDriver for Ring3ProcessBus {
             return Err(BusError::WireNotReady);
         }
         let n = self.response_len as usize;
-        // out 슬롯 부족은 BufferTooSmall 부재로 Internal 로 collapse (Plan 02 의 BusError variant 보존 결정)
+        // out 슬롯 부족은 BufferTooSmall 부재로 Internal collapse, BusError variant 보존
         if out.len() < n {
             return Err(BusError::Internal);
         }
         out[..n].copy_from_slice(&self.pending_response[..n]);
-        // SH-3  회수 직후 stale 자료 cascade 차단 (T-04-10 mitigation)
+        // 회수 직후 stale 자료 cascade 차단
         self.pending_response.zeroize();
         self.response_len = 0;
         Ok(n)
     }
 
-    // Tier 1/2/3 3 단계 wire dispatcher (D-07 / D-08 / D-16) 본문
+    // Tier 1/2/3 3 단계 wire dispatcher 본문
     fn write(&mut self, data: &[u8]) -> Result<usize, BusError> {
         if !self.open_state {
             return Err(BusError::NotOpen);
         }
-        // Tier 1  oversize / undersize  handle_write 가 BadArg 로 collapse (D-16 Tier 1)
+        // Tier 1, oversize / undersize 는 handle_write 가 BadArg 로 collapse
         if data.len() < 16 || data.len() > WIRE_FRAME_MAX {
             return Err(BusError::Internal);
         }
-        // D-08 single-flight  response_len != 0 시 pending_response/response_len 모두 미변경
-        // (덮어쓰기 차단  frame parse / cap auth / cmd dispatch 어떤 것도 수행 X)
-        // handle_write 의 BusError → SyscallError::Internal collapse 로 RAX 매핑 (Pitfall 7)
+        // single-flight, response_len != 0 시 pending_response/response_len 모두 미변경
+        // (덮어쓰기 차단, frame parse / cap auth / cmd dispatch 어떤 것도 미수행)
+        // handle_write 의 BusError 는 SyscallError::Internal 로 collapse 되어 RAX 매핑
         if self.response_len != 0 {
             return Err(BusError::Internal);
         }
-        // Tier 2  header 수동 parse (Pitfall 1)  postcard varint 함정 우회
+        // Tier 2, header 수동 parse, postcard varint 함정 우회
         let mut hdr_bytes = [0u8; 16];
         hdr_bytes.copy_from_slice(&data[..16]);
         let hdr = parse_header(&hdr_bytes);
 
-        // Tier 2 invariant 4 종  어느 것이 실패했는지 변별 0 (단일 collapse, D-16 Tier 2)
-        // [u8; 4] 는 CtEqOps 미구현  u32 LE 로 평탄화 후 동일 CT 비교
+        // Tier 2 invariant 4 종, 어느 것이 실패했는지 변별 0, 단일 collapse
+        // [u8; 4] 는 CtEqOps 미구현, u32 LE 로 평탄화 후 동일 CT 비교
         let magic_u32 = u32::from_le_bytes(hdr.magic);
         let wire_magic_u32 = u32::from_le_bytes(WIRE_MAGIC);
-        let magic_ok = CtEqOps::eq(&magic_u32, &wire_magic_u32).unwrap_u8() == 1;
-        let version_ok = CtEqOps::eq(&hdr.version, &WIRE_VERSION).unwrap_u8() == 1;
+        let magic_ok = CtEqOps::ct_eq(&magic_u32, &wire_magic_u32).unwrap_u8() == 1;
+        let version_ok = CtEqOps::ct_eq(&hdr.version, &WIRE_VERSION).unwrap_u8() == 1;
         let len_ok = (hdr.payload_len as usize) + 16 <= data.len()
             && (hdr.payload_len as usize) <= WIRE_PAYLOAD_MAX;
-        // Pitfall 6  cmd 가 request 인지 검증  0x8000+ 와 WireCmd::Error 거부
+        // cmd 가 request 인지 검증, 0x8000+ 와 WireCmd::Error 거부
         let cmd_is_request =
             (hdr.cmd & WIRE_CMD_RESPONSE_BIT) == 0 && hdr.cmd != WireCmd::Error as u16;
 
@@ -754,18 +769,18 @@ impl BusDriver for Ring3ProcessBus {
             return Err(BusError::Internal);
         }
 
-        // Tier 3  cmd dispatch (D-11 / Phase 5.1 D-01 D-02 — AttestSubmit/Status 본문 closure)
+        // Tier 3, cmd dispatch, AttestSubmit/Status 본문 closure
         let payload = &data[16..16 + hdr.payload_len as usize];
         let resp_frame_len = match hdr.cmd {
             x if x == WireCmd::Ping as u16 => handle_ping(hdr.req_id, &mut self.pending_response),
             x if x == WireCmd::Blake3Hash as u16 => {
                 handle_blake3(hdr.req_id, payload, &mut self.pending_response)
             }
-            // 본 페이즈 신규 Phase 5.1 D-01 wire AttestSubmit re-attestation dispatch
+            // wire AttestSubmit re-attestation dispatch
             x if x == WireCmd::AttestSubmit as u16 => {
                 handle_attest_submit(hdr.req_id, payload, &mut self.pending_response)
             }
-            // 본 페이즈 신규 Phase 5.1 D-02 wire Status audit-snapshot dispatch
+            // wire Status audit-snapshot dispatch
             x if x == WireCmd::Status as u16 => {
                 handle_status(hdr.req_id, payload, &mut self.pending_response)
             }
@@ -779,7 +794,7 @@ impl BusDriver for Ring3ProcessBus {
         Ok(data.len())
     }
 
-    // readable/writable 시그널 (D-10)  response_len 단일 source-of-truth
+    // readable/writable 시그널, response_len 단일 source-of-truth
     fn poll(&mut self) -> Result<BusReady, BusError> {
         if !self.open_state {
             return Err(BusError::NotOpen);
@@ -798,11 +813,11 @@ impl BusDriver for Ring3ProcessBus {
 
 impl Zeroize for Ring3ProcessBus {
     fn zeroize(&mut self) {
-        // Phase 4 Plan 01 bytes-first 순서 — 민감할 수 있는 응답 페이로드를 먼저 비운 뒤
-        // 메타데이터를 reset (PATTERNS SH-3, T-04-04 mitigation)
+        // bytes-first 순서, 민감할 수 있는 응답 페이로드를 먼저 비운 뒤
+        // 메타데이터 reset
         self.pending_response.zeroize();
         self.response_len = 0;
-        // u16 endpoint id 는 RESEARCH §6 기준 non-secret 이나 INVALID 로 reset 이 cleaner invariant
+        // u16 endpoint id 는 non-secret 이나 INVALID 로 reset 이 cleaner invariant
         self.endpoint = EndpointId::INVALID;
         self.open_state = false;
     }
@@ -815,9 +830,13 @@ impl Drop for Ring3ProcessBus {
 }
 
 //
-// BusInstance — enum-dispatch (D-01). 본 enum 자체가 BusDriver 를 구현 (D-03). 5 stub variants 는 zero-sized, _ => NotImplemented 와일드카드로 흡수 (D-04).
+// BusInstance enum-dispatch, 본 enum 자체가 BusDriver 구현, 5 stub variants 는 zero-sized, _ => NotImplemented 와일드카드로 흡수
 //
 
+// large_enum_variant 억제 근거, Box 로 대형 variant 를 힙에 두는 표준 완화는
+// alloc 요구, 본 커널은 동적 할당 금지 (no_std no-alloc) 라 적용 불가
+// 슬롯은 정적 고정 풀에 인라인 저장, variant 크기 차이는 설계상 불가피
+#[allow(clippy::large_enum_variant)]
 pub enum BusInstance {
     Empty,
     Software(SoftwareBus),
@@ -897,8 +916,8 @@ impl BusDriver for BusInstance {
         match self {
             Self::Software(_) => BusKind::Software,
             Self::Ring3Process(_) => BusKind::Ring3Process,
-            // SAFETY-note: Self::Empty 의 kind() 는 Plan 02 가 Attached 슬롯에서만 호출 —
-            // Empty 슬롯은 enumerate 에 부재 (D-19 + handle_enumerate 의 state==Attached 가드).
+            // SAFETY-note Self::Empty 의 kind() 는 Attached 슬롯에서만 호출
+            // Empty 슬롯은 enumerate 에 부재 (handle_enumerate 의 state==Attached 가드)
             Self::Empty => BusKind::Software,
             Self::Usb => BusKind::Usb,
             Self::Spi => BusKind::Spi,
@@ -910,7 +929,7 @@ impl BusDriver for BusInstance {
 }
 
 //
-// Zeroize cascade (D-11). 활성 variant payload 를 먼저 비우고 (bytes-first), 마지막에 discriminant 를 Empty 로 reset (Phase 1 token-first ordering 일관).
+// Zeroize cascade, 활성 variant payload 를 먼저 비우고 (bytes-first), 마지막에 discriminant 를 Empty 로 reset
 //
 
 impl Zeroize for BusInstance {
@@ -925,22 +944,22 @@ impl Zeroize for BusInstance {
 }
 
 impl Drop for BusInstance {
-    // SAFETY-net: Drop 폴백. 정상 detach 경로 (Plan 02 detach) 가 명시적 zeroize 우선 호출.
-    // panic = abort 환경 — Drop 은 SMP 종료 시점 / stack-local 보호 목적.
+    // SAFETY-net Drop 폴백, 정상 detach 경로가 명시적 zeroize 우선 호출
+    // panic = abort 환경, Drop 은 SMP 종료 시점 / stack-local 보호 목적
     fn drop(&mut self) {
         self.zeroize();
     }
 }
 
 //
-// 컴파일-타임 사이즈 핀 (D-02). BusInstance 정의 뒤에 두어 타입 in-scope 보장.
+// 컴파일-타임 사이즈 핀, BusInstance 정의 뒤에 두어 타입 in-scope 보장
 //
 
 const _: () = assert!(core::mem::size_of::<BusKind>() == 1);
 const _: () = assert!(core::mem::size_of::<BusInstance>() <= BUS_INSTANCE_MAX);
 
 //
-// Phase 3 신규 size pin
+// SoftHsm 역할/버퍼 size pin
 //
 
 const _: () = assert!(core::mem::size_of::<SoftHsmRole>() == 1);

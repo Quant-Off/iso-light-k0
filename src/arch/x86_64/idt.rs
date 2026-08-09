@@ -32,7 +32,7 @@ const PIC2_DATA: u16 = 0xA1; // Slave  PIC 데이터(마스크) 포트
 
 const PIC_EOI: u8 = 0x20; // End-Of-Interrupt 명령
 
-/// IRQ 벡터 오프셋: IRQ0 -> INT 0x20 (32)으로 재매핑.
+/// IRQ 벡터 오프셋 IRQ0 을 INT 0x20 (32)으로 재매핑.
 /// CPU 예외(0x00..0x1F)와의 충돌 방지.
 pub const IRQ_BASE: u8 = 0x20;
 
@@ -197,10 +197,10 @@ unsafe fn init_pic() {
         io_wait();
 
         // ICW2: 벡터 오프셋
-        // Master: IRQ0 -> INT 0x20 (32)
+        // Master IRQ0 을 INT 0x20 (32)으로
         outb(PIC1_DATA, IRQ_BASE);
         io_wait();
-        // Slave:  IRQ8 -> INT 0x28 (40)
+        // Slave IRQ8 을 INT 0x28 (40)으로
         outb(PIC2_DATA, IRQ_BASE + 8);
         io_wait();
 
@@ -256,8 +256,8 @@ pub unsafe fn pic_eoi_slave() {
 
 /// 지정한 IRQ 라인의 마스크를 해제하여 인터럽트를 허용함 (0-based IRQ 번호, 0..15).
 ///
-/// IRQ 0..7   -> Master PIC 마스크 레지스터(0x21) 비트 해제
-/// IRQ 8..15  -> Slave  PIC 마스크 레지스터(0xA1) 비트 해제 + Slave 연결 IRQ2 자동 해제
+/// IRQ 0..7 은 Master PIC 마스크 레지스터(0x21) 비트를 해제
+/// IRQ 8..15 는 Slave PIC 마스크 레지스터(0xA1) 비트를 해제하고 Slave 연결 IRQ2 도 자동 해제
 ///
 /// # Safety
 /// - 해당 IRQ에 유효한 핸들러가 IDT에 등록된 이후에 호출해야 함.
@@ -280,7 +280,7 @@ pub unsafe fn enable_irq(irq: u8) {
             outb(PIC1_DATA, mask);
         } else if irq < 16 {
             // IRQ 8..15: Slave PIC 마스크에서 해당 비트 클리어
-            // Slave는 Master의 IRQ2를 통해 연결되므로 IRQ2도 활성화해야 함
+            // Slave는 Master의 IRQ2를 통해 연결되므로 IRQ2도 활성화 필요
             let mut slave_mask: u8;
             core::arch::asm!(
                 "in al, dx",
@@ -338,7 +338,7 @@ unsafe fn fatal_halt(
     }
 
     // Release/Debug 공통: 인터럽트 비활성화 + CPU Halt 무한 루프
-    // panic.rs의 정책과 동일하게, 어떠한 상황에서도 커널이 계속 실행되지 않도록 함
+    // panic.rs의 정책과 동일하게, 어떠한 상황에서도 커널 지속 실행 차단
     loop {
         // SAFETY: 치명 예외 후 CPU 정지 - IF는 인터럽트 게이트에서 이미 0
         unsafe {
@@ -350,8 +350,8 @@ unsafe fn fatal_halt(
 // CPU 예외 핸들러
 //
 // x86-interrupt ABI: CPU가 핸들러 진입 전에 스택 프레임(InterruptStackFrame)을
-// 자동으로 push. 오류 코드가 있는 예외는 프레임 아래에 u64 오류 코드가 추가됨
-// 핸들러 반환 시 IRET로 이전 컨텍스트를 복원함
+// 자동으로 push. 오류 코드가 있는 예외는 프레임 아래에 u64 오류 코드 추가
+// 핸들러 반환 시 IRET로 이전 컨텍스트 복원
 
 // #DE: Divide Error (벡터 0, Fault)
 extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
@@ -381,7 +381,7 @@ extern "x86-interrupt" fn nmi_handler(frame: InterruptStackFrame) {
 
 // #BP: Breakpoint (벡터 3, Trap)
 extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
-    // 향후 커널 디버거 연동 시 이 핸들러를 확장함
+    // 향후 커널 디버거 연동 시 이 핸들러 확장
     // 현재는 디버그 출력 후 계속 진행(IRET)하지 않고 정지
     unsafe {
         fatal_halt(b"#BP Breakpoint", None, &frame);
@@ -420,9 +420,9 @@ extern "x86-interrupt" fn device_not_available_handler(frame: InterruptStackFram
 
 // #DF: Double Fault (벡터 8, Abort, 오류코드=0)
 // 반드시 IST를 사용해야 함: 스택 오버플로 등으로 커널 스택이 손상된 상태에서도
-// 안전하게 실행되도록 tss.rs의 DOUBLE_FAULT_STACK을 IST1로 등록함
+// 안전하게 실행되도록 tss.rs의 DOUBLE_FAULT_STACK을 IST1로 등록
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error_code: u64) -> ! {
-    // #DF는 Abort: IRET로 복구 불가능. 반드시 발산(diverge)해야 함
+    // #DF는 Abort: IRET로 복구 불가능. 반드시 발산(diverge) 필요
     // SAFETY: 치명 예외, IST1 스택에서 실행 중
     unsafe { fatal_halt(b"#DF Double Fault", Some(error_code), &frame) }
 }
@@ -531,7 +531,7 @@ extern "x86-interrupt" fn virtualization_handler(frame: InterruptStackFrame) {
 }
 
 // 기본 핸들러 (미정의/예약 벡터)
-// 0x30..0xFF 범위의 모든 예약 벡터에 설치하여 Triple Fault를 방지함
+// 0x30..0xFF 범위의 모든 예약 벡터에 설치하여 Triple Fault 방지
 extern "x86-interrupt" fn default_handler(frame: InterruptStackFrame) {
     unsafe {
         fatal_halt(b"Unexpected Interrupt/Exception", None, &frame);
@@ -540,7 +540,7 @@ extern "x86-interrupt" fn default_handler(frame: InterruptStackFrame) {
 
 // IRQ 스텁 핸들러 (0x20..0x2F)
 // PIC를 초기화 직후 모든 IRQ가 마스킹되어 있으므로, 이 핸들러들은 향후
-// 특정 IRQ가 enable_irq()로 활성화될 때의 기본 처리 경로임
+// 특정 IRQ가 enable_irq()로 활성화될 때의 기본 처리 경로
 
 extern "x86-interrupt" fn irq0_handler(_frame: InterruptStackFrame) {
     // IRQ0: PIT(Programmable Interval Timer) - 향후 스케줄러와 연동
@@ -597,7 +597,7 @@ pub unsafe fn init_idt() {
             0,
         );
         IDT[0x01] = GateDescriptor::new(debug_handler as *const () as usize, GATE_TRAP, 0);
-        // #NMI: IST2 사용 — 주 스택 오염 상태에서도 안전한 NMI 처리 보장
+        // #NMI 는 IST2 사용, 주 스택 오염 상태에서도 안전한 NMI 처리 보장
         IDT[0x02] = GateDescriptor::new(nmi_handler as *const () as usize, GATE_INTERRUPT, IST_NMI);
         IDT[0x03] = GateDescriptor::new(breakpoint_handler as *const () as usize, GATE_TRAP, 0);
         IDT[0x04] = GateDescriptor::new(overflow_handler as *const () as usize, GATE_TRAP, 0);
@@ -642,7 +642,7 @@ pub unsafe fn init_idt() {
             GATE_INTERRUPT,
             0,
         );
-        // #PF: IST4 사용 — 커널 스택 가드 페이지 트리거 시 안전한 핸들러 스택으로 전환
+        // #PF 는 IST4 사용, 커널 스택 가드 페이지 트리거 시 안전한 핸들러 스택으로 전환
         IDT[0x0E] = GateDescriptor::new(
             page_fault_handler as *const () as usize,
             GATE_INTERRUPT,
@@ -655,7 +655,7 @@ pub unsafe fn init_idt() {
             GATE_INTERRUPT,
             0,
         );
-        // #MC: IST3 사용 — 복구 불가 하드웨어 오류 시 독립 스택에서 진단 수행
+        // #MC 는 IST3 사용, 복구 불가 하드웨어 오류 시 독립 스택에서 진단 수행
         IDT[0x12] = GateDescriptor::new(
             machine_check_handler as *const () as usize,
             GATE_INTERRUPT,
@@ -667,7 +667,7 @@ pub unsafe fn init_idt() {
             GATE_INTERRUPT,
             0,
         );
-        // 0x15..0x1F: 예약 예외 -> 기본 핸들러
+        // 0x15..0x1F 예약 예외는 기본 핸들러로 등록
         let mut v = 0x0Fu8;
         while v <= 0x1F {
             if IDT[v as usize].type_attr == 0 {
@@ -709,7 +709,7 @@ pub unsafe fn init_idt() {
         // 5. LIDT: IDT 포인터를 CPU IDTR에 로드
         let ptr = IdtPointer {
             limit: (size_of::<[GateDescriptor; 256]>() - 1) as u16,
-            // &raw은 static mut에서 공유 참조 없이 원시 포인터를 생성함
+            // &raw은 static mut에서 공유 참조 없이 원시 포인터 생성
             base: (&raw const IDT) as *const GateDescriptor as u64,
         };
 

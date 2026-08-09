@@ -1,10 +1,10 @@
 //! x86_64 Task State Segment(TSS) 와 IST 스택 레이아웃을 관리하는 모듈입니다.
 //!
 //! IST 구성:
-//!   - IST1  -> #DF  (Double Fault),             64 KiB + 4 KiB Guard
-//!   - IST2  -> #NMI (Non-Maskable Interrupt),   32 KiB + 4 KiB Guard
-//!   - IST3  -> #MC  (Machine Check),            32 KiB + 4 KiB Guard
-//!   - IST4  -> #PF  (Page Fault, 커널 스택 오버플로 포함),  64 KiB + 4 KiB
+//!   - IST1 은 #DF (Double Fault) 전용, 64 KiB + 4 KiB Guard
+//!   - IST2 는 #NMI (Non-Maskable Interrupt) 전용, 32 KiB + 4 KiB Guard
+//!   - IST3 은 #MC (Machine Check) 전용, 32 KiB + 4 KiB Guard
+//!   - IST4 는 #PF (Page Fault, 커널 스택 오버플로 포함) 전용, 64 KiB + 4 KiB
 //!
 //! 치명 예외 전용 스택을 독립적으로 분리하여, 커널 주 스택이 망가진 상태
 //! (스택 오버플로, 가드 페이지 진입, 래치-업 등) 에서도 핸들러가 안전한
@@ -55,8 +55,8 @@ const IST_PF_IDX: usize = (IST_PAGE_FAULT - 1) as usize;
 //
 // IST 전용 독립 스택 (가드 페이지 포함)
 //
-// 각 스택은 `.bss`(고주소 VMA)에 정적 배치되어 커널 이미지의 일부로 매핑됨
-// W^X 매핑 시 가드 영역은 제외되어 실제 #PF를 유발하도록 main.rs에서 처리함
+// 각 스택은 `.bss`(고주소 VMA)에 정적 배치되어 커널 이미지의 일부로 매핑
+// W^X 매핑 시 가드 영역은 제외되어 실제 #PF를 유발하도록 main.rs에서 처리
 
 /// #DF 핸들러 전용 스택
 static mut STACK_DOUBLE_FAULT: IstStack<STACK_DF_SIZE> = IstStack::new();
@@ -137,7 +137,7 @@ pub fn base_addr() -> u64 {
     (&raw const KERNEL_TSS) as u64
 }
 
-/// Ring 3 → Ring 0 전환 시 자동 로드되는 커널 스택 포인터(RSP0)를 설정함.
+/// Ring 3 에서 Ring 0 으로 전환 시 자동 로드되는 커널 스택 포인터(RSP0)를 설정함.
 ///
 /// 인터럽트/예외가 사용자 모드(CPL=3)에서 발생하거나 IRETQ 가 사용자 모드
 /// 진입을 수행할 때 CPU 가 본 RSP0 값을 RSP 에 자동 적재함. (Intel SDM

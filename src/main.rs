@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
-// x86-interrupt 호출 규약: extern "x86-interrupt" 핸들러 작성에 필요
-#![feature(abi_x86_interrupt)]
+// x86-interrupt 호출 규약: extern "x86-interrupt" 핸들러 작성에 필요 (x86 전용)
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 // `static mut` 접근은 Rust 2024 의 `static_mut_refs`lint를 회피하기 위해
 // `*(&raw const|mut X)` 패턴을 사용함. clippy의 `deref_addrof`는 이 패턴을
 // `X` 직접 접근과 동치로 보고 경고하지만, 직접 접근은 다시 `static_mut_refs`
@@ -9,29 +9,28 @@
 #![allow(clippy::deref_addrof)]
 
 pub mod allocator;
-pub mod arch; // Phase 8: arch 디렉토리 골격 (D-01 Forward) + entropy 서브트리
-// Phase 9 9-A/9-B HAL-04 ISA 의존 모듈은 src/arch/x86_64/ 로 이동하고 명시 목록 re-export 로 본체 경로 보존 (OQ6)
-// Phase 10.1 HAL-06 복원 (D-2) x86 전용 gdt/idt/tss/vga 소비처(_kernel_start)를
-// src/arch/x86_64/ 로 이관 완료하여 본체는 arch-중립 공통 서브셋만 무-cfg 재노출한다
-// (crate::arch::active 가 이미 cfg-alias 이므로 per-item arch cfg 불요 production cfg 0)
+pub mod arch; // arch 디렉토리 골격 + entropy 서브트리
+// ISA 의존 모듈은 src/arch/x86_64/ 로 이동하고 명시 목록 re-export 로 본체 경로 보존
+// x86 전용 gdt/idt/tss/vga 소비처(_kernel_start)를 src/arch/x86_64/ 로 이관하여
+// 본체는 arch 중립 공통 서브셋만 cfg 없이 재노출
+// (crate::arch::active 가 이미 cfg-alias 이므로 항목별 arch cfg는 불필요)
 pub use crate::arch::active::{boot_stub, cpu, mmu, syscall};
-// vga 는 debug 빌드 SCAFFOLD 스모크 테스트만 소비하므로 debug_assertions 게이트로 유지
-// (check-arch-cfg-gate 가 debug_assertions site 를 SCAFFOLD 로 분류 = production FAIL 아님)
+// vga 는 debug 빌드 스모크 테스트만 소비하므로 debug_assertions 게이트로 유지
 #[cfg(all(target_arch = "x86_64", debug_assertions))]
 pub use crate::arch::active::vga;
-// Phase 9 9-C 펌웨어-중립 boot 계층 (BootInfo + multiboot2/uefi 어댑터, HAL-08)
+// 펌웨어-중립 boot 계층 (BootInfo + multiboot2/uefi 어댑터)
 pub mod boot;
-// 중립 메모리맵 타입은 boot 계층으로 2차 이동됨 crate::memory_map 경로는 별칭으로 보존 (allocator 본체 무변경)
+// 중립 메모리맵 타입은 boot 계층에 있으며 crate::memory_map 경로는 별칭으로 보존
 pub use crate::boot::memory_map;
 pub mod capability; // Capability-based Access Control
 pub mod crypto_service; // EP_CRYPTO 엔드포인트 암호화 서비스 디스패처
 pub mod sign_service;   // EP_SIGN 엔드포인트 ML-DSA PQ 서명 서비스
 pub mod elf; // ELF64 정적 실행 파일 파서
 pub mod hsm; // HSM 추상 트레이트 + NullHsm
-pub mod hsm_registry; // Phase 1: HSM 멀티 슬롯 레지스트리 (capability-backed)
-pub mod hsm_attest; // Phase 5: ML-DSA-44 attest verifier + AUDIT_RING + ATTEST_BUF
-pub mod air_gap; // Phase 6: air-gap 이중 게이트 + sys_hsm_status + 2 층 self-check
-pub mod bus; // Phase 2: 외부 버스 드라이버 추상화 (BusDriver trait + enum-dispatch)
+pub mod hsm_registry; // HSM 멀티 슬롯 레지스트리 (capability-backed)
+pub mod hsm_attest; // ML-DSA-44 attest verifier + AUDIT_RING + ATTEST_BUF
+pub mod air_gap; // air-gap 이중 게이트 + sys_hsm_status + 2 층 self-check
+pub mod bus; // 외부 버스 드라이버 추상화 (BusDriver trait + enum-dispatch)
 pub mod ipc; // IPC 메시지 패싱 (동기 rendezvous)
 pub mod keystore; // 소프트 PSK 키 저장소 (HSM 폴백)
 mod panic;
@@ -40,33 +39,25 @@ pub mod stack; // 커널 스택 + 가드 페이지 레이아웃
 pub mod tls; // TLS 1.3 PSK (psk_dhe_ke / psk_pq_hybrid_ke)
 // 보안 메모리 소거는 외부 `zeroize` 크레이트(elib-k0-nt) 사용
 
+// AddressSpace 는 debug 전용 try_spawn_user 스캐폴딩만 소비함
+// KERNEL_ADDR_SPACE static 은 src/arch/x86_64/kernel_start.rs 로 이관됨
+#[cfg(all(target_arch = "x86_64", debug_assertions))]
 use mmu::AddressSpace;
 // KERNEL_VMA_BASE/Mmu/PageTableFlags/Uninitialized 는 x86 _kernel_start 전용 소비였으며
-// Phase 10.1 이관으로 해당 import 는 src/arch/x86_64/kernel_start.rs 로 동반 이동됨 (HAL-06)
+// 해당 import 도 src/arch/x86_64/kernel_start.rs 로 함께 이동됨
 
-//
 // 사용자 ELF 페이로드 (build.rs 가 OUT_DIR 로 복사한 후 환경변수로 노출)
 //
-// Phase C/D 의 사용자 크레이트가 빌드되어 있지 않으면 build.rs 가 4-byte
-// ELF magic placeholder 만 임베드함. 그 경우 elf::parse() 가 `Truncated` /
-// `BadMagic` 으로 거절하여 spawn 시도가 안전하게 fail-stop 됨.
+// 사용자 크레이트가 빌드되어 있지 않으면 build.rs 가 4-byte
+// ELF magic placeholder 만 임베드함 그 경우 elf::parse() 가 `Truncated` /
+// `BadMagic` 으로 거절하여 spawn 시도가 안전하게 fail-stop 됨
 //
-// Phase E 통합 단계에서 _kernel_start 가 spawn_elf + enter_ring3 를 호출하면
-// dead_code 경고가 자동으로 해소됨. 그 전까지 일시 허용.
+// _kernel_start 가 spawn_elf 와 enter_ring3 를 호출하면 dead_code 경고가 해소되며
+// 그 전까지 일시 허용함
 #[allow(dead_code)]
 const USER_HELLO_ELF: &[u8] = include_bytes!(env!("ISO_USER_HELLO_ELF"));
 #[allow(dead_code)]
 const USER_LUMEN_ELF: &[u8] = include_bytes!(env!("ISO_USER_LUMEN_ELF"));
-
-
-//
-// 커널 전역 주소 공간
-//
-
-/// 커널 전역 주소 공간 (PML4 루트 페이지 테이블 보유).
-/// 부팅 후 CR3에 로드되어 커널 메모리 격리를 담당함.
-// SAFETY: 부팅 초기 단일 코어 접근만 허용
-static mut KERNEL_ADDR_SPACE: AddressSpace = AddressSpace::new();
 
 
 /// 임베드된 사용자 ELF 를 spawn 하고 성공 시 Ring 3 으로 진입함.
@@ -79,13 +70,13 @@ static mut KERNEL_ADDR_SPACE: AddressSpace = AddressSpace::new();
 /// 부팅 단계 16 의 모든 사전 조건이 충족된 상태에서만 호출.
 #[cfg(all(target_arch = "x86_64", debug_assertions))]
 unsafe fn try_spawn_user(elf: &[u8], label: &[u8], kernel_space: &AddressSpace) {
-    // 4-byte placeholder 는 ELF 헤더 64 바이트 미만이므로 parse 가 Truncated 로 거절.
-    // 그러나 길이 컷오프로 빠르게 판별하여 vga 메시지 노이즈를 줄임.
+    // 4-byte placeholder 는 ELF 헤더 64 바이트 미만이므로 parse 가 Truncated 로 거절함
+    // 그러나 길이 컷오프로 빠르게 판별하여 vga 메시지 노이즈를 줄임
     if elf.len() < 64 {
         return;
     }
 
-    // SAFETY: 부팅 단계 16 의 사전조건. spawn_elf 내부에서 ELF 검증 + 페이지 매핑.
+    // SAFETY: 부팅 단계 16 의 사전조건, spawn_elf 내부에서 ELF 검증 + 페이지 매핑
     match unsafe { process::spawn_elf(kernel_space, elf) } {
         Ok(pid) => {
             // SAFETY: VGA 직접 접근은 debug 빌드 한정 단일 코어 부팅 경로
@@ -94,8 +85,8 @@ unsafe fn try_spawn_user(elf: &[u8], label: &[u8], kernel_space: &AddressSpace) 
                 vga::print(label, vga::Color::White);
                 vga::println(b", entering Ring 3...", vga::Color::Green);
             }
-            // SAFETY: 본 함수에서 spawn 직후 즉시 진입 — 다른 코드 끼지 않음.
-            //         enter_ring3 는 ! 반환.
+            // SAFETY: 본 함수에서 spawn 직후 즉시 진입, 다른 코드 끼지 않음
+            //         enter_ring3 는 ! 반환
             unsafe {
                 process::enter_ring3(pid);
             }
@@ -114,10 +105,10 @@ unsafe fn try_spawn_user(elf: &[u8], label: &[u8], kernel_space: &AddressSpace) 
 ///
 /// CryptoPayload 레이아웃을 in-place 로 작성하여 BLAKE3 해시 요청을 한 번
 /// 수행하고, 응답 페이로드의 형식이 `crypto_service::write_ok_reply` 가 기록한
-/// 패턴(algo 에코 · data_len ≥ 32 · 비-에러 응답 타입)과 일치하는지 확인한다.
+/// 패턴(algo 에코, data_len ≥ 32, 비-에러 응답 타입)과 일치하는지 확인한다.
 ///
 /// # Safety
-/// `init_prng()` · `ipc::init()` 완료 후 단일 코어에서만 호출.
+/// `init_prng()` 와 `ipc::init()` 완료 후 단일 코어에서만 호출.
 #[cfg(all(target_arch = "x86_64", debug_assertions))]
 unsafe fn crypto_smoke_test() {
     use ipc::{CryptoAlgo, CryptoPayload, MessageType};
@@ -169,7 +160,7 @@ unsafe fn crypto_smoke_test() {
         }
     };
 
-    // 4. 응답 형식 검증: HashResp · algo 에코 · 32바이트 다이제스트
+    // 4. 응답 형식 검증: HashResp, algo 에코, 32바이트 다이제스트
     let payload = reply.payload_bytes();
     let ok = reply.header.msg_type == MessageType::HashResp
         && payload.len() >= ipc::CRYPTO_DATA_OFFSET
@@ -195,7 +186,7 @@ unsafe fn crypto_smoke_test() {
     // reply 의 Secret<RawPayload> 는 Drop 시 평문 자동 소거
 }
 
-/// TLS 1.3 PSK 라운드트립 스모크 테스트 — 디버그 빌드 전용.
+/// TLS 1.3 PSK 라운드트립 스모크 테스트, 디버그 빌드 전용.
 ///
 /// 절차:
 ///   1. SoftKeystore 에 32B 임시 PSK 를 등록.
@@ -207,7 +198,7 @@ unsafe fn crypto_smoke_test() {
 /// 실패 시 VGA 로 빨간 메시지 출력. 정상 시 녹색 메시지 출력.
 ///
 /// # Safety
-/// `init_prng()` · `ipc::init()` 완료 후 단일 코어에서만 호출.
+/// `init_prng()` 와 `ipc::init()` 완료 후 단일 코어에서만 호출.
 #[cfg(all(target_arch = "x86_64", debug_assertions))]
 unsafe fn tls_smoke_test() {
     use crate::hsm::PskId;
@@ -252,7 +243,7 @@ unsafe fn tls_smoke_test() {
     let ks_ref = unsafe { crate::keystore::global() };
 
     //
-    // 2. PSK-Classical (X25519 단독, 레거시 호환) <- 먼저 실행
+    // 2. PSK-Classical (X25519 단독, 레거시 호환) 을 먼저 실행
     //
     // 본 테스트는 ML-KEM 을 거치지 않아 TCG 환경에서도 빠르게 완결되어야 함
     unsafe {
@@ -397,7 +388,7 @@ unsafe fn hsm_registry_smoke_test() {
         with_registry, with_registry_mut,
     };
 
-    // Step 1: 초기 상태 확인 — attached_count == 0
+    // Step 1: 초기 상태 확인, attached_count == 0
     // SAFETY: BSP 단일 코어 부팅 시퀀스 + REGISTRY 정적 인스턴스 온라인
     let initial_count = unsafe { with_registry(|r| r.attached_count()) };
     if initial_count != 0 {
@@ -411,7 +402,7 @@ unsafe fn hsm_registry_smoke_test() {
         return;
     }
 
-    // Step 2: attach -> capability 발급 (실제 Hash-DRBG-SHA256 토큰)
+    // Step 2: attach 하여 capability 발급 (실제 Hash-DRBG-SHA256 토큰)
     // SAFETY: capability::init_prng() 완료, BSP 단일 코어
     let cap = match unsafe {
         attach_kernel_side(BusKind::Software, &[], HsmRights::USE | HsmRights::ENUMERATE | HsmRights::REVOKE)
@@ -452,7 +443,7 @@ unsafe fn hsm_registry_smoke_test() {
         return;
     }
 
-    // Step 4: enumerate (cap 보유) — 정확히 1개 슬롯 노출
+    // Step 4: enumerate (cap 보유), 정확히 1개 슬롯 노출
     let mut info_buf: [HsmSlotInfo; HSM_MAX_SLOTS] = [HsmSlotInfo::empty(); HSM_MAX_SLOTS];
     // SAFETY: BSP 단일 코어 + REGISTRY 정적 인스턴스 온라인
     let written = unsafe { with_registry(|r| r.enumerate(&mut info_buf)) };
@@ -468,7 +459,7 @@ unsafe fn hsm_registry_smoke_test() {
     }
 
     // Step 5: detach 거부 경로 정직 검증 (post-attach CAP-02 정신)
-    //   - 위조된 cap (token=0xDEAD_BEEF_DEAD_BEEF, 동일 slot) 으로 detach 호출 -> 실패 기대
+    //   - 위조된 cap (token=0xDEAD_BEEF_DEAD_BEEF, 동일 slot) 으로 detach 호출 시 실패 기대
     //   - 슬롯 상태는 Attached 유지 (변경 없음)
     let forged = HsmCapability::with_forged_token(0xDEAD_BEEF_DEAD_BEEF, cap.slot, HsmRights::REVOKE);
     // SAFETY: BSP 단일 코어; detach 진입 가능 시점
@@ -503,7 +494,7 @@ unsafe fn hsm_registry_smoke_test() {
         );
     }
 
-    // Step 6: 합법 cap 으로 detach -> 슬롯 Empty 복귀 + zeroize 트리거
+    // Step 6: 합법 cap 으로 detach 하여 슬롯 Empty 복귀 + zeroize 트리거
     // SAFETY: BSP 단일 코어
     let detach_result = unsafe { with_registry_mut(|r| r.detach(&cap, HsmRights::REVOKE)) };
     if detach_result.is_err() {
@@ -533,7 +524,7 @@ unsafe fn hsm_registry_smoke_test() {
         return;
     }
 
-    // 성공 마일스톤
+    // 성공 마커 출력
     // SAFETY: identity-mapped VGA 버퍼
     unsafe {
         vga::println(
@@ -552,7 +543,7 @@ unsafe fn bus_phase2_smoke_test() {
     use crate::bus::{BusDriver, BusInstance, BusKind};
     use hsm_registry::{HsmRights, attach_kernel_side, with_registry, with_registry_mut};
 
-    // Step 1+2: SoftHSM bus_kind 로 attach -> capability 발급
+    // Step 1+2: SoftHSM bus_kind 로 attach 하여 capability 발급
     // SAFETY: capability::init_prng() 완료, BSP 단일 코어
     let cap = match unsafe {
         attach_kernel_side(
@@ -575,7 +566,7 @@ unsafe fn bus_phase2_smoke_test() {
     };
     let slot_idx = cap.slot.0 as usize;
 
-    // 테스트 페이로드 (16 bytes). 스택-로컬, alloc 없음.
+    // 테스트 페이로드 (16 bytes), 스택-로컬 alloc 없음
     let pattern: [u8; 16] = [
         0xA5, 0x5A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
         0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
@@ -646,9 +637,9 @@ unsafe fn bus_phase2_smoke_test() {
         return;
     }
 
-    // Step 5: 루프백 동치성 검증 — 16바이트 XOR-OR fold (early-return 없는 단일 분기).
+    // Step 5: 루프백 동치성 검증, 16바이트 XOR-OR fold (early-return 없는 단일 분기)
     // CtEqOps 가 [u8] 슬라이스에 미구현 (스칼라 + SecureBuffer 만 지원) 이므로 동일 의미의
-    // O(N) OR-누산 패턴을 직접 작성한다 — 데이터-의존 분기는 발생하지 않음.
+    // O(N) OR-누산 패턴을 직접 작성하며 데이터-의존 분기는 발생하지 않음
     let mut diff: u8 = 0;
     let mut i: usize = 0;
     while i < pattern.len() {
@@ -666,7 +657,7 @@ unsafe fn bus_phase2_smoke_test() {
         return;
     }
 
-    // Step 6: 합법 cap detach -> D-17 close-before-zeroize cascade 트리거
+    // Step 6: 합법 cap detach 하여 close-before-zeroize cascade 트리거
     // SAFETY: BSP 단일 코어
     let detach_result = unsafe { with_registry_mut(|r| r.detach(&cap, HsmRights::REVOKE)) };
     if detach_result.is_err() {
@@ -680,16 +671,16 @@ unsafe fn bus_phase2_smoke_test() {
         return;
     }
 
-    // Step 7: T-02-03 observability — detach 후 slot.bus 의 raw 96바이트 가 전부 0 인지 검사.
+    // Step 7: observability, detach 후 slot.bus 의 raw 96바이트가 전부 0 인지 검사
     // SoftwareBus::zeroize 가 payload 를 비우고 BusInstance::zeroize 가 *self = Self::Empty
-    // (discriminant 0) 로 reset 한 결과를 가시화.
-    // SAFETY: BSP 단일 코어; slot_bus_mut 는 idx<HSM_MAX_SLOTS 일 때 항상 Some 반환.
+    // (discriminant 0) 로 reset 한 결과를 가시화
+    // SAFETY: BSP 단일 코어; slot_bus_mut 는 idx<HSM_MAX_SLOTS 일 때 항상 Some 반환
     let raw_all_zero: bool = unsafe {
         with_registry_mut(|r| match r.slot_bus_mut(slot_idx) {
             Some(bus) => {
                 let p: *const u8 = bus as *const BusInstance as *const u8;
                 let n: usize = core::mem::size_of::<BusInstance>();
-                // SAFETY: bus 는 유효한 &mut BusInstance — 동일 메모리 영역을 u8 슬라이스로 재해석.
+                // SAFETY: bus 는 유효한 &mut BusInstance, 동일 메모리 영역을 u8 슬라이스로 재해석
                 let slice = core::slice::from_raw_parts(p, n);
                 slice.iter().all(|&b| b == 0)
             }
@@ -707,7 +698,7 @@ unsafe fn bus_phase2_smoke_test() {
         return;
     }
 
-    // 추가 보강: registry 카운트 0 + 슬롯 Empty (Phase 1 cascade 와 동일)
+    // 추가 보강: registry 카운트 0 + 슬롯 Empty (앞선 detach cascade 와 동일)
     // SAFETY: BSP 단일 코어
     let post_count = unsafe { with_registry(|r| r.attached_count()) };
     if post_count != 0 {
@@ -731,7 +722,7 @@ unsafe fn bus_phase2_smoke_test() {
     }
 }
 
-// chan_phase3_smoke_test  Phase 3 in-kernel relay 라운드트립 검증  H4 모델 (D-22)  marker CHAN_PHASE3_OK
+// chan_phase3_smoke_test  in-kernel relay 라운드트립 검증  marker CHAN_PHASE3_OK
 #[cfg(all(target_arch = "x86_64", debug_assertions))]
 unsafe fn chan_phase3_smoke_test() {
     use crate::bus::{BusDriver, BusInstance, BusKind, SoftHsmRole};
@@ -763,7 +754,7 @@ unsafe fn chan_phase3_smoke_test() {
     let src_slot = cap_src.slot.0 as usize;
 
     // (2) AesGcm dst 슬롯 attach  rights = USE | REVOKE | RELAY_DST
-    // SAFETY: Phase 2 와 동일 invariant
+    // SAFETY: 앞선 src 슬롯 attach 와 동일 invariant
     let cap_dst = match unsafe {
         attach_kernel_side(
             BusKind::Software,
@@ -785,7 +776,7 @@ unsafe fn chan_phase3_smoke_test() {
     };
     let dst_slot = cap_dst.slot.0 as usize;
 
-    // (3) src.write(b"PHASE3_INPUT")  Role::Blake3 → src.ring 에 32B digest 저장
+    // (3) src.write(b"PHASE3_INPUT") 시 Role::Blake3 가 src.ring 에 32B digest 저장
     let write_input: &[u8; 12] = b"PHASE3_INPUT";
     // SAFETY: BSP 단일 코어; with_registry_mut 의 invariant 동일
     let write_ok = unsafe {
@@ -805,8 +796,8 @@ unsafe fn chan_phase3_smoke_test() {
         return;
     }
 
-    // (4) kernel-side relay  with_relay_buf 안에서 src.read 32B → dst.write 32B
-    // D-22 H4  syscall ABI 우회  with_relay_buf direct 진입  RELAY_BUF entry+exit zeroize 보장 (D-14)
+    // (4) kernel-side relay  with_relay_buf 안에서 src.read 32B 후 dst.write 32B
+    // syscall ABI 우회  with_relay_buf direct 진입  RELAY_BUF entry+exit zeroize 보장
     // SAFETY: BSP single-core; with_relay_buf + with_registry_mut 는 disjoint static borrow
     let relay_ok = unsafe {
         with_relay_buf(|buf| {
@@ -837,8 +828,8 @@ unsafe fn chan_phase3_smoke_test() {
     }
 
     // (5) in-kernel 재계산 + slice ct_eq  dst.ring[..60] == AES256GCM(key, nonce_1, BLAKE3(input))
-    // RESEARCH §Risk #6  debug_aes_state / debug_ring 는 #[cfg(debug_assertions)] 노출  release 빌드 부재
-    // 5a — BLAKE3(b"PHASE3_INPUT") 직접 호출
+    // debug_aes_state / debug_ring 는 #[cfg(debug_assertions)] 노출  release 빌드 부재
+    // 5a BLAKE3(b"PHASE3_INPUT") 직접 호출
     let mut hasher = Blake3::new();
     hasher.update(write_input);
     let digest = match hasher.finalize() {
@@ -857,7 +848,7 @@ unsafe fn chan_phase3_smoke_test() {
     let mut blake3_out = [0u8; BLAKE3_OUT_LEN];
     blake3_out.copy_from_slice(&digest.as_slice()[..BLAKE3_OUT_LEN]);
 
-    // 5b — dst 의 fresh key + counter==1 직접 노출 + expected ciphertext 합성 + dst.ring 와 비교
+    // 5b dst 의 fresh key + counter==1 직접 노출 + expected ciphertext 합성 + dst.ring 와 비교
     let mut expected: [u8; 60] = [0u8; 60]; // nonce(12) || ct(32) || tag(16)
     let mut got: [u8; 60] = [0u8; 60];
     // SAFETY: BSP 단일 코어; debug_assertions 만 진입 가능
@@ -867,7 +858,7 @@ unsafe fn chan_phase3_smoke_test() {
                 Some(b) => b,
                 None => return 1,
             };
-            // BusInstance::Software 케이스 직접 매치  Phase 2 BUS-04 enum-dispatch 일관
+            // BusInstance::Software 케이스 직접 매치  enum-dispatch 일관
             let sw = match bus {
                 BusInstance::Software(sw) => sw,
                 _ => return 1,
@@ -876,24 +867,30 @@ unsafe fn chan_phase3_smoke_test() {
                 Some(s) => s,
                 None => return 1,
             };
-            // nonce 직렬화 (counter == 1; D-12)
+            // nonce 직렬화 (counter == 1)
             let mut nonce = [0u8; GCM_NONCE_SIZE];
             nonce[..8].copy_from_slice(&state.nonce_counter.to_le_bytes());
             // expected: encrypt(key, nonce, blake3_out)
-            let cipher = AES256GCM::new(state.key.expose());
+            let mut cipher = AES256GCM::default();
+            cipher.init(state.key.expose());
             let mut tag = [0u8; GCM_TAG_SIZE];
             expected[..GCM_NONCE_SIZE].copy_from_slice(&nonce);
-            cipher.encrypt(
-                &nonce,
-                &[],
-                &blake3_out,
-                &mut expected[GCM_NONCE_SIZE..GCM_NONCE_SIZE + BLAKE3_OUT_LEN],
-                &mut tag,
-            );
+            if cipher
+                .encrypt(
+                    &nonce,
+                    &[],
+                    &blake3_out,
+                    &mut expected[GCM_NONCE_SIZE..GCM_NONCE_SIZE + BLAKE3_OUT_LEN],
+                    &mut tag,
+                )
+                .is_err()
+            {
+                return 1;
+            }
             expected[GCM_NONCE_SIZE + BLAKE3_OUT_LEN..].copy_from_slice(&tag);
             // got: dst.ring[..60]
             got.copy_from_slice(&sw.debug_ring()[..60]);
-            // slice CT-eq via XOR-OR fold (Phase 2 main.rs:1149-1157 패턴, RESEARCH §Risk #8)
+            // slice CT-eq via XOR-OR fold
             let mut diff: u8 = 0;
             let mut i = 0;
             while i < 60 {
@@ -936,17 +933,16 @@ unsafe fn chan_phase3_smoke_test() {
                 vga::Color::Red,
             );
         }
-        return;
     }
 }
 
 //
-// attest_phase5_smoke_test  Phase 5 attach with attestation gate 2-leg 검증  marker ATTEST_PHASE5_OK
+// attest_phase5_smoke_test  attach with attestation gate 2-leg 검증  marker ATTEST_PHASE5_OK
 //
 // Leg 1 valid sig 흐름  dev sk 로 BLAKE3(pk||bus||BOOT_CHALLENGE) 서명 후
 //                       attach_kernel_side_with_attest Ok(cap) 슬롯 1 개 부착
 // Leg 2 mutated sig 흐름  sig[0] ^= 0xFF 후 동일 호출 Err(AttestFailed)
-//                         attached_count 변동 0 RESEARCH 6.2 atomicity 회귀 가드
+//                         attached_count 변동 0 atomicity 회귀 가드
 //
 // 본 smoke 는 feature smoke 게이트 아래에서만 컴파일 closed 프로필 dev sk leak 0 보장
 #[cfg(all(target_arch = "x86_64", debug_assertions, feature = "smoke"))]
@@ -957,7 +953,7 @@ unsafe fn attest_phase5_smoke_test() {
     use hsm_registry::{HsmRights, attach_kernel_side_with_attest, with_registry, with_registry_mut};
     use mldsa::MLDSA44;
 
-    // Phase 5 D-02 dev sk 자료는 feature smoke 한정 include_bytes 로만 임베드
+    // dev sk 자료는 feature smoke 한정 include_bytes 로만 임베드
     // closed 프로필 빌드는 본 함수 자체가 cfg-out 되어 sk44 자료 leak 0
     const DEV_SK: &[u8; MLDSA44::SK_LEN] = include_bytes!("../keys/dev_trust_root.sk44");
 
@@ -974,7 +970,7 @@ unsafe fn attest_phase5_smoke_test() {
     pre[MLDSA44::PK_LEN] = bus_kind as u8;
     pre[MLDSA44::PK_LEN + 1..].copy_from_slice(&challenge);
 
-    // (3) BLAKE3 digest  서명 평문은 32 옥텟 digest (D-07 amendment)
+    // (3) BLAKE3 digest  서명 평문은 32 옥텟 digest
     let mut hasher = Blake3::new();
     hasher.update(&pre);
     let digest_buf = match hasher.finalize() {
@@ -992,7 +988,7 @@ unsafe fn attest_phase5_smoke_test() {
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&digest_buf.as_slice()[..32]);
 
-    // (4) ML-DSA-44 sign  ctx b"ISO-K0-ENROLL-V1" 16 옥텟 D-08 도메인 분리 verify_attest 와 동일 ctx
+    // (4) ML-DSA-44 sign  ctx b"ISO-K0-ENROLL-V1" 16 옥텟 도메인 분리 verify_attest 와 동일 ctx
     // rnd 인자는 결정적 smoke 회귀 일관성을 위해 고정 nonce [0xBB;32] 사용
     let rnd = [0xBB_u8; 32];
     let sig: [u8; MLDSA44::SIG_LEN] = match MLDSA44::sign(DEV_SK, &digest, b"ISO-K0-ENROLL-V1", &rnd) {
@@ -1094,7 +1090,7 @@ unsafe fn attest_phase5_smoke_test() {
 }
 
 //
-// Phase 5.1 D-04 wire AttestSubmit fixture 정적 슬롯
+// wire AttestSubmit fixture 정적 슬롯
 //
 // kernel 의 attest_phase5_1_wire_smoke_test 가 채우고
 // lumen 의 SyscallNum AttestFixtureExport(13) 가 사용자 공간으로 복사
@@ -1108,10 +1104,10 @@ unsafe fn attest_phase5_smoke_test() {
 static mut WIRE_ATTEST_FIXTURE: [u8; 3733] = [0u8; 3733];
 
 //
-// attest_phase5_1_wire_smoke_test  Phase 5.1 wire AttestSubmit / Status round-trip 9-step
+// attest_phase5_1_wire_smoke_test  wire AttestSubmit / Status round-trip 9-step
 //                                  marker ATTEST_PHASE5_1_OK
 //
-// (1) BOOT_CHALLENGE 와 ACTIVE_TRUST_ROOT_PK 스냅샷 Phase 5 mirror
+// (1) BOOT_CHALLENGE 와 ACTIVE_TRUST_ROOT_PK 스냅샷 mirror
 // (2) Pre-image (pk || bus_kind || challenge) 재구성 + BLAKE3 digest
 // (3) ML-DSA-44 sign  ctx b"ISO-K0-ENROLL-V1"  rnd 결정적 [0xCC; 32]
 // (4) wire AttestSubmit payload 3733 옥텟 조립 (pk || bus_kind || sig)
@@ -1119,7 +1115,7 @@ static mut WIRE_ATTEST_FIXTURE: [u8; 3733] = [0u8; 3733];
 // (6) Leg 1 valid  kernel-direct handle_attest_submit  resp status = Ok 응답 16B
 // (7) Leg 2 mutated sig (sig 첫 옥텟 flip) handle_attest_submit  resp cmd 0xFFFF status 3
 // (8) audit_ring delta == 2 후행 검증 (5 WireReattestOk + 6 WireReattestFail)
-// (9) ATTEST_PHASE5_1_OK marker emit (Pitfall 6 substring 충돌 0)
+// (9) ATTEST_PHASE5_1_OK marker emit (substring 충돌 0)
 #[cfg(all(target_arch = "x86_64", debug_assertions, feature = "smoke"))]
 unsafe fn attest_phase5_1_wire_smoke_test() {
     use crate::bus::{BusKind, WIRE_FRAME_MAX, handle_attest_submit};
@@ -1160,8 +1156,8 @@ unsafe fn attest_phase5_1_wire_smoke_test() {
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&digest_buf.as_slice()[..32]);
 
-    // (3) ML-DSA-44 sign  ctx b"ISO-K0-ENROLL-V1" 16 옥텟 D-08 도메인 분리
-    // rnd 인자 결정적 smoke 회귀 일관성 위해 고정 nonce [0xCC; 32] 사용 (Phase 5 0xBB 와 분리)
+    // (3) ML-DSA-44 sign  ctx b"ISO-K0-ENROLL-V1" 16 옥텟 도메인 분리
+    // rnd 인자 결정적 smoke 회귀 일관성 위해 고정 nonce [0xCC; 32] 사용 (앞선 0xBB 와 분리)
     let rnd = [0xCC_u8; 32];
     let sig: [u8; MLDSA44::SIG_LEN] = match MLDSA44::sign(DEV_SK, &digest, b"ISO-K0-ENROLL-V1", &rnd) {
         Ok(s) => s,
@@ -1177,7 +1173,7 @@ unsafe fn attest_phase5_1_wire_smoke_test() {
     };
 
     // (4) wire AttestSubmit payload 3733 옥텟 조립 (pk(1312) || bus_kind(1) || sig(2420))
-    //     handle_attest_submit 가 기대하는 wire layout (Pitfall 1 회피)
+    //     handle_attest_submit 가 기대하는 wire layout
     const WIRE_ATTEST_LEN: usize = MLDSA44::PK_LEN + 1 + MLDSA44::SIG_LEN;
     let mut attest_wire = [0u8; WIRE_ATTEST_LEN];
     attest_wire[..MLDSA44::PK_LEN].copy_from_slice(&pk);
@@ -1234,7 +1230,7 @@ unsafe fn attest_phase5_1_wire_smoke_test() {
         return;
     }
 
-    // (9) ATTEST_PHASE5_1_OK marker  Pitfall 6 substring 충돌 0 검증됨
+    // (9) ATTEST_PHASE5_1_OK marker  substring 충돌 0 검증됨
     // SAFETY identity-mapped VGA 버퍼
     unsafe {
         vga::println(
@@ -1250,7 +1246,7 @@ unsafe fn attest_phase5_1_wire_smoke_test() {
     tampered.zeroize();
 }
 
-/// Phase 5.1 D-04 attest_payload 3733 옥텟 fixture export 핸들러 (feature smoke 한정)
+/// attest_payload 3733 옥텟 fixture export 핸들러 (feature smoke 한정)
 ///
 /// SyscallNum AttestFixtureExport(13) 의 dispatch 본문 ABI
 ///   rdi = out_ptr (user-space dst)
@@ -1284,7 +1280,7 @@ pub fn handle_attest_fixture_export(ctx: &mut syscall::SyscallContext) -> u64 {
     0
 }
 
-/// Phase 6 GAP D-PHASE6 air-gap dual gate + sys_hsm_status + gap_self_check 통합 smoke test
+/// air-gap dual gate + sys_hsm_status + gap_self_check 통합 smoke test
 ///
 /// # Safety
 /// 부팅 시 단일 코어 init_audit_read_cap + init_network_cap (cfg) + gap_self_check 모두 완료 가정
@@ -1352,22 +1348,12 @@ unsafe fn gap_phase6_smoke_test() {
         }
     }
 
-    // 마지막 GAP_PHASE6_OK marker (4-line 의 마지막 라인) Plan 06-07 qemu-test.sh grep 입력
+    // 마지막 GAP_PHASE6_OK marker (4-line 의 마지막 라인) qemu-test.sh grep 입력
     // SAFETY VGA buffer 단일 코어 부팅 시 초기화 완료 가정
     unsafe {
         vga::println(
             b"[iso-light-k0] GAP_PHASE6_OK marker",
             vga::Color::Green,
         );
-    }
-}
-
-/// 마이크로커널 메인 이벤트 루프.
-///
-/// IPC 요청, 타이머 인터럽트 대기 (hlt).
-/// TODO: IPC 수신 큐 처리, Capability 검증, 스케줄러 연동
-fn kernel_main_loop() -> ! {
-    loop {
-        crate::arch::active::cpu::wait_for_interrupt();
     }
 }

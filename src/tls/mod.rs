@@ -47,12 +47,12 @@ pub const MAX_TLS_CONNS: usize = 4;
 /// 트랜스크립트 버퍼 최대 길이 (PQ-hybrid CH/SH 의 ML-KEM share 수용).
 pub const TRANSCRIPT_BUF_LEN: usize = 4096;
 
-/// AEAD 키 / IV / 태그 크기 (suite 무관 — 본 커널 정책상 고정).
+/// AEAD 키 / IV / 태그 크기 (suite 무관하게 본 커널 정책상 고정).
 pub const AEAD_KEY_LEN: usize = 32;
 pub const AEAD_IV_LEN: usize = 12;
 pub const AEAD_TAG_LEN: usize = 16;
 
-// ML-KEM-768 (FIPS 203) 정수 — elib-k0-nt 내부 상수와 동일하나
+// ML-KEM-768 (FIPS 203) 정수로 elib-k0-nt 내부 상수와 동일하나
 // 그쪽이 pub(crate) 이므로 여기서 별도 선언
 pub const TLS_MLKEM768_PK_LEN: usize = 1184;
 pub const TLS_MLKEM768_CT_LEN: usize = 1088;
@@ -70,9 +70,9 @@ pub const TLS_HASH_LEN: usize = SHA256_OUTPUT_SIZE; // 32
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
-    /// 폐쇄망 — 사전 분배 PSK 기반, 본 커널 기본.
+    /// 폐쇄망, 사전 분배 PSK 기반이며 본 커널 기본.
     Closed,
-    /// 외부망 — `tls-external` Cargo feature + 런타임 Capability 가 모두 있을 때만.
+    /// 외부망, `tls-external` Cargo feature 와 런타임 Capability 가 모두 있을 때만.
     #[cfg(feature = "tls-external")]
     External,
 }
@@ -81,14 +81,14 @@ pub enum Profile {
 pub enum KexPolicy {
     /// X25519 + ML-KEM-768 hybrid (양자 안전, 본 커널 기본 권장).
     Hybrid,
-    /// X25519 단독 — 레거시 시스템 호환 (옵트인).
+    /// X25519 단독, 레거시 시스템 호환 (옵트인).
     Classical,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CipherSuite {
-    /// AES-256-GCM + HKDF-SHA-256 (본 커널 정의 — IANA 미등록).
+    /// AES-256-GCM + HKDF-SHA-256 (본 커널 정의, IANA 미등록).
     Aes256GcmSha256 = 0x01,
     /// ChaCha20-Poly1305 + HKDF-SHA-256 (RFC 8446 §B.4 의 SHA-256 변형).
     ChaCha20Poly1305Sha256 = 0x02,
@@ -264,7 +264,7 @@ pub struct ConnHandle(pub u8);
 //
 // `Secret::new` 가 const fn 이 아니므로 슬롯은 `Option<TlsConnection>` 으로
 // 시작하여 alloc 시점에 lazy 하게 인스턴스화됨. close 시 `None` 으로 되돌리며
-// `Drop` 으로 모든 `Secret<>` 필드가 volatile-write 로 소거됨
+// `Drop` 으로 모든 `Secret<>` 필드가 volatile-write 로 소거
 static mut TLS_POOL: [Option<TlsConnection>; MAX_TLS_CONNS] = [None, None, None, None];
 
 /// # Safety

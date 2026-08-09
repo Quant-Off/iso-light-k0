@@ -42,7 +42,14 @@ echo ""
 
 # 1. ISO 빌드
 echo "[1/5] ISO 빌드 중..."
-make iso
+# SKIP_ISO_BUILD=1 이면 기존 ${ISO} 를 그대로 사용 (사전 빌드된 아티팩트·에어갭 환경
+# 에서 userspace build-std prereq 를 우회하고 하네스만 재실행할 때 사용)
+if [ "${SKIP_ISO_BUILD:-0}" = "1" ]; then
+    echo "  SKIP_ISO_BUILD=1 -> 기존 ${ISO} 사용 (빌드 생략)"
+    [ -f "${ISO}" ] || { echo "[FAIL] ${ISO} 부재 (SKIP_ISO_BUILD 인데 사전 빌드 ISO 없음)"; exit 1; }
+else
+    make iso
+fi
 echo ""
 
 # 2. KVM 가속 여부 확인
@@ -284,7 +291,7 @@ fi
 if [ -s "${VGA_TXT}" ]; then
     if [ "${ENTROPY_MODE}" = "tcg-no-entropy" ]; then
         UNEXPECTED_FATAL=$(grep -E "FATAL|MISMATCH|FAILED" "${VGA_TXT}" \
-            | grep -vE "FATAL: no hardware entropy" \
+            | grep -vE "FATAL: (entropy quorum failure|no hardware entropy)" \
             | grep -vE "FATAL: HsmRegistry smoke FAILED \(attach error\)" \
             | grep -vE "FATAL: bus_phase2 smoke FAILED \(attach error\)" \
             | grep -vE "FATAL: chan_phase3 smoke FAILED \(attach" \
@@ -326,7 +333,7 @@ HAS_ATTEST_PHASE5_1_OK=false  # Phase 5.1 marker  ci-phase5_1 게이트
 HAS_GAP_PHASE6_OK=false  # Phase 6 marker  ci-phase6 게이트
 if [ -s "${VGA_TXT}" ]; then
     grep -q "Booted\. Initializing"           "${VGA_TXT}" && HAS_BOOTED=true
-    grep -q "FATAL: no hardware entropy"      "${VGA_TXT}" && HAS_FAILCLOSED=true
+    grep -qE "FATAL: (entropy quorum failure|no hardware entropy)" "${VGA_TXT}" && HAS_FAILCLOSED=true
     grep -q "Capability DRBG Init Done"       "${VGA_TXT}" && HAS_DRBG=true
     grep -q "BLAKE3 round-trip OK"            "${VGA_TXT}" && HAS_SMOKE_OK=true
     grep -q "PQ-Hybrid (X25519+MLKEM768) OK"  "${VGA_TXT}" && HAS_TLS_HYBRID=true
@@ -438,7 +445,7 @@ if [ "${ENTROPY_MODE}" = "tcg-no-entropy" ]; then
     printf "  %-34s %s\n" "[H5/M12 fail-closed FATAL]" "$($HAS_FAILCLOSED && echo PASS || echo MISS)"
     if ! $HAS_FAILCLOSED; then
         PASS=false
-        FAIL_REASONS+=("fail-closed FATAL(no hardware entropy) 미출력 — 부팅이 예상 경로로 진행되지 않음")
+        FAIL_REASONS+=("fail-closed FATAL(entropy quorum failure) 미출력 — 부팅이 예상 경로로 진행되지 않음")
     fi
     if ! $HAS_BOOTED; then
         PASS=false

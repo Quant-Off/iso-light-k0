@@ -1,5 +1,5 @@
-//! Multiboot2 헤더와 32-bit -> 64-bit Long Mode 전환 스텁(Higher-Half Kernel)
-//! 을 제공하는 모듈입니다.
+//! Multiboot2 헤더와 32-bit 에서 64-bit Long Mode 로 전환하는 스텁(Higher-Half
+//! Kernel)을 제공하는 모듈입니다.
 //!
 //! 부팅 흐름:
 //!   1. GRUB 이 Multiboot2 로 `_start` (32-bit, .boot32, phys ~0x100036) 에
@@ -13,10 +13,11 @@
 //!   3. `_kernel_start` (고주소 VMA, Rust) 가 호출되어 본격적인 커널 초기화가
 //!      시작됨.
 //!
-//! 페이지 테이블 설계 (부팅 중 활성):
-//!   - PML4[0]   -> boot_pdpt_low  -> 4 x 1 GiB Identity (0..4GiB -> 0..4GiB)
-//!   - PML4[511] -> boot_pdpt_high -> PDPT[510]: 0xFFFFFFFF_8000_0000 -> phys 0
-//!     PML4[511] (cont.)              PDPT[511]: 0xFFFFFFFF_C000_0000 -> phys 1GiB
+//! 부팅 중 활성 페이지 테이블 구성:
+//!   PML4[0] 은 boot_pdpt_low 로 이어져 0 에서 4 GiB 까지 4 개의 1 GiB identity
+//!   매핑을 제공하고, PML4[511] 은 boot_pdpt_high 로 이어져 PDPT[510] 이 가상
+//!   0xFFFFFFFF_8000_0000 을 물리 0 에, PDPT[511] 이 가상 0xFFFFFFFF_C000_0000 을
+//!   물리 1 GiB 에 매핑함.
 //!
 //! Higher-Half 점프 전략:
 //!   `_start64` 는 .boot32(저주소) 에 있으므로 `_kernel_start`(고주소) 로의

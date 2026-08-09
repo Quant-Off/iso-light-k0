@@ -2,10 +2,10 @@
 //!
 //! # Features
 //! `_start` 에서 `CurrentEL` 을 판정하여 EL2 진입(virtualization=on)이면 EL1 으로
-//! 무조건 `eret` 강하하고(Pitfall 9), EL1 직접 진입이면 통과합니다. 강하 후
+//! 무조건 `eret` 강하하고, EL1 직접 진입이면 통과합니다. 강하 후
 //! `el1_entry` 는 SPSel 을 SP_EL1 로 전환하고 boot 스택 SP_EL1 을 활성한 뒤
 //! VBAR_EL1 에 `.vector_table` 을 로드하고 CPACR_EL1.FPEN 을 세팅합니다. 진입
-//! 레지스터 x0(DTB phys addr, A4)은 강하 구간에서 x19 로 보존되어 커널 합류점에
+//! 레지스터 x0(DTB phys addr)은 강하 구간에서 x19 로 보존되어 커널 합류점에
 //! 전달됩니다.
 //!
 //! x86_64 `boot_stub.rs` 의 Multiboot2 헤더 + Long Mode 전환 구조를 mirror 하되
@@ -13,7 +13,7 @@
 //! 사용합니다. `el1_entry` 는 특권 정규화 + EL=1 early print 후 `aarch64_kernel_entry`
 //! 로 bl 분기하며(`boot.rs` 커널 합류점 MMU stage1 + GIC + PSCI 7-line proof), 진입 함수는
 //! `-> !` 이므로 반환 시 방어적 trap 으로 낙하합니다. DTB 파싱과 arch-중립 `_kernel_start`
-//! 합류는 Phase 11 LIVE-01 로 이연됩니다.
+//! 합류는 후속 작업으로 이연됩니다.
 
 use core::arch::global_asm;
 
@@ -21,7 +21,7 @@ global_asm!(
     r#"
     //
     // § 1. 진입점 _start (.text.boot)
-    //     QEMU virt -kernel 로드 후 진입 x0 = DTB phys addr (A4)
+    //     QEMU virt -kernel 로드 후 진입 x0 = DTB phys addr
     //     진입 EL 은 EL1(기본) 또는 EL2(virtualization=on)
     //
     .section .text.boot,"ax",%progbits
@@ -37,8 +37,8 @@ _start:
     b.ne el1_entry
 
     //
-    // § 2. EL2 -> EL1 무조건 강하 (Pitfall 9 ARM-02)
-    //     HCR_EL2.RW=1 EL1 AArch64 실행 SPSR_EL2=0x3c5 EL1h + DAIF 전 mask
+    // § 2. EL2 에서 EL1 로 무조건 강하
+    //     HCR_EL2.RW=1 로 EL1 AArch64 실행, SPSR_EL2=0x3c5 EL1h + DAIF 전 mask
     //
     mrs x1, hcr_el2
     orr x1, x1, #(1 << 31)          // HCR_EL2.RW = 1
@@ -61,7 +61,7 @@ el1_entry:
 
     adrp x1, _vector_table          // vectors.rs 가 .vector_table 에 배치 (0x800 정렬)
     add  x1, x1, :lo12:_vector_table
-    msr  vbar_el1, x1               // 예외 벡터 베이스 로드 (ARM-03)
+    msr  vbar_el1, x1               // 예외 벡터 베이스 로드
 
     mrs  x1, cpacr_el1              // CPACR_EL1.FPEN = 0b11 FP/SIMD 트랩 해제
     orr  x1, x1, #(0b11 << 20)
@@ -69,9 +69,9 @@ el1_entry:
     isb
 
     //
-    // § 4. MMU 전 early print PL011 physical MMIO 로 EL=1 마커 직접 출력 (ARM-07)
+    // § 4. MMU 전 early print, PL011 physical MMIO 로 EL=1 마커 직접 출력
     //      PL011 은 MMU 무관 동작하므로 identity 물리 UARTDR(0x0900_0000+0x00)에
-    //      바이트 스트림을 흘림 (A1 폴백 base 10-C console 백엔드와 동일 주소)
+    //      바이트 스트림을 흘림 (폴백 base, console 백엔드와 동일 주소)
     //
     movz x2, #0x0900, lsl #16       // x2 = PL011 base 0x0900_0000 (UARTDR offset 0x00)
     adr  x3, .Lel1_marker_el1
@@ -82,10 +82,10 @@ el1_entry:
     b    .Lel1_emit
 .Lel1_emit_done:
 
-    mov  x0, x19                    // DTB phys addr 복원 (커널 합류점 1 번째 인수 A4)
+    mov  x0, x19                    // DTB phys addr 복원 (커널 합류점 1 번째 인수)
 
     //
-    // § 5. 커널 부팅 합류점 분기 (Pattern 1 boot.rs aarch64_kernel_entry 는 -> !)
+    // § 5. 커널 부팅 합류점 분기 (boot.rs aarch64_kernel_entry 는 발산 함수)
     //      함수는 반환하지 않으므로 bl 후 방어적 trap 으로 낙하 (정상 경로 미도달)
     //
     bl   aarch64_kernel_entry

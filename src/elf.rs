@@ -2,7 +2,7 @@
 //!
 //! `iso-light-k0` 의 사용자 프로세스 로더는 ELF64 LE little-endian 정적
 //! 실행 파일(`ET_EXEC` 또는 `ET_DYN`-but-statically-linked)만 받습니다. 동적
-//! 링킹·인터프리터·재배치 셋업은 모두 거부합니다.
+//! 링킹, 인터프리터, 재배치 셋업은 모두 거부합니다.
 //!
 //! # 검증 항목
 //!   - ELF magic `0x7F 'E' 'L' 'F'`, class = 64-bit, data = LSB, version = 1
@@ -54,11 +54,11 @@ const PT_TLS: u32 = 7;
 const PT_GNU_STACK: u32 = 0x6474_E551;
 const PT_GNU_RELRO: u32 = 0x6474_E552;
 
-/// PT_LOAD 의 `p_flags` — 실행 가능
+/// PT_LOAD 의 `p_flags` 실행 가능 비트
 pub const PF_X: u32 = 1;
-/// PT_LOAD 의 `p_flags` — 쓰기 가능
+/// PT_LOAD 의 `p_flags` 쓰기 가능 비트
 pub const PF_W: u32 = 2;
-/// PT_LOAD 의 `p_flags` — 읽기 가능
+/// PT_LOAD 의 `p_flags` 읽기 가능 비트
 pub const PF_R: u32 = 4;
 
 //
@@ -97,7 +97,7 @@ pub enum ElfError {
 
 /// 파싱된 ELF64 이미지의 뷰. 원본 `&[u8]` 의 라이프타임에 묶임.
 pub struct Elf64Image<'a> {
-    /// `e_entry` — 사용자 진입점 가상 주소
+    /// `e_entry`, 사용자 진입점 가상 주소
     pub entry: u64,
     /// 적재해야 하는 PT_LOAD 세그먼트 목록
     pub loads: ProgramHeaderArray,
@@ -149,7 +149,7 @@ pub fn parse(data: &[u8]) -> Result<Elf64Image<'_>, ElfError> {
         return Err(ElfError::Truncated);
     }
 
-    // SAFETY: 위 길이 검증 후 read_unaligned 로 alignment 무관 접근.
+    // SAFETY: 위 길이 검증 후 read_unaligned 로 alignment 무관 접근
     let header: ElfHeader = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const ElfHeader) };
 
     // 1. e_ident 검증
@@ -192,7 +192,7 @@ pub fn parse(data: &[u8]) -> Result<Elf64Image<'_>, ElfError> {
     };
     for i in 0..(header.e_phnum as usize) {
         let off = phoff + i * size_of::<ProgramHeaderRaw>();
-        // SAFETY: off..off+56 가 data 범위 내임을 위에서 보장.
+        // SAFETY: off..off+56 가 data 범위 내임을 위에서 보장
         let raw: ProgramHeaderRaw =
             unsafe { core::ptr::read_unaligned(data.as_ptr().add(off) as *const ProgramHeaderRaw) };
 
@@ -203,7 +203,7 @@ pub fn parse(data: &[u8]) -> Result<Elf64Image<'_>, ElfError> {
         // 4-2. PT_LOAD 외에는 무시 (PT_NULL/PT_PHDR/PT_NOTE/PT_GNU_STACK 등)
         if raw.p_type != PT_LOAD {
             // PT_TLS / PT_SHLIB 도 본 단계 미지원이지만 정적 링킹 사용자 프로그램은
-            // 일반적으로 포함하지 않으므로 단순 스킵.
+            // 일반적으로 포함하지 않으므로 단순 스킵
             let _ = (
                 PT_NULL,
                 PT_NOTE,
@@ -236,7 +236,7 @@ pub fn parse(data: &[u8]) -> Result<Elf64Image<'_>, ElfError> {
         if !mmu::is_user_va(raw.p_vaddr) {
             return Err(ElfError::BadVirtualAddress);
         }
-        // p_memsz 끝도 사용자 영역 안에 있어야 함
+        // p_memsz 끝도 사용자 영역 안에 포함
         let mem_end = raw
             .p_vaddr
             .checked_add(raw.p_memsz)

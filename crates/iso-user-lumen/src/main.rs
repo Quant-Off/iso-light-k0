@@ -8,12 +8,12 @@
 //! Ring 3 결합 검증).
 //!
 //! 검증 항목:
-//!   1. BLAKE3(고정 입력) → 32-byte 다이제스트 hex 출력
-//!   2. BLAKE3 keyed_derive(고정 키 + 메시지) → 32-byte 출력
-//!   3. Ed25519 결정성 — 고정 시드 + 고정 메시지 → 64-byte 서명 hex 출력 +
+//!   1. BLAKE3(고정 입력) 이 32-byte 다이제스트 hex 출력
+//!   2. BLAKE3 keyed_derive(고정 키 + 메시지) 가 32-byte 출력
+//!   3. Ed25519 결정성, 고정 시드 와 고정 메시지 로 64-byte 서명 hex 출력 및
 //!      verify roundtrip
-//!   4. X25519 ECDH — Alice(seed=AAAA…) ↔ Bob(seed=BBBB…) 양방향 공유 비밀 일치
-//!   5. AES-256-GCM round-trip — encrypt → decrypt 성공 + 평문 일치
+//!   4. X25519 ECDH, Alice(seed=AAAA…) 와 Bob(seed=BBBB…) 양방향 공유 비밀 일치
+//!   5. AES-256-GCM round-trip, encrypt 후 decrypt 성공 및 평문 일치
 //!
 //! sys_write(STDERR=2) 로 결과를 보고하고 sys_exit(0/1) 으로 종료합니다.
 //!
@@ -42,7 +42,7 @@ const STDERR: u64 = 2;
 #[inline(always)]
 unsafe fn syscall1(num: u64, a0: u64) -> u64 {
     let ret: u64;
-    // SAFETY: syscall ABI — RCX/R11 만 clobber
+    // SAFETY: syscall ABI, RCX/R11 만 clobber
     unsafe {
         asm!(
             "syscall",
@@ -79,9 +79,9 @@ unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    // Phase 4 신규  sys_hsm_attach 의 4번째 인자 (out_ptr) 를 r8 로 전달
+    // sys_hsm_attach 의 4번째 인자 (out_ptr) 를 r8 로 전달
     // src/hsm_registry.rs::handle_attach line 483 `let out_ptr = ctx.r8;` 와 ABI 일관
-    // Linux 의 r10 미사용  iso-light-k0 syscall ABI 가 r8 슬롯 채택 (Phase 1 D-15)
+    // Linux 의 r10 미사용, iso-light-k0 syscall ABI 가 r8 슬롯 채택
     let ret: u64;
     // SAFETY: syscall3 와 동일 RCX/R11 만 clobber sysret 후 정상 복귀
     unsafe {
@@ -206,7 +206,8 @@ fn check_blake3_keyed() {
 //
 fn check_ed25519() {
     let seed = [0x42u8; 32];
-    let sk = ed25519::SecretKey::from_bytes(&seed);
+    let mut sk = ed25519::SecretKey::default();
+    sk.init(&seed);
     let pk = ed25519::PublicKey::from(&sk);
     let msg = b"iso-lumen-wire-compat-ed25519";
     let sig = ed25519::sign(msg, &sk);
@@ -221,7 +222,7 @@ fn check_ed25519() {
         exit(1);
     }
 
-    // 결정성 한 번 더 — 같은 시드 + 메시지 → 같은 서명
+    // 결정성 한 번 더, 같은 시드 와 메시지 로 같은 서명
     let sig2 = ed25519::sign(msg, &sk);
     if sig.as_bytes() == sig2.as_bytes() {
         write_stderr(b"[iso-user-lumen] Ed25519 deterministic OK\n");
@@ -238,21 +239,22 @@ fn check_x25519() {
     let alice_seed = [0xAAu8; 32];
     let bob_seed = [0xBBu8; 32];
 
-    let alice_sk = x25519::SecretKey::from_bytes(alice_seed);
-    let bob_sk = x25519::SecretKey::from_bytes(bob_seed);
+    let mut alice_sk = x25519::SecretKey::default();
+    alice_sk.init(&alice_seed);
+    let mut bob_sk = x25519::SecretKey::default();
+    bob_sk.init(&bob_seed);
     let alice_pk = alice_sk.public_key();
     let bob_pk = bob_sk.public_key();
 
-    let (s_ab, s_ba) = match (
-        alice_sk.diffie_hellman(&bob_pk),
-        bob_sk.diffie_hellman(&alice_pk),
-    ) {
-        (Ok(a), Ok(b)) => (a, b),
-        _ => {
-            write_stderr(b"[iso-user-lumen] x25519 ECDH LOW-ORDER REJECTED\n");
-            exit(1);
-        }
-    };
+    // 제자리 계산: 공유비밀은 호출자가 둔 SharedSecret 버퍼에 직접 기록됨
+    let mut s_ab = x25519::SharedSecret::default();
+    let mut s_ba = x25519::SharedSecret::default();
+    if alice_sk.diffie_hellman_into(&bob_pk, &mut s_ab).is_err()
+        || bob_sk.diffie_hellman_into(&alice_pk, &mut s_ba).is_err()
+    {
+        write_stderr(b"[iso-user-lumen] x25519 ECDH LOW-ORDER REJECTED\n");
+        exit(1);
+    }
 
     if s_ab.as_bytes() == s_ba.as_bytes() {
         let mut shared = [0u8; 32];
@@ -273,22 +275,31 @@ fn check_aes256_gcm() {
     let aad = b"iso-lumen-wire-compat-aad";
     let plaintext = b"hello-from-ring3-iso-user-lumen";
 
-    let cipher = AES256GCM::new(&key);
+    let mut cipher = AES256GCM::default();
+    cipher.init(&key);
 
     let mut ciphertext = [0u8; 31];
     let mut tag = [0u8; 16];
-    cipher.encrypt(&nonce, aad, plaintext, &mut ciphertext, &mut tag);
+    if cipher
+        .encrypt(&nonce, aad, plaintext, &mut ciphertext, &mut tag)
+        .is_err()
+    {
+        write_stderr(b"[iso-user-lumen] AES-256-GCM encrypt FAILED\n");
+        exit(1);
+    }
 
     print_hex32(b"[iso-user-lumen] AES-GCM tag(left 32B) = ", &{
-        // 16-byte tag 만 표시. 위 헬퍼는 32-byte 전제이므로 prefix tag_hex 직접.
+        // 16-byte tag 만 표시, 위 헬퍼는 32-byte 전제라 prefix 와 tag hex 를 직접 구성
         let mut tagbuf = [0u8; 32];
         tagbuf[..16].copy_from_slice(&tag);
         tagbuf
     });
 
     let mut decrypted = [0u8; 31];
-    let ok = cipher.decrypt(&nonce, aad, &ciphertext, &tag, &mut decrypted);
-    if !ok {
+    if cipher
+        .decrypt(&nonce, aad, &ciphertext, &tag, &mut decrypted)
+        .is_err()
+    {
         write_stderr(b"[iso-user-lumen] AES-256-GCM decrypt rejected (tag mismatch)\n");
         exit(1);
     }
@@ -301,9 +312,9 @@ fn check_aes256_gcm() {
 }
 
 //
-// 검증 #6 Phase 4 Wire Contract 종단 검증 (D-14 8-step)
+// 검증 #6 Wire Contract 종단 검증 (8-step)
 //
-/// Phase 4 종단 검증  Ring 3 lumen 이 wire contract 의 실 클라이언트로 동작함을 실증
+/// 종단 검증으로 Ring 3 lumen 이 wire contract 의 실 클라이언트로 동작함을 실증한다.
 ///
 /// 8-step 시퀀스:
 ///   1) cap_blake3 = sys_hsm_attach(Software, init=[ROLE_BLAKE3=1])
@@ -312,8 +323,8 @@ fn check_aes256_gcm() {
 ///   4) sys_hsm_write(cap_wire, frame, 44)
 ///   5) sys_hsm_read(cap_wire, response, 4096)
 ///   6) response header parse (magic / cmd / status / payload_len 검증)
-///   7) elib-k0-nt Blake3::hash(input) 직접 호출  expected 32B digest
-///   8) ct_eq_slice 동일 비트 일치 검증  WIRE_PHASE4_OK marker 또는 WIRE_PHASE4_FAIL
+///   7) elib-k0-nt Blake3::hash(input) 직접 호출로 expected 32B digest
+///   8) ct_eq_slice 동일 비트 일치 검증 후 WIRE_PHASE4_OK marker 또는 WIRE_PHASE4_FAIL
 fn wire_blake3_phase4_test() {
     const SYS_HSM_ATTACH: u64 = 7;
     const SYS_HSM_WRITE: u64 = 10;
@@ -324,7 +335,7 @@ fn wire_blake3_phase4_test() {
     const EP_LUMEN_WIRE_RAW: u16 = 0x0003;
     const WIRE_FRAME_MAX_LOCAL: usize = 4096;
 
-    // BSS 거주 buffer  Pitfall 7 회피 (stack 8 KiB 부담 0)
+    // BSS 거주 buffer 로 8 KiB 스택 부담 회피
     static mut FRAME_BUF: [u8; WIRE_FRAME_MAX_LOCAL] = [0u8; WIRE_FRAME_MAX_LOCAL];
     static mut RESPONSE_BUF: [u8; WIRE_FRAME_MAX_LOCAL] = [0u8; WIRE_FRAME_MAX_LOCAL];
 
@@ -346,10 +357,10 @@ fn wire_blake3_phase4_test() {
         exit(1);
     }
 
-    // (2) cap_wire attach  EP_LUMEN_WIRE endpoint_exists 게이트 통과
+    // (2) cap_wire attach 로 EP_LUMEN_WIRE endpoint_exists 게이트 통과
     let init_wire = EP_LUMEN_WIRE_RAW.to_le_bytes();
     let mut cap_wire = [0u8; 16];
-    // SAFETY: 동상  init_wire 는 2 byte stack array
+    // SAFETY: 동상, init_wire 는 2 byte stack array
     let rax = unsafe {
         syscall4(
             SYS_HSM_ATTACH,
@@ -364,12 +375,12 @@ fn wire_blake3_phase4_test() {
         exit(1);
     }
 
-    // (3) Wire frame Blake3Hash build  postcard 우회 수동 byte layout
+    // (3) Wire frame Blake3Hash build, postcard 우회 수동 byte layout
     let input: &[u8] = b"PHASE4_INPUT";
     let payload_len: u16 = 16 + input.len() as u16; // 28
     let frame_len: usize = 16 + payload_len as usize; // 44
 
-    // SAFETY: BSP 단일 Ring 3 process  FRAME_BUF 동시 접근 없음
+    // SAFETY: BSP 단일 Ring 3 process, FRAME_BUF 동시 접근 없음
     unsafe {
         let buf = &mut *(&raw mut FRAME_BUF);
         buf[0..4].copy_from_slice(b"LWK0");
@@ -383,7 +394,7 @@ fn wire_blake3_phase4_test() {
     }
 
     // (4) sys_hsm_write(cap_wire, frame, 44)
-    // SAFETY: FRAME_BUF 의 frame_len 길이 슬라이스만 노출  cap_wire 는 16 byte
+    // SAFETY: FRAME_BUF 의 frame_len 길이 슬라이스만 노출, cap_wire 는 16 byte
     let rax = unsafe {
         let buf_ptr = (&raw const FRAME_BUF) as *const u8;
         syscall3(
@@ -415,8 +426,8 @@ fn wire_blake3_phase4_test() {
     }
     let n = n as usize;
 
-    // (6) Response header parse  magic / cmd / status / payload_len 검증
-    // SAFETY: 동상  RESPONSE_BUF 첫 16 byte read-only
+    // (6) Response header parse, magic / cmd / status / payload_len 검증
+    // SAFETY: 동상, RESPONSE_BUF 첫 16 byte read-only
     let (resp_magic, resp_cmd, resp_status, resp_payload_len) = unsafe {
         let buf = &*(&raw const RESPONSE_BUF);
         let m = [buf[0], buf[1], buf[2], buf[3]];
@@ -435,7 +446,7 @@ fn wire_blake3_phase4_test() {
         exit(1);
     }
 
-    // (7) elib-k0-nt::blake::Blake3 직접 호출  expected 32B digest
+    // (7) elib-k0-nt::blake::Blake3 직접 호출로 expected 32B digest
     let mut hasher = Blake3::new();
     hasher.update(input);
     let expected = match hasher.finalize() {
@@ -465,17 +476,17 @@ fn wire_blake3_phase4_test() {
 }
 
 //
-// Phase 5.1 wire AttestSubmit / Status round-trip smoke (lumen client)
+// wire AttestSubmit / Status round-trip smoke (lumen client)
 //
 // 8-step 시퀀스:
-//   (1) cap_wire attach (Phase 4 None-attest path  Pitfall 7 회피  syscall arity 4 유지)
+//   (1) cap_wire attach (None-attest path, syscall arity 4 유지)
 //   (2) sys_attest_fixture_export 로 kernel WIRE_ATTEST_FIXTURE 3733 옥텟 회수
 //   (3) Leg 1 wire frame 빌드 (cmd 0x0040 AttestSubmit, payload 3733B)
 //   (4) Leg 1 write+read 응답 cmd=0x8040 status=0 payload_len=0 n=16
 //   (5) Leg 2 fixture[1313] ^= 0xFF (sig 첫 옥텟 flip) 응답 cmd=0xFFFF status=3
 //   (6) Leg 3 wire frame 빌드 (cmd 0x0080 Status, payload empty)
 //   (7) Leg 3 write+read 응답 cmd=0x8080 payload_len ≥ 8
-//   (8) Marker emit  write_stderr(b"ATTEST_PHASE5_1_OK\n")
+//   (8) Marker emit write_stderr(b"ATTEST_PHASE5_1_OK\n")
 fn wire_attest_phase5_1_test() {
     const SYS_HSM_ATTACH: u64 = 7;
     const SYS_HSM_WRITE: u64 = 10;
@@ -489,12 +500,12 @@ fn wire_attest_phase5_1_test() {
     const CMD_STATUS: u16 = 0x0080;
     const SIG_FLIP_OFFSET: usize = 1313; // pk(1312) + bus_kind(1)
 
-    // BSS 거주 buffer  스택 부담 0
+    // BSS 거주 buffer 로 스택 부담 0
     static mut FRAME_BUF: [u8; WIRE_FRAME_MAX_LOCAL] = [0u8; WIRE_FRAME_MAX_LOCAL];
     static mut RESPONSE_BUF: [u8; WIRE_FRAME_MAX_LOCAL] = [0u8; WIRE_FRAME_MAX_LOCAL];
     static mut FIXTURE_BUF: [u8; ATTEST_WIRE_LEN] = [0u8; ATTEST_WIRE_LEN];
 
-    // (1) cap_wire attach  EP_LUMEN_WIRE endpoint_exists 게이트 (Phase 4 None-attest path)
+    // (1) cap_wire attach 로 EP_LUMEN_WIRE endpoint_exists 게이트 (None-attest path)
     let init_wire = EP_LUMEN_WIRE_RAW.to_le_bytes();
     let mut cap_wire = [0u8; 16];
     // SAFETY init_wire 와 cap_wire 모두 stack-local 유효 슬라이스
@@ -512,8 +523,8 @@ fn wire_attest_phase5_1_test() {
         exit(1);
     }
 
-    // (2) sys_attest_fixture_export  kernel WIRE_ATTEST_FIXTURE 3733 옥텟 회수
-    // SAFETY FIXTURE_BUF 는 단일 진입 BSS  syscall 진입 시 SMAP 윈도우만 user write
+    // (2) sys_attest_fixture_export 로 kernel WIRE_ATTEST_FIXTURE 3733 옥텟 회수
+    // SAFETY FIXTURE_BUF 는 단일 진입 BSS, syscall 진입 시 SMAP 윈도우만 user write
     let rax = unsafe {
         syscall3(
             SYS_ATTEST_FIXTURE_EXPORT,
@@ -527,10 +538,10 @@ fn wire_attest_phase5_1_test() {
         exit(1);
     }
 
-    // (3) Leg 1 wire frame build  cmd 0x0040 AttestSubmit
+    // (3) Leg 1 wire frame build, cmd 0x0040 AttestSubmit
     let payload_len: u16 = ATTEST_WIRE_LEN as u16;
     let frame_len: usize = 16 + payload_len as usize;
-    // SAFETY BSP 단일 Ring 3 process  FRAME_BUF/FIXTURE_BUF 동시 접근 없음
+    // SAFETY BSP 단일 Ring 3 process, FRAME_BUF/FIXTURE_BUF 동시 접근 없음
     unsafe {
         let buf = &mut *(&raw mut FRAME_BUF);
         let fix = &*(&raw const FIXTURE_BUF);
@@ -543,7 +554,7 @@ fn wire_attest_phase5_1_test() {
         buf[16..16 + ATTEST_WIRE_LEN].copy_from_slice(fix);
     }
 
-    // (4) Leg 1 write + read  응답 cmd=0x8040 status=0 payload_len=0 n=16
+    // (4) Leg 1 write + read, 응답 cmd=0x8040 status=0 payload_len=0 n=16
     // SAFETY FRAME_BUF 의 frame_len 길이 슬라이스만 노출
     let rax = unsafe {
         let buf_ptr = (&raw const FRAME_BUF) as *const u8;
@@ -593,8 +604,8 @@ fn wire_attest_phase5_1_test() {
         exit(1);
     }
 
-    // (5) Leg 2  sig 첫 옥텟 flip (fixture offset 1313 = pk(1312) + bus_kind(1))
-    //     req_id 2 로 재구성  응답 cmd=0xFFFF status=3 (Denied)
+    // (5) Leg 2, sig 첫 옥텟 flip (fixture offset 1313 = pk(1312) + bus_kind(1))
+    //     req_id 2 로 재구성, 응답 cmd=0xFFFF status=3 (Denied)
     // SAFETY FIXTURE_BUF 단일 진입
     unsafe {
         (*(&raw mut FIXTURE_BUF))[SIG_FLIP_OFFSET] ^= 0xFF;
@@ -637,7 +648,7 @@ fn wire_attest_phase5_1_test() {
         exit(1);
     }
 
-    // (6) Leg 3 Status frame build  cmd 0x0080 payload empty
+    // (6) Leg 3 Status frame build, cmd 0x0080 payload empty
     // SAFETY 동상
     unsafe {
         let buf = &mut *(&raw mut FRAME_BUF);
@@ -648,7 +659,7 @@ fn wire_attest_phase5_1_test() {
         buf[12..14].copy_from_slice(&0u16.to_le_bytes()); // payload_len = 0
         buf[14..16].copy_from_slice(&0u16.to_le_bytes());
     }
-    // (7) Leg 3 write + read  응답 cmd=0x8080 payload_len ≥ 8
+    // (7) Leg 3 write + read, 응답 cmd=0x8080 payload_len ≥ 8
     let _ = unsafe {
         let buf_ptr = (&raw const FRAME_BUF) as *const u8;
         syscall3(
@@ -687,7 +698,7 @@ fn wire_attest_phase5_1_test() {
 //
 // 진입점
 //
-/// 사용자 진입점 — `process::enter_ring3()` 가 ELF entry RIP 로 점프함.
+/// 사용자 진입점. `process::enter_ring3()` 가 ELF entry RIP 로 점프함.
 ///
 /// # Safety
 /// 직접 호출 금지. 사용자 모드 RIP 로만 진입.
@@ -701,7 +712,7 @@ pub unsafe extern "C" fn _start() -> ! {
     check_x25519();
     check_aes256_gcm();
     wire_blake3_phase4_test();
-    // Phase 5.1 wire AttestSubmit / Status round-trip smoke marker ATTEST_PHASE5_1_OK
+    // wire AttestSubmit / Status round-trip smoke marker ATTEST_PHASE5_1_OK
     wire_attest_phase5_1_test();
 
     write_stderr(b"[iso-user-lumen] all wire-compat checks passed\n");

@@ -2,7 +2,7 @@
 //!
 //! # Features
 //! `arm-gic` 0.8.1 `gicv3::GicV3` 위임으로 redistributor 를 distributor 보다 먼저
-//! 깨웁니다(Pitfall 11). GICv3 는 CPU-affine redistributor 를 통해 SGI/PPI 를
+//! 깨웁니다. GICv3 는 CPU-affine redistributor 를 통해 SGI/PPI 를
 //! 라우팅하므로 redistributor 가 sleep 이면 distributor 를 enable 해도 인터럽트가
 //! 코어에 도달하지 않습니다. 따라서 부팅 순서는 (1) GICR_WAKER.ProcessorSleep=0 후
 //! ChildrenAsleep==0 poll 까지 block 하는 redistributor wake 를 선행하고, (2) 이후
@@ -10,7 +10,7 @@
 //!
 //! 디바이스 MMIO(GICD distributor / GICR redistributor)는 검증된 arm-gic 크레이트에
 //! 위임하고, CPU-affine 시스템 레지스터(ICC_SRE_EL1 / ICC_IGRPEN1_EL1 / ICC_PMR_EL1 /
-//! ICC_EOIR1_EL1)는 raw asm 으로 직접 배선합니다(RESEARCH Don't Hand-Roll 경계 커널
+//! ICC_EOIR1_EL1)는 raw asm 으로 직접 배선합니다(경계 커널
 //! 특권 시퀀스는 손에 쥐고 디바이스 프로토콜은 신뢰 크레이트에 위임). x86_64 `idt.rs`
 //! 의 8259 PIC(init_pic / pic_eoi / enable_irq)에 role-match 하되 GICv3 는 전혀 다른
 //! 모델이라 인코딩은 전량 divergent 합니다.
@@ -29,19 +29,19 @@ use core::ptr::NonNull;
 
 use crate::arch::aarch64::{console, cpu};
 
-/// QEMU virt GICv3 distributor MMIO 물리 기본 주소 (A1 폴백 DTB/BootInfo 우선)
+/// QEMU virt GICv3 distributor MMIO 물리 기본 주소 (폴백 기본값, DTB/BootInfo 우선)
 const GICD_PHYS_BASE: usize = 0x0800_0000;
 
-/// QEMU virt GICv3 redistributor MMIO 물리 기본 주소 (A1 폴백 DTB/BootInfo 우선)
+/// QEMU virt GICv3 redistributor MMIO 물리 기본 주소 (폴백 기본값, DTB/BootInfo 우선)
 const GICR_PHYS_BASE: usize = 0x080A_0000;
 
-/// GICv3 distributor register block 기저 포인터 (MMU 전 identity 물리 -> 후 선형 VA)
+/// GICv3 distributor register block 기저 포인터 (MMU 전 identity 물리, 후 선형 VA)
 static mut GICD_BASE: *mut Gicd = GICD_PHYS_BASE as *mut Gicd;
 
-/// GICv3 redistributor SGI/PPI register block 기저 포인터 (MMU 전 identity 물리 -> 후 선형 VA)
+/// GICv3 redistributor SGI/PPI register block 기저 포인터 (MMU 전 identity 물리, 후 선형 VA)
 static mut GICR_BASE: *mut GicrSgi = GICR_PHYS_BASE as *mut GicrSgi;
 
-/// BSP 단일 코어 redistributor 선형 인덱스 (v2.0 범위 단일 코어)
+/// BSP 단일 코어 redistributor 선형 인덱스
 const BOOT_CPU: usize = 0;
 
 /// 부팅 proof 용 self-IPI SGI 번호 (INTID 3 software generated interrupt)
@@ -112,11 +112,11 @@ unsafe fn enable_cpu_interface() {
 
 /// GICv3 를 bring-up 하여 redistributor 를 distributor 보다 먼저 깨우고 GRP1 을 활성함.
 ///
-/// Pitfall 11 순서 강제
-/// (1) GICR_WAKER.ProcessorSleep=0 -> ChildrenAsleep==0 poll 까지 block (arm-gic
-///     redistributor MMIO 위임) -> `GICR wake OK` / `ChildrenAsleep=0` 마커
+/// 아래 순서를 강제함
+/// (1) GICR_WAKER.ProcessorSleep=0 후 ChildrenAsleep==0 poll 까지 block (arm-gic
+///     redistributor MMIO 위임) 로 `GICR wake OK` / `ChildrenAsleep=0` 마커
 /// (2) distributor/redistributor default 설정 + GRP1 활성(arm-gic) + ICC_SRE_EL1.SRE=1
-///     + ICC_IGRPEN1_EL1=1 (raw 시스템 레지스터 명시) -> `GRP1 enabled` 마커
+///     + ICC_IGRPEN1_EL1=1 (raw 시스템 레지스터 명시) 로 `GRP1 enabled` 마커
 /// redistributor 가 sleep 이면 distributor enable 해도 SGI/PPI 가 코어에 미도달하므로
 /// wake 를 반드시 선행함.
 ///
@@ -196,7 +196,7 @@ pub unsafe fn deliver_boot_proof_irq() {
 
         // DAIF.I 해제 후 self-IPI 발생 ICC_SGI1R_EL1 (GicCpuInterface::send_sgi 위임)
         cpu::interrupts_enable();
-        GicCpuInterface::send_sgi(
+        let _ = GicCpuInterface::send_sgi(
             BOOT_SGI_INTID,
             SgiTarget::List {
                 affinity3: 0,

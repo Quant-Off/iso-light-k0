@@ -115,8 +115,8 @@ impl CpuFeatures {
 //
 // 감지된 기능의 전역 캐시
 //
-// 부팅 초기 단일 코어에서 한 번 확정되므로 `static mut` 접근은 안전함
-// SMP 전환 시에는 per-CPU 영역으로 이동해야 함
+// 부팅 초기 단일 코어에서 한 번 확정되므로 `static mut` 접근 안전
+// SMP 전환 시에는 per-CPU 영역으로 이동 필요
 static mut CPU_FEATURES: CpuFeatures = CpuFeatures {
     sse: false,
     sse2: false,
@@ -186,7 +186,7 @@ unsafe fn write_cr4(v: u64) {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn xsetbv(index: u32, value: u64) {
-    // SAFETY: OSXSAVE=1 이후에만 호출할 것 — 아니면 #UD 발생
+    // SAFETY: OSXSAVE=1 이후에만 호출할 것, 아니면 #UD 발생
     unsafe {
         core::arch::asm!(
             "xsetbv",
@@ -270,8 +270,9 @@ const XCR0_AVX: u64 = 1 << 2;
 
 /// IA32_EFER MSR 인덱스
 pub const IA32_EFER: u32 = 0xC000_0080;
-/// EFER.SCE — System Call Extensions (syscall/sysret 활성)
+/// EFER.SCE 는 System Call Extensions (syscall/sysret 활성)
 pub const EFER_SCE: u64 = 1 << 0;
+pub const EFER_NXE: u64 = 1 << 11;
 
 //
 // 공개 API
@@ -297,9 +298,9 @@ pub unsafe fn enable_simd_fpu() {
     }
 
     // 1. CR0: EM=0, TS=0, MP=1, NE=1
-    //   EM=1이면 모든 SSE/x87 -> #UD. 반드시 0
+    //   EM=1이면 모든 SSE/x87 명령이 #UD 를 유발하므로 반드시 0
     //   TS=1이면 첫 FPU/SSE 접근 시 #NM. lazy save 안 쓰므로 0
-    //   MP=1 + TS=1 조합만 WAIT에서 #NM 발생. 여기선 MP=1, TS=0이므로 무해함
+    //   MP=1 + TS=1 조합만 WAIT에서 #NM 발생. 여기선 MP=1, TS=0이므로 무해
     //   NE=1로 x87 예외를 #MF로 라우팅 (PIC를 통한 IRQ13 경로 미사용)
     let mut cr0 = unsafe { read_cr0() };
     cr0 &= !(CR0_EM | CR0_TS);
@@ -309,7 +310,7 @@ pub unsafe fn enable_simd_fpu() {
     }
 
     // 2. CR4: OSFXSR, OSXMMEXCPT, (옵션) OSXSAVE
-    //   OSFXSR=1이 없으면 모든 SSE 명령어가 #UD 를 일으킴
+    //   OSFXSR=1이 없으면 모든 SSE 명령어가 #UD 유발
     //   OSXMMEXCPT=1이면 SSE FP 오류를 #XM으로 라우팅 (없으면 #UD)
     let mut cr4 = unsafe { read_cr4() };
     cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
@@ -322,7 +323,7 @@ pub unsafe fn enable_simd_fpu() {
 
     // 3. x87 FPU 상태 초기화
     //   FNINIT: 제어/상태/태그 워드를 리셋. 구현부가 부동소수 연산을 하지
-    //   않더라도 예외 마스크를 결정적 상태로 만들어 추후 #MF 오작동 방지함
+    //   않더라도 예외 마스크를 결정적 상태로 만들어 추후 #MF 오작동 방지
     // SAFETY: CR0.EM=0이므로 FNINIT 실행 가능
     unsafe {
         core::arch::asm!("fninit", options(nostack, preserves_flags));
@@ -368,7 +369,7 @@ pub unsafe fn enable_security_bits() {
     let feats = features();
 
     // 1. CR0.WP = 1
-    // SAFETY: WP 만 OR 로 추가. 다른 비트(PG/PE/MP/NE)는 보존.
+    // SAFETY: WP 만 OR 로 추가하고 다른 비트(PG/PE/MP/NE)는 보존
     let mut cr0 = unsafe { read_cr0() };
     cr0 |= CR0_WP;
     unsafe {
@@ -391,7 +392,7 @@ pub unsafe fn enable_security_bits() {
     }
 
     // 3. IA32_EFER.SCE = 1 (syscall/sysret 활성)
-    // SAFETY: EFER 읽기-수정-쓰기. NXE/LME 등 기존 비트 보존.
+    // SAFETY: EFER 읽기-수정-쓰기로 NXE/LME 등 기존 비트 보존
     unsafe {
         let efer = rdmsr(IA32_EFER);
         wrmsr(IA32_EFER, efer | EFER_SCE);
@@ -458,7 +459,7 @@ pub unsafe fn clac() {
 }
 
 //
-// panic/ipc 본체 외과수술 소비 표면 (Phase 9 9-C)
+// panic/ipc 경로가 소비하는 CPU 정지 및 인터럽트 제어 표면
 //
 
 /// 복구 불가 상태의 CPU 영구 정지 루프 (panic fail-stop 경로 전용).
@@ -514,7 +515,7 @@ pub unsafe fn interrupts_enable() {
 // aarch64 스텁
 //
 // aarch64 타겟에서는 CPACR_EL1 구성을 통해 FP/SIMD(Advanced SIMD & NEON) 트랩을
-// 해제해야 함. 현재 활성 타겟이 x86_64-unknown-none이므로 스텁만 제공함
+// 해제 필요. 현재 활성 타겟이 x86_64-unknown-none이므로 스텁만 제공
 
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn enable_simd_fpu() {

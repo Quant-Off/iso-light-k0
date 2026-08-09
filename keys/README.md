@@ -1,26 +1,29 @@
-# keys 디렉터리
+# keys 디렉토리
 
-본 디렉터리는 iso-light-k0 의 ML-DSA-44 신뢰 루트 키 자료를 담는다 (Phase 5 attach/enrollment/attestation 게이트의 컴파일-타임 임베드 source)
+해당 디렉토리는 iso-light-k0의 ML-DSA-44 신뢰 루트 키 자료를 담고 있습니다.
 
 ## 자료
 
-- `trust_root.pk44` (1312 B) repo commit 대상 ML-DSA-44 공개 신뢰 루트 dev/test 전용
-- `dev_trust_root.sk44` (2560 B) .gitignore 로 추적 제외 ML-DSA-44 비밀 키 kernel-side smoke (feature `smoke`) 전용 closed 프로필 빌드 산출물에 절대 포함 금지
+- `trust_root.pk44` (1312 B) - 저장소 커밋용 (ML-DSA-44, dev/test 전용)
+- `dev_trust_root.sk44` (2560 B) - `.gitignore`로 추적 제외 (ML-DSA-44)
 
 ## 생성
 
-두 자료는 host 측에서 1 회 생성한다
+키 페어(쌍)는 호스트 머신에서 다음 명령을 통해 1회 생성합니다.
 
 ```
 bash scripts/gen-dev-keys.sh
 ```
 
-본 스크립트는 deterministic seed `[0xAA_u8; 32]` 로 `elib-k0-nt::mldsa::MLDSA44::keygen` 을 호출하여 두 자료를 dump 한다 (RESEARCH §10.1) seed 는 dev 자료에만 한정된 결정론적 값이며 production 환경에서는 절대로 사용 금지
+해당 스크립트는 결정론적 시드 `[0xAA_u8; 32]`로 `elib-k0-nt`의 `MLDSA44::keygen`을 호출하여 키 페어를 덤프합니다. 시드값은 dev 키 페어에만 한정된 결정론적 값입니다.
 
-## 운영 환경 절대 사용 금지
-
-본 디렉터리의 키 자료는 **dev 와 test 전용**이며 production 신뢰 루트로 절대 채택 금지 production trust root 는 별도 out-of-band keystore provisioning 절차를 통해 별도 키쌍으로 부팅 시점에 주입한다 (CONTEXT D-02, D-03 명시) `.gitignore` 의 `keys/*.sk*` 규칙은 sk 자료의 실수 commit 만 막을 뿐 dev 키 자체가 production 환경에 잔존하는 위험은 운영자가 직접 통제해야 한다 (RESEARCH §14.3 잔존 위험)
+> [!IMPORTANT]
+> 절대로 해당 키 페어를 프로덕션(운영) 환경에서 사용하지 마세요.
+> 
+> 프로덕션의 Trust Root는 별도 out-of-band(독립 경로)의 키스토어 공급 과정에서 별도 키 페이로 부팅 시점에 주입됩니다.
+> 
+> 단, `dev` 키 페어가 프로뎍선 환경에 잔존하는 위험에 대해서 당신이 직접 통제해야 합니다.
 
 ## CI 게이트
 
-closed 프로필 빌드 산출물에 dev sk 자료가 leak 되지 않음을 `scripts/check-no-dev-sk.sh` 가 검증한다 (Phase 5 D-19) 본 검증은 Makefile `ci-phase5` 의 한 leg 으로 동작한다
+CI 과정에서 `scripts/check-no-dev-sk.sh` 스크립트를 통해 빌드 산출물에 dev 비밀 키가 누출되지 않음을 검증할 수 있습니다. 해당 검증은 Makefile 내 `ci-phase5`에 포함되어 있습니다.

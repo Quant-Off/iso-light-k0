@@ -1,17 +1,16 @@
 //! 본 모듈은 aarch64 MMU stage1 4KiB granule 페이지 테이블과 typestate 전이를 수행합니다.
 //!
 //! # Features
-//! 48-bit VA / 4KiB granule / TTBR0(하위 user)·TTBR1(상위 kernel) split 4-level 페이지
+//! 48-bit VA / 4KiB granule / TTBR0(하위 user)와 TTBR1(상위 kernel) split 4-level 페이지
 //! 테이블을 정적 풀(동적 할당 0)로 구축합니다. MAIR_EL1 attribute slot(Device-nGnRnE /
 //! Device-nGnRE MMIO / Normal WBWA)과 TCR_EL1(T0SZ/T1SZ/TG0/TG1/IPS)을 조립하고, 각 leaf
 //! descriptor 는 x86 W^X 정책을 계승하여 writable 페이지에 UXN+PXN 을 자동 강제합니다
 //! (writable + executable 동시 요청은 `MmuError::WxPolicyViolation`). UART MMIO 페이지는
-//! Device-nGnRE(MAIR Attr1)로 매핑되어 MMU self_test(Pitfall 3) 대상이 됩니다.
+//! Device-nGnRE(MAIR Attr1)로 매핑되어 MMU self_test 대상이 됩니다.
 //!
 //! x86_64 `mmu.rs` 의 typestate 계약(`Uninitialized`/`Initialized`/`Mmu<State>`/`PhantomData`
-//! /`AddressSpace`)을 exact mirror 하되 descriptor 인코딩과 TTBR split·MAIR·TCR 은 aarch64
-//! 고유입니다. 12-step barrier activate 와 AT S1E1R self_test 는 이후 wave(10-C Task 3)가
-//! 동일 파일에 배선합니다.
+//! /`AddressSpace`)을 exact mirror 하되 descriptor 인코딩과 TTBR split, MAIR, TCR 은 aarch64
+//! 고유입니다. 12-step barrier activate 와 AT S1E1R self_test 도 이 파일에 함께 배선됩니다.
 
 use core::marker::PhantomData;
 
@@ -36,7 +35,7 @@ pub const SIZE_2MIB: u64 = 2 * 1024 * 1024;
 /// TTBR1 은 VA[47:0] 을 해석하며 상위 16 bit 는 전부 1(0xFFFF_...)이어야 함
 pub const KERNEL_VMA_BASE: u64 = 0xFFFF_0000_0000_0000;
 
-/// QEMU virt PL011 UART MMIO 물리 기본 주소 (A1 폴백 DTB/BootInfo 우선)
+/// QEMU virt PL011 UART MMIO 물리 기본 주소 (폴백 기본값, DTB/BootInfo 우선)
 pub const UART_PHYS: u64 = 0x0900_0000;
 
 /// QEMU virt GICv3 distributor MMIO 물리 기본 주소 (gic.rs GICD_PHYS_BASE 와 동일 값 aarch64 내부 공유)
@@ -51,6 +50,18 @@ const GICD_MMIO_SIZE: u64 = 0x1_0000;
 /// GICR redistributor 코어당 RD+SGI 프레임 매핑 크기 (64 KiB * 2 = 128 KiB)
 const GICR_MMIO_SIZE: u64 = 0x2_0000;
 
+/// QEMU virt virtio-mmio transport window 물리 기본 주소 (엔트로피 source-1 virtio-rng 슬롯)
+pub const VIRTIO_MMIO_PHYS: u64 = 0x0A00_0000;
+
+/// virtio-mmio 슬롯 stride (QEMU virt 각 transport 0x200 바이트)
+pub const VIRTIO_MMIO_STRIDE: u64 = 0x200;
+
+/// virtio-mmio 슬롯 수 (QEMU virt 기본 32 슬롯을 순차 probe)
+pub const VIRTIO_MMIO_COUNT: u64 = 32;
+
+/// virtio-mmio 전체 window 매핑 크기 (32 * 0x200 = 16 KiB, 4 page)
+const VIRTIO_MMIO_SIZE: u64 = VIRTIO_MMIO_STRIDE * VIRTIO_MMIO_COUNT;
+
 //
 // 내부 상수
 //
@@ -62,7 +73,7 @@ const POOL_TABLES: usize = 24;
 const PA_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 //
-// MAIR_EL1 attribute slots (RESEARCH Pattern 2)
+// MAIR_EL1 attribute slots
 //   Attr0 = Device-nGnRnE  Attr1 = Device-nGnRE(MMIO)  Attr2 = Normal WBWA
 //
 
@@ -144,7 +155,7 @@ unsafe extern "C" {
 // 에러 타입
 //
 
-/// 페이지 테이블 구축·검증 실패 종류.
+/// 페이지 테이블 구축과 검증 실패 종류.
 ///
 /// W^X 위반은 x86 `mmu::MmuError::WxPolicyViolation` 계약을 계승함.
 #[derive(Debug, PartialEq, Eq)]
@@ -336,14 +347,14 @@ impl AddressSpace {
         } else {
             DESC_AP_RO_EL1
         };
-        // W^X 자동 강제 writable 이거나 비실행 데이터는 UXN+PXN (x86 WRITABLE -> NO_EXECUTE 대응)
+        // W^X 자동 강제 writable 이거나 비실행 데이터는 UXN+PXN (x86 WRITABLE 이 NO_EXECUTE 로 대응)
         if writable || !executable {
             d |= DESC_UXN | DESC_PXN;
         }
         Ok(d)
     }
 
-    /// 한 VA -> PA 매핑을 지정 루트(high=TTBR1)로 4KiB 페이지 배선함(EL1 leaf_desc).
+    /// 한 VA 에서 PA 로의 매핑을 지정 루트(high=TTBR1)로 4KiB 페이지 배선함(EL1 leaf_desc).
     ///
     /// # Errors
     /// 풀 소진 시 `TableExhausted`, 재매핑 시 `AlreadyMapped`, W^X/정렬 위반은 leaf_desc 전파
@@ -454,24 +465,33 @@ impl AddressSpace {
             self.map_range(linear, rodata, data, false, false, false)?;
             // .data + .bss RW-NX (W^X writable 은 UXN+PXN 자동 강제)
             self.map_range(linear, data, end, true, false, false)?;
-            // UART MMIO Device-nGnRE writable-NX (self_test 대상 Pitfall 3)
+            // UART MMIO Device-nGnRE writable-NX (self_test 대상)
             let uart = uart_phys & !(PAGE_SIZE_U64 - 1);
             self.map_range(linear, uart, uart + PAGE_SIZE_U64, true, false, true)?;
-            // GICD distributor MMIO Device-nGnRE writable-NX (MMU on 후 gic::setup 접근 확보 Pitfall 3)
+            // GICD distributor MMIO Device-nGnRE writable-NX (MMU on 후 gic::setup 접근 확보)
             self.map_range(linear, GICD_PHYS, GICD_PHYS + GICD_MMIO_SIZE, true, false, true)?;
             // GICR redistributor MMIO Device-nGnRE writable-NX (RD+SGI 프레임 128 KiB)
             self.map_range(linear, GICR_PHYS, GICR_PHYS + GICR_MMIO_SIZE, true, false, true)?;
+            // virtio-mmio transport window Device-nGnRE writable-NX (virtio-rng probe + virtqueue MMIO)
+            self.map_range(
+                linear,
+                VIRTIO_MMIO_PHYS,
+                VIRTIO_MMIO_PHYS + VIRTIO_MMIO_SIZE,
+                true,
+                false,
+                true,
+            )?;
         }
         Ok(())
     }
 
     //
-    // 런타임 process 주소 공간 표면 (x86 mmu::AddressSpace 공개 API mirror, DEF-10A-01)
+    // 런타임 process 주소 공간 표면 (x86 mmu::AddressSpace 공개 API mirror)
     //
     // 본체(process.rs)는 x86 과 동일한 map_page/map_user_page/walk_to_phys/
     // inherit_kernel_mappings 표면을 소비함. 아래 구현은 aarch64 stage1 4KiB leaf
-    // descriptor 로 번역하며, x86 W^X·사용자 격리 계약을 계승함. 사용자 페이지는
-    // TTBR0 하위 절반, 커널 매핑은 TTBR1 상위 절반으로 배선됨.
+    // descriptor 로 번역하며, x86 W^X 와 사용자 격리 계약을 계승하고 사용자 페이지는
+    // TTBR0 하위 절반, 커널 매핑은 TTBR1 상위 절반으로 배선
     //
 
     /// 사용자(EL0) 4KiB leaf descriptor 를 조립함 (W^X 자동 강제).
@@ -492,7 +512,7 @@ impl AddressSpace {
             | (ATTRIDX_NORMAL << DESC_ATTRINDX_SHIFT)
             | DESC_SH_INNER;
         if writable {
-            // 사용자 데이터 RW EL1+EL0 실행 금지(UXN+PXN) — W^X 자동
+            // 사용자 데이터 RW, EL1+EL0 실행 금지(UXN+PXN)로 W^X 자동
             d |= DESC_AP_RW_EL1_EL0 | DESC_UXN | DESC_PXN;
         } else {
             // 사용자 코드 RO EL1+EL0 사용자 실행 허용(UXN=0) 커널 실행 금지(PXN)
@@ -647,7 +667,7 @@ pub struct Initialized;
 /// 타입 수준 상태 머신으로 MMU 초기화 순서를 컴파일 타임에 강제함.
 ///
 /// `Mmu<Uninitialized>` 에서 `initialize` 를 호출하면 `Mmu<Initialized>` 로 전이되며,
-/// 그 상태에서만 `activate`/`self_test`(10-C Task 3) 가 호출 가능함.
+/// 그 상태에서만 `activate`/`self_test` 가 호출 가능함.
 pub struct Mmu<State> {
     _marker: PhantomData<State>,
 }
@@ -677,9 +697,9 @@ impl Mmu<Uninitialized> {
 }
 
 impl Mmu<Initialized> {
-    /// 지정 주소 공간을 현재 코어에 활성화함 (roadmap 12-step barrier 시퀀스 HAL mmu_enable).
+    /// 지정 주소 공간을 현재 코어에 활성화함 (12-step barrier 시퀀스).
     ///
-    /// RESEARCH Pattern 2 정확 순서(Pitfall 10)를 준수하며 barrier 생략/재배치는 금지됨.
+    /// 정해진 순서를 그대로 지켜야 하며 barrier 생략이나 재배치는 금지된다.
     /// 특히 `MSR SCTLR_EL1`(M=1) 앞뒤 ISB 가 핵심(M-bit 켜기 전후 컨텍스트 동기화)이다.
     /// step 1 DC CVAC 는 페이지 테이블 전 영역(루트 2 + 정적 풀)을 PoC 로 clean 한다.
     ///
@@ -704,8 +724,8 @@ impl Mmu<Initialized> {
         }
         sctlr |= 1; // SCTLR_EL1.M = 1 MMU enable
 
-        // SAFETY 12-step barrier 순서는 재배치 금지(Pitfall 10) SCTLR 앞뒤 ISB 필수
-        //        DC CVAC 루프가 cmp/b.lo 로 NZCV 를 변경하므로 preserves_flags 미부여
+        // SAFETY: 12-step barrier 순서 재배치 금지, SCTLR 앞뒤 ISB 필수
+        //         DC CVAC 루프가 cmp/b.lo 로 NZCV 를 변경하므로 preserves_flags 미부여
         unsafe {
             core::arch::asm!(
                 // step 1 DC CVAC 페이지 테이블 을 PoC 로 clean (MMU off 기록분을 table walker 가시화)
@@ -752,7 +772,7 @@ impl Mmu<Initialized> {
     }
 }
 
-/// MMU enable 직후 UART MMIO 매핑 attribute 를 검증함 (Pitfall 3 self_test).
+/// MMU enable 직후 UART MMIO 매핑 attribute 를 검증함.
 ///
 /// `AT S1E1R, <uart_va>` 로 stage1 EL1 read 변환을 강제 실행한 뒤 PAR_EL1 을 읽어
 /// F(fault) 미set 과 ATTR(bits[63:56]) == Device-nGnRE(0x04)를 확인한다. PAR_EL1.ATTR 은
@@ -799,9 +819,9 @@ pub unsafe fn self_test(uart_va: u64) -> Result<(), MmuError> {
 /// # Safety
 /// `Mmu<Initialized>::activate` 완료 직후 1 회만 호출해야 함
 pub unsafe fn post_mmu_enable() {
-    // SAFETY MMU 활성 상태 identity UART VA 로 self_test 후 선형 VA 로 콘솔 재배치
+    // SAFETY: MMU 활성 상태, identity UART VA 로 self_test 후 선형 VA 로 콘솔 재배치
     unsafe {
-        // self_test 실패 시 fail-stop (Pitfall 3 오매핑 진행 차단)
+        // self_test 실패 시 fail-stop, 오매핑 진행 차단
         if self_test(UART_PHYS).is_err() {
             super::cpu::halt_loop();
         }

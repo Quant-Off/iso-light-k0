@@ -7,10 +7,7 @@
 //! 환경에서 물리 프레임 할당자 초기화의 입력으로 사용됩니다. 실제 파싱은
 //! `crate::boot::multiboot2` 등 어댑터 모듈이 담당합니다.
 
-//
 // 에러 타입
-//
-
 #[derive(Debug)]
 pub enum ParseError {
     /// 전달된 펌웨어 info 주소가 유효하지 않음 (null 또는 정렬 불량)
@@ -19,16 +16,13 @@ pub enum ParseError {
     InvalidSize,
 }
 
-//
 // 메모리 영역 타입
-//
-
 /// 물리 메모리 영역의 용도 분류 (Multiboot2 Type 필드 기반)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryKind {
     /// 자유롭게 사용 가능한 RAM
     Usable,
-    /// BIOS·하드웨어에 예약된 영역
+    /// BIOS 와 하드웨어에 예약된 영역
     Reserved,
     /// ACPI 정보 파싱 후 재사용 가능
     AcpiReclaimable,
@@ -55,10 +49,7 @@ impl MemoryRegion {
     }
 }
 
-//
 // 메모리 맵
-//
-
 /// 물리 메모리 맵이 포함할 수 있는 최대 영역 수.
 /// x86_64 시스템 기준 일반적으로 10~20개이므로 64는 충분한 여유.
 const MAX_REGIONS: usize = 64;

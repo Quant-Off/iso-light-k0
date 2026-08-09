@@ -20,7 +20,7 @@ use constant_time::Choice;
 
 use crate::crypto_service::SHA256_OUTPUT_SIZE;
 
-/// PSK 식별자 — TLS 1.3 의 `PskIdentity.identity` 필드와 동등한 16바이트 토큰.
+/// PSK 식별자. TLS 1.3 의 `PskIdentity.identity` 필드와 동등한 16바이트 토큰.
 ///
 /// 사이드채널 보호를 위해 등록된 식별자 비교는 constant-time 으로만 수행.
 /// 식별자 자체는 비밀이 아니지만, 등록 여부 누설을 줄이기 위해 본 컨벤션 유지.
@@ -47,7 +47,7 @@ pub enum HsmError {
     PskNotFound,
     /// HSM 이 본 환경에 없음 (NullHsm 의 모든 호출).
     NotProvisioned,
-    /// 내부 일관성 위반(키 길이 불일치 등) — 정상 환경에서는 발생하지 않음.
+    /// 내부 일관성 위반(키 길이 불일치 등). 정상 환경에서는 발생하지 않음.
     Internal,
 }
 
@@ -69,7 +69,7 @@ pub trait HsmDriver {
     /// 반환값 `Choice(1)` = 등록됨, `Choice(0)` = 미등록 또는 만료.
     fn psk_exists(&self, id: &PskId) -> Choice;
 
-    /// HKDF-Extract(salt, PSK) -> 32바이트 PRK 출력.
+    /// HKDF-Extract(salt, PSK) 로 32바이트 PRK 를 출력.
     ///
     /// HSM 환경에서는 HMAC 연산이 HSM 내부 엔진으로 수행되어 PSK 가 메모리에
     /// 노출되지 않음. 소프트 폴백에서는 `Secret<PSK>` 를 임시 노출하여
@@ -87,7 +87,7 @@ pub trait HsmDriver {
 
     /// 등록된 PSK 슬롯을 즉시 소거(volatile-write) 함.
     ///
-    /// 미등록 슬롯에 대한 호출은 idempotent — 에러 없이 종료되어야 함.
+    /// 미등록 슬롯에 대한 호출은 idempotent 이며 에러 없이 종료되어야 함.
     fn psk_destroy(&mut self, id: &PskId) -> Result<(), HsmError>;
 }
 

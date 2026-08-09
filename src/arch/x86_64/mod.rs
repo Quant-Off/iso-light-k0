@@ -2,52 +2,73 @@
 //!
 //! # Features
 //! x86_64 전용 entropy 어댑터 (RDSEED/RDRAND + virtio PCI transport) 를 노출합니다.
-//! Phase 10 의 aarch64 합류 시 본 모듈과 대칭인 aarch64 hub 가 신설됩니다.
+//! aarch64 합류 시 본 모듈과 대칭인 aarch64 hub 가 신설됩니다.
 
 pub mod entropy;
 
-// Phase 9 9-A HAL-04 ISA 의존 모듈 (구 src/{cpu,boot->gdt,tss,vga,boot_stub}.rs lossless 이동본)
+// ISA 의존 모듈 (CPU 제어, GDT, TSS, VGA, 부트 트램폴린)
 pub mod boot_stub;
 pub mod cpu;
 pub mod gdt;
 pub mod tss;
 pub mod vga;
 
-// Phase 9 9-B HAL-04 잔여 ISA 의존 모듈 (구 src/{mmu,idt,syscall}.rs lossless 이동본)
-// memory_map 은 9-C 에서 src/boot/{memory_map,multiboot2}.rs 로 2차 분할 이동됨 (OQ3)
+// 잔여 ISA 의존 모듈 (MMU, IDT, syscall)
 pub mod idt;
 pub mod mmu;
 pub mod syscall;
 
-// Phase 9 9-C BootEntry 표면 (구 process.rs enter_ring3 asm lossless 추출본)
+// BootEntry 표면 (Ring 3 진입 asm)
 pub mod process_entry;
 
-// Phase 10.1 HAL-06 복원 (D-2) x86 전용 부팅 진입 시퀀스 + GRUB Multiboot2 어댑터
-// (구 src/main.rs::_kernel_start + src/boot/multiboot2.rs lossless 이관본, body arch-cfg 0)
+// x86 전용 부팅 진입 시퀀스 및 GRUB Multiboot2 어댑터
 pub mod kernel_start;
 pub mod multiboot2;
 
 /// 스택 캐너리 순회용 IST 가드 범위 HAL 표면 (x86 실범위 4 종).
 ///
 /// `stack::install_canaries` 와 `validate_canaries` 가 arch 분기 없이 소비하도록
-/// tss 의 IST 가드 4 종을 write-once static 슬라이스로 노출함 (HAL-06 복원).
+/// tss 의 IST 가드 4 종을 write-once static 슬라이스로 노출함.
 /// aarch64 대칭 표면은 빈 슬라이스를 반환하여 IST 부재(SP_EL1 dedicated panic 스택)를 표현함
 pub fn ist_guard_ranges() -> &'static [(u64, u64)] {
-    // 부팅 초기 단일 코어 write-once 후 공유 참조로만 소비되는 정적 백업 저장소
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    // 부팅 초기 write-once 후 공유 참조로만 소비되는 정적 백업 저장소
     static mut IST_GUARD_RANGES: [(u64, u64); 4] = [(0, 0); 4];
-    // SAFETY 부팅 초기 단일 코어에서만 기록되며 반환 슬라이스는 정적 수명 공유 참조로만 소비됨
-    unsafe {
-        *(&raw mut IST_GUARD_RANGES) = tss::ist_guard_ranges();
-        &*(&raw const IST_GUARD_RANGES)
+    // write-once latch 상태 0 미초기화 1 초기화 진행 2 완료
+    //
+    // CAS latch 로 최초 진입자만 1 회 기록하여 이미 반환된 &'static alias 와 &mut 쓰기의
+    // 공존을 막고 (write-once 재진입 UB 방지), 이후 호출은 캐시된 슬라이스만 반환
+    static STATE: AtomicU8 = AtomicU8::new(0);
+
+    if STATE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        // SAFETY 최초 진입자만 도달 다른 경로는 STATE!=0 이라 미도달 배타적 단일 기록
+        // 기록 값은 정적 IST 스택 주소 유래로 결정론적이라 write-once 가 의미 동일
+        unsafe {
+            *(&raw mut IST_GUARD_RANGES) = tss::ist_guard_ranges();
+        }
+        STATE.store(2, Ordering::Release);
+    } else {
+        // 초기화 진행 중이면 완료까지 대기 (단일 코어 부팅에선 사실상 즉시 종료)
+        while STATE.load(Ordering::Acquire) != 2 {
+            core::hint::spin_loop();
+        }
     }
+
+    // SAFETY STATE==2 이후 IST_GUARD_RANGES 는 더 이상 기록되지 않으며 정적 수명
+    // 불변 공유 참조로만 소비됨 (write-once 완료)
+    unsafe { &*(&raw const IST_GUARD_RANGES) }
 }
 
 //
-// 6 HAL trait x86_64 첫 구현체 (HAL-03 ZST + inline(always) 전수)
+// HAL trait x86_64 구현체 (ZST + inline(always) 위임)
 //
-// 모든 구현체는 크기 0 의 ZST 이며 기존 free fn / typestate 메서드로의 thin
-// 위임임. dyn/Box 미사용으로 vtable 미생성 (HAL-02) 이며 Phase 10 aarch64 가
-// 동일 표면을 구현하도록 강제하는 컴파일 타임 계약의 첫 실증체임.
+// 모든 구현체는 크기 0 의 ZST 로 기존 free fn / typestate 메서드에 얇게 위임
+// dyn/Box 를 쓰지 않아 vtable 이 생성되지 않으며 aarch64 도 동일 표면을 구현하도록
+// 강제하는 컴파일 타임 계약 역할
 //
 
 /// Cpu trait x86_64 구현체.
@@ -109,7 +130,7 @@ impl crate::arch::Cpu for X86Cpu {
 }
 
 /// Mmu trait x86_64 구현체. typestate 강제는 기존 `mmu::Mmu<State>` 가 담당하며
-/// 본 구현체는 3 단계 전이 표면을 위임 매핑만 함 (HAL-07).
+/// 본 구현체는 3 단계 전이 표면을 위임 매핑만 함.
 #[allow(dead_code)]
 pub struct X86Mmu;
 

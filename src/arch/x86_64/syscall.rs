@@ -16,11 +16,11 @@
 //! # 진입 시퀀스 (`syscall` 명령)
 //!   1. CPU: CS = STAR[47:32] = `KERNEL_CS`, SS = `KERNEL_DS`, RCX = RIP,
 //!      R11 = RFLAGS, RFLAGS &= !FMASK.
-//!   2. asm stub: `swapgs` → `mov gs:[8], rsp` → `mov rsp, gs:[0]`.
+//!   2. asm stub: `swapgs` 후 `mov gs:[8], rsp` 로 사용자 RSP 저장, `mov rsp, gs:[0]` 로 커널 스택 로드.
 //!   3. asm stub: 9 개 GPR + RIP/RFLAGS 를 push 하여 `SyscallContext` 구성.
 //!   4. asm stub: `call dispatch(ctx_ptr)` (System V ABI).
 //!   5. dispatch: `ctx.rax` 에 결과 작성.
-//!   6. asm stub: 컨텍스트 pop → `mov rsp, gs:[8]` → `swapgs` → `sysretq`.
+//!   6. asm stub: 컨텍스트 pop 후 `mov rsp, gs:[8]`, `swapgs`, `sysretq` 순으로 복귀.
 //!
 //! # 사용자 ABI
 //!   - 호출 번호: RAX
@@ -38,10 +38,9 @@ use zeroize::volatile::secure_zero;
 use crate::arch::x86_64::gdt::{SYSCALL_CS_BASE, SYSRET_CS_BASE};
 use crate::cpu::{IA32_EFER, rdmsr, wrmsr};
 
-// arch-중립 syscall 표면(번호/에러/컨텍스트/주소 판정)은 arch/common 으로 추출됨.
-// 본 모듈은 이를 re-export 하여 기존 `crate::syscall::{...}` 소비 경로를 보존함
-// (본체 import byte-diff 0). SyscallContext 는 naked syscall_entry 의 push 순서와
-// 동일 레이아웃(pc/flags/num/arg0..arg5)으로 결합됨.
+// arch 중립 syscall 표면(번호/에러/컨텍스트/주소 판정)은 arch/common 에 정의되며
+// 여기서 re-export 하여 `crate::syscall::{...}` 소비 경로를 유지함, SyscallContext 는
+// naked syscall_entry 의 push 순서와 동일 레이아웃(pc/flags/num/arg0..arg5) 필수
 pub use crate::arch::common::syscall::{
     SyscallContext, SyscallError, SyscallNum, is_user_address,
 };
@@ -90,9 +89,9 @@ const FMASK_BITS: u64 = (1 << 9)         // IF
 /// 변경하지 말 것.
 #[repr(C)]
 pub struct PerCpu {
-    /// gs:0x00 — 커널 스택 최상단 (syscall 진입 시 RSP 로 로드)
+    /// gs:0x00 슬롯, 커널 스택 최상단 (syscall 진입 시 RSP 로 로드)
     pub kernel_stack_top: u64,
-    /// gs:0x08 — 사용자 RSP 임시 저장소 (syscall stub 내부 전용)
+    /// gs:0x08 슬롯, 사용자 RSP 임시 저장소 (syscall stub 내부 전용)
     pub user_rsp_save: u64,
 }
 
@@ -100,16 +99,16 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, kernel_stack_top) == 0);
 const _: () = assert!(core::mem::offset_of!(PerCpu, user_rsp_save) == 8);
 
 /// BSP per-CPU 인스턴스. SMP 도입 시 코어별 배열로 확장.
-// SAFETY: 부팅 초기 단일 코어, install() 에서 한 번만 채워짐.
+// SAFETY: 부팅 초기 단일 코어, install() 에서 한 번만 채워짐
 static mut BSP_PER_CPU: PerCpu = PerCpu {
     kernel_stack_top: 0,
     user_rsp_save: 0,
 };
 
 //
-// SyscallNum / SyscallError / SyscallContext / is_user_address 는 arch/common 으로
-// 추출됨(위 pub use 로 re-export). SyscallContext 레이아웃(pc/flags/num/arg0..arg5)은
-// 아래 naked syscall_entry 의 push 순서와 결합됨.
+// SyscallNum / SyscallError / SyscallContext / is_user_address 는 arch/common 에 정의되어
+// 위 pub use 로 re-export 됨, SyscallContext 레이아웃(pc/flags/num/arg0..arg5)은 아래
+// naked syscall_entry 의 push 순서와 반드시 일치
 //
 
 //
@@ -143,7 +142,7 @@ pub unsafe fn install(kernel_stack_top: u64) {
     // 3. LSTAR: 64-bit 모드 syscall 진입 주소
     let lstar: u64 = syscall_entry as *const () as u64;
 
-    // 4. CSTAR: 32-bit 사용자는 미지원 → 안전하게 0 (compat-mode syscall 시 #UD)
+    // 4. CSTAR: 32-bit 사용자는 미지원이므로 안전하게 0 (compat-mode syscall 시 #UD)
     let cstar: u64 = 0;
 
     // 5. KernelGsBase: swapgs 로 교체될 BSP per-CPU 베이스
@@ -157,7 +156,7 @@ pub unsafe fn install(kernel_stack_top: u64) {
     //   - 사용자 모드 (iretq 직전 swapgs 후):
     //                IA32_GS_BASE = 0
     //                IA32_KERNEL_GS_BASE = &PerCpu
-    //   - syscall stub 의 swapgs 가 두 값을 다시 교환하여 진입 즉시 GS = &PerCpu.
+    //   - syscall stub 의 swapgs 가 두 값을 다시 교환하여 진입 즉시 GS = &PerCpu
     unsafe {
         wrmsr(IA32_STAR, star);
         wrmsr(IA32_LSTAR, lstar);
@@ -178,15 +177,15 @@ pub unsafe fn install(kernel_stack_top: u64) {
 // naked syscall entry stub
 //
 // 호출 규약 (CPU 가 자동 수행):
-//   - RCX  ← user RIP
-//   - R11  ← user RFLAGS
+//   - RCX 에 user RIP 적재
+//   - R11 에 user RFLAGS 적재
 //   - RFLAGS &= ~FMASK_BITS
 //   - CS = STAR[47:32], SS = STAR[47:32] + 8
 //   - RSP 는 사용자 RSP 그대로 유지 (스왑 안 됨)
 //
 // 반환 (`sysretq`):
 //   - CS = STAR[63:48] + 16 (RPL=3), SS = STAR[63:48] + 8
-//   - RIP ← RCX, RFLAGS ← R11
+//   - RIP 에 RCX, RFLAGS 에 R11 복원
 //
 
 /// syscall 진입 stub. 사용자 컨텍스트를 스택에 saved 한 뒤 dispatch 호출.
@@ -198,14 +197,14 @@ pub unsafe fn install(kernel_stack_top: u64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_entry() -> ! {
     naked_asm!(
-        // ── 1. GS 스왑 + 스택 전환 ─────────────────────────────────
+        // 1. GS 스왑 및 스택 전환
         "swapgs",
-        "mov gs:[8], rsp",          // user_rsp_save ← user RSP
-        "mov rsp, gs:[0]",          // RSP ← kernel_stack_top
+        "mov gs:[8], rsp",          // user_rsp_save 에 user RSP 저장
+        "mov rsp, gs:[0]",          // RSP 에 kernel_stack_top 로드
 
-        // ── 2. SyscallContext 구성 (push 순서 = struct 역순) ───────
+        // 2. SyscallContext 구성 (push 순서 = struct 역순)
         // struct: pc, flags, num, arg0, arg1, arg2, arg3, arg4, arg5
-        //   ←매핑: rcx(rip), r11(rflags), rax, rdi, rsi, rdx, r10, r8, r9
+        //   매핑: rcx(rip), r11(rflags), rax, rdi, rsi, rdx, r10, r8, r9
         // push   : r9, r8, r10, rdx, rsi, rdi, rax, r11, rcx
         "push r9",
         "push r8",
@@ -217,14 +216,14 @@ pub unsafe extern "C" fn syscall_entry() -> ! {
         "push r11",                 // user RFLAGS
         "push rcx",                 // user RIP
 
-        // ── 3. 16-byte 스택 정렬 유지 + dispatch 호출 ──────────────
-        // 9 × 8B = 72B push 후 RSP 정렬은 호출자 정렬에 따라 결정.
+        // 3. 16-byte 스택 정렬 유지 및 dispatch 호출
+        // 9 × 8B = 72B push 후 RSP 정렬은 호출자 정렬에 따라 결정
         // 진입 시 사용자 RSP 가 임의 정렬일 수 있으나, 우리는 gs:[0] 로
-        // 강제 전환했으므로 install() 의 16B 정렬을 신뢰함.
+        // 강제 전환했으므로 install() 의 16B 정렬 신뢰
         "mov rdi, rsp",             // arg0 = ctx ptr
         "call {dispatch}",
 
-        // ── 4. SyscallContext pop ─────────────────────────────────
+        // 4. SyscallContext pop
         "pop rcx",                  // user RIP 복원
         "pop r11",                  // user RFLAGS 복원
         "pop rax",                  // syscall 반환값
@@ -235,7 +234,7 @@ pub unsafe extern "C" fn syscall_entry() -> ! {
         "pop r8",
         "pop r9",
 
-        // ── 5. 스택 복원 + sysret ─────────────────────────────────
+        // 5. 스택 복원 및 sysret
         "mov rsp, gs:[8]",          // user RSP 복원
         "swapgs",
         "sysretq",
@@ -269,12 +268,12 @@ extern "C" fn dispatch(ctx: &mut SyscallContext) {
         x if x == SyscallNum::AttestFixtureExport as u64 => {
             crate::handle_attest_fixture_export(ctx)
         }
-        // Phase 6 air-gap dual-enforcement (D-03 / D-05 / D-06)
+        // air-gap 이중 강제 경로
         #[cfg(feature = "tls-external")]
         x if x == SyscallNum::NetworkCapTake as u64 => crate::air_gap::take_network_cap(ctx),
         x if x == SyscallNum::AuditCapTake as u64 => crate::air_gap::take_audit_read_cap(ctx),
         x if x == SyscallNum::HsmStatus as u64 => crate::air_gap::handle_status(ctx),
-        // IpcCall/IpcRecv/IpcReply/CapRequest 는 Phase B 에서 와이어업.
+        // IpcCall/IpcRecv/IpcReply/CapRequest 는 아직 미구현으로 Unknown 반환
         x if x == SyscallNum::IpcCall as u64
             || x == SyscallNum::IpcRecv as u64
             || x == SyscallNum::IpcReply as u64
@@ -288,14 +287,14 @@ extern "C" fn dispatch(ctx: &mut SyscallContext) {
 }
 
 //
-// 핸들러 — Phase A 범위
+// syscall 핸들러
 //
 
 /// 사용자 프로세스 종료. 현재는 BSP 단일 프로세스 가정으로 단순 halt.
 ///
-/// Phase B 에서 process slot 을 도입하면 슬롯을 free 하고 스케줄러로 양보함.
+/// 향후 process slot 을 도입하면 슬롯을 해제하고 스케줄러로 양보함.
 fn sys_exit(_status: u64) -> u64 {
-    // SAFETY: VGA 직접 접근은 debug 빌드에서만 허용된 경로. 단일 코어 가정.
+    // SAFETY: VGA 직접 접근은 debug 빌드에서만 허용된 경로, 단일 코어 가정
     #[cfg(all(target_arch = "x86_64", debug_assertions))]
     unsafe {
         crate::vga::println(
@@ -319,7 +318,7 @@ fn sys_exit(_status: u64) -> u64 {
 /// 사용자 메모리 검증:
 ///   - `buf_ptr` 가 사용자 가상 주소 범위(canonical lower half) 인지 확인
 ///   - `len` 이 합리적 한도(8 KiB) 이하인지 확인
-///   - SMAP 활성 시 `stac()` ↔ `clac()` 로 접근 윈도우를 최소화
+///   - SMAP 활성 시 `stac()` 과 `clac()` 로 접근 윈도우를 최소화
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     if fd != 2 {
         return SyscallError::BadArg.as_rax();
@@ -332,7 +331,7 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
         return SyscallError::BadAddress.as_rax();
     }
 
-    // SAFETY: 사용자 메모리 read 만 수행. 길이/주소 검증 완료. SMAP 윈도우 최소화.
+    // SAFETY: 사용자 메모리 read 만 수행, 길이/주소 검증 완료, SMAP 윈도우 최소화
     let mut stack_buf = [0u8; 256];
     let mut remaining = len as usize;
     let mut src = buf_ptr as *const u8;
@@ -344,8 +343,8 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
             core::ptr::copy_nonoverlapping(src, stack_buf.as_mut_ptr(), chunk);
             crate::cpu::clac();
         }
-        // VGA 출력은 debug 빌드에서만. release 빌드는 사일런트로 동작 (사용자
-        // 메모리는 검증되었지만 VGA 자체가 release 에서 빌드되지 않음).
+        // VGA 출력은 debug 빌드에서만 수행하며 release 빌드는 사일런트로 동작 (사용자
+        // 메모리는 검증되었지만 VGA 자체가 release 에서 빌드되지 않음)
         // SAFETY: stack_buf[..chunk] 는 방금 채워진 범위
         #[cfg(debug_assertions)]
         unsafe {
@@ -373,12 +372,12 @@ fn sys_getrandom(buf_ptr: u64, len: u64) -> u64 {
     while remaining > 0 {
         let chunk = remaining.min(tmp.len());
         // SAFETY: 단일 코어 부팅 초기 또는 정적 동기화 보장 환경에서만
-        //         DRBG 접근. 현 단계에서는 BSP 가 dispatch 함수를 직렬 실행함.
+        //         DRBG 접근, 현 단계에서는 BSP 가 dispatch 함수를 직렬 실행
         match unsafe { crate::capability::rand_bytes(&mut tmp[..chunk]) } {
             Ok(()) => {}
             Err(_) => return SyscallError::Internal.as_rax(),
         }
-        // SAFETY: 사용자 메모리 write. 검증 완료.
+        // SAFETY: 사용자 메모리 write, 검증 완료
         unsafe {
             crate::cpu::stac();
             core::ptr::copy_nonoverlapping(tmp.as_ptr(), dst, chunk);
@@ -396,5 +395,5 @@ fn sys_getrandom(buf_ptr: u64, len: u64) -> u64 {
 }
 
 //
-// is_user_address 는 arch/common/syscall.rs 로 추출됨 (상단 pub use 로 re-export).
+// is_user_address 는 arch/common/syscall.rs 에 정의, 상단 pub use 로 re-export
 //

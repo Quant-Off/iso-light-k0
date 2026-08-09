@@ -68,8 +68,11 @@ if [ "$ARCH" = "aarch64" ]; then
 
     # (b') secure-erase 심볼 스코프 memset 콜 0 (D-1 정밀화 비밀 소거 비-elidability 검증)
     #   whole-ELF bl.*memset 카운트 대신 k0_secure_zero + zeroize/Zeroize/secure_zero 계열
-    #   심볼만 objdump --disassemble-symbols 스코프 디스어셈하여 각 bl.*memset 0 을 검증함
+    #   심볼만 objdump --disassemble-symbols 스코프 디스어셈하여 각 branch-to-memset 0 을 검증함
     #   (aarch64-softfloat 비-비밀 버퍼 init 의 target-inherent memset 은 스코프 밖으로 분리)
+    #   WR-03 패턴을 bl (일반 콜) 뿐 아니라 tail-call b <memset> 까지 포함하도록 확장함
+    #   b[l]? 를 whitespace 로 감싸 mnemonic 컬럼에 앵커 (조건분기 b.eq, 레지스터분기 br 은 미매칭)
+    BRANCH_MEMSET_RE='[[:space:]]b[l]?[[:space:]].*memset'
     SECURE_SYMS=()
     if $NM_CMD "$AARCH64_ELF" 2>/dev/null | grep -qE " [Tt] k0_secure_zero"; then
         # #[used] 앵커 최소 대상 (fail-closed 강제)
@@ -90,11 +93,11 @@ if [ "$ARCH" = "aarch64" ]; then
         FAIL_REASONS+=("secure-erase 스코프 게이트 앵커 k0_secure_zero nm 부재 (fail-closed 조용한 통과 금지)")
     else
         for sym in "${SECURE_SYMS[@]}"; do
-            n=$($OBJDUMP -d --disassemble-symbols="$sym" "$AARCH64_ELF" 2>/dev/null | grep -cE 'bl.*memset' || true)
+            n=$($OBJDUMP -d --disassemble-symbols="$sym" "$AARCH64_ELF" 2>/dev/null | grep -cE "$BRANCH_MEMSET_RE" || true)
             n=$(echo "$n" | tr -d '[:space:]')
             if [ "${n:-0}" != "0" ]; then
                 PASS=false
-                FAIL_REASONS+=("secure-erase 심볼 ${sym} 이 memset libcall ${n} 건 호출 (비밀 소거 elidable 결함)")
+                FAIL_REASONS+=("secure-erase 심볼 ${sym} 이 memset 로 branch (bl 또는 tail-call b) ${n} 건 (비밀 소거 elidable 결함)")
             fi
         done
     fi

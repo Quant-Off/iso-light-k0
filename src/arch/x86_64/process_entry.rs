@@ -1,9 +1,9 @@
 //! Ring 3 최초 진입 asm 시퀀스를 담는 모듈입니다.
 //!
 //! # Features
-//! CR3 적재 -> swapgs -> iretq 를 단일 atomic asm 블록으로 실행하여 Ring 0 에서
-//! Ring 3 사용자 컨텍스트로 권한 강하합니다. 구 process.rs enter_ring3 의 asm
-//! 블록을 lossless 추출한 것으로 BootEntry HAL trait 의 x86_64 구현 표면입니다
+//! CR3 적재 후 swapgs, iretq 를 단일 atomic asm 블록으로 실행하여 Ring 0 에서
+//! Ring 3 사용자 컨텍스트로 권한 강하합니다. BootEntry HAL trait 의 x86_64 구현
+//! 표면입니다
 
 use crate::arch::x86_64::gdt::{USER_CS, USER_DS};
 
@@ -19,16 +19,15 @@ use crate::arch::x86_64::gdt::{USER_CS, USER_DS};
 /// - 호출 전에 `syscall::install()` + `tss::set_rsp0()` 가 완료되어 있어야 함.
 /// - 인터럽트 비활성(CLI) 상태에서 호출 권장 (iretq 가 RFLAGS=0x202 로 IF=1 설정).
 pub unsafe fn enter_user(cr3: u64, rip: u64, rsp: u64) -> ! {
-    // SAFETY: 아래 asm 블록은 단일 atomic 시퀀스로 CR3 적재 -> swapgs ->
-    //         iretq 순으로 실행. 사이에 어떤 high-level 연산도 끼지 않음.
-    //         iretq 는 RFLAGS = 0x202 (IF=1, reserved=1) 와 CS:RIP, SS:RSP 를
-    //         적재하여 Ring 3 으로 권한 강하.
+    // SAFETY: 아래 asm 블록은 단일 atomic 시퀀스로 CR3 적재, swapgs, iretq 순으로
+    //         실행하며 사이에 어떤 high-level 연산도 끼지 않고, iretq 가 RFLAGS =
+    //         0x202 (IF=1, reserved=1) 와 CS:RIP, SS:RSP 를 적재하여 Ring 3 으로 강하함
     unsafe {
         core::arch::asm!(
             // 1. 사용자 PML4 활성화
             "mov cr3, {cr3}",
-            // 2. swapgs: 커널 GS=&PerCpu -> KERNEL_GS_BASE,
-            //            KERNEL_GS_BASE(=0) -> GS_BASE (사용자 GS=0)
+            // 2. swapgs: 커널 GS=&PerCpu 를 KERNEL_GS_BASE 로,
+            //            KERNEL_GS_BASE(=0) 를 GS_BASE 로 (사용자 GS=0)
             "swapgs",
             // 3. iretq 스택 frame: 역순 push (SS, RSP, RFLAGS, CS, RIP)
             "push {ss}",

@@ -4,7 +4,7 @@
 //! `arm-pl011-uart` 0.5.0 드라이버에 UARTDR 바이트 write 를 위임하여 부팅 직렬
 //! 콘솔을 구성합니다. PL011 은 MMU 유무 무관 동작하므로 boot_stub 의 MMU 전 early
 //! print(`EL=1`)와 MMU 활성 후 `MMU=ON` 마커를 동일 백엔드로 낼 수 있습니다. 백엔드
-//! base 는 `static mut PL011_BASE` 로 유지하며 물리 0x0900_0000(A1 폴백, DTB 우선)로
+//! base 는 `static mut PL011_BASE` 로 유지하며 물리 0x0900_0000(폴백 기본값, DTB 우선)로
 //! 시작하고, MMU 활성 후 `update_base` 로 커널 선형 매핑 VA 로 갱신합니다.
 //!
 //! x86_64 `vga.rs` 의 Console 표면(write_str/clear + update_base)을 mirror 하되 VGA
@@ -16,7 +16,7 @@
 use arm_pl011_uart::{PL011Registers, Uart, UniqueMmioPointer};
 use core::ptr::NonNull;
 
-/// QEMU virt PL011 UART MMIO 물리 기본 주소 (A1 폴백 DTB/BootInfo 우선)
+/// QEMU virt PL011 UART MMIO 물리 기본 주소 (폴백 기본값, DTB/BootInfo 우선)
 const PL011_PHYS_BASE: usize = 0x0900_0000;
 
 /// PL011 register block 기저 포인터

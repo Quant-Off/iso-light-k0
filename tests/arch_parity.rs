@@ -37,7 +37,8 @@ fn blake3_byte_diff_zero() {
 fn aes256_byte_diff_zero() {
     let key = [0x11u8; 32];
     let block = [0x22u8; 16];
-    let c = aes::AES256::new(&key);
+    let mut c = aes::AES256::default();
+    c.init(&key);
     let out = c.encrypt(&block);
     assert_eq!(hexs(&out), AES_GOLDEN, "AES-256 크로스 아키텍처 diff");
 }
@@ -46,7 +47,8 @@ fn aes256_byte_diff_zero() {
 fn chacha20_byte_diff_zero() {
     let key = [0x33u8; 32];
     let nonce = [0x44u8; 12];
-    let mut core = chacha20::ChaCha20Core::new(&key, &nonce);
+    let mut core = chacha20::ChaCha20Core::default();
+    core.init(&key, &nonce);
     let out = core.keystream_block();
     assert_eq!(hexs(&out), CHACHA_GOLDEN, "ChaCha20 크로스 아키텍처 diff");
 }
@@ -55,9 +57,11 @@ fn chacha20_byte_diff_zero() {
 fn mlkem768_byte_diff_zero() {
     let d = [0x55u8; 32];
     let z = [0x66u8; 32];
-    let kp = mlkem::mlkem768_keygen(&d, &z);
+    let mut kp = mlkem::MLKEM768KeyPair::default();
+    mlkem::mlkem768_keygen(&d, &z, &mut kp);
     let m = [0x77u8; 32];
-    let (ct, ss) = mlkem::mlkem768_encaps(&kp.ek, &m).unwrap();
+    let mut ss = zeroize::Secret::new([0u8; 32]);
+    let ct = mlkem::mlkem768_encaps(&kp.ek, &m, &mut ss).unwrap();
     // ek + ct + ss 전량을 BLAKE3 로 압축하여 단일 byte 라도 diff 나면 digest 반전
     let mut h = blake::Blake3::new();
     h.update(&kp.ek);

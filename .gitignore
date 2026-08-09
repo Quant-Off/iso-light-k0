@@ -6,9 +6,15 @@ dist/
 task-*.md
 docker.md
 
-# Phase 10 ci-phase10 이 생성하는 aarch64 명명 산출물 (SC1 ARM-01 빌드 아티팩트)
+# TEMP START
+CHANGELOG.md
+RELEASE-READINESS.md
+SECURITY.md
+utm-test/
+# TEMP END
+
 iso-light-k0-aarch64-psci.elf
-Cargo.lock
+# Cargo.lock
 isodir/boot/kernel.bin
 /AIR-GAP.md
 
@@ -17,5 +23,11 @@ isodir/boot/kernel.bin
 .claude/
 CLAUDE.md
 
-# dev trust root secret keys
+# dev trust root secret keys + 릴리즈 서명 개인키 (공개키 *.pk* 는 포함)
 keys/*.sk*
+
+# 생성 릴리즈 아티팩트(재현 가능한 make sbom/release-hash/sign-release로 생성)
+sbom.cdx.json
+release-hash.txt
+*.sig87
+__pycache__/

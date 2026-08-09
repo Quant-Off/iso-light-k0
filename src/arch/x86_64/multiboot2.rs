@@ -3,15 +3,15 @@
 //! # Features
 //! GRUB이 전달한 Multiboot2 info 구조를 순회하여 물리 메모리 맵 태그(type=6)와
 //! KASLR 커스텀 태그를 파싱하고, 결과를 `super::memory_map::MemoryMap` 중립
-//! 자료형으로 반환합니다. 파싱 로직은 기존 구현을 그대로 재배치한 것으로 신규
-//! 파싱 로직은 도입하지 않습니다 (Security Domain V5). 동적 할당은 전혀 없으며
-//! 부팅 초기 identity mapping 단일 코어 시점에서만 호출되어야 합니다.
+//! 자료형으로 반환합니다. 새 파싱 로직을 도입하지 않고 기존 파서를 재사용하며
+//! 동적 할당은 전혀 없고 부팅 초기 identity mapping 단일 코어 시점에서만
+//! 호출되어야 합니다.
 
 use crate::boot::BootInfo;
 use crate::boot::memory_map::{MemoryKind, MemoryMap, MemoryRegion, ParseError};
 
 //
-// mb2 -> BootInfo 어댑터
+// mb2 를 BootInfo 로 변환하는 어댑터
 //
 
 /// 펌웨어-중립 부팅 정보의 static BSS 인스턴스 (부팅 1회 어댑터가 채움).
@@ -21,19 +21,18 @@ static mut BOOT_INFO: BootInfo = BootInfo::empty();
 /// 진입하는 어댑터 진입점.
 ///
 /// boot_stub 의 `.Lkernel_entry` 간접 점프 대상으로 RDI = mb2_addr (mb2 info 물리
-/// 주소) 를 수신한다. 파싱 실패 시 기존 fail-safe(`unwrap_or_else(empty)`) 동작을
-/// lossless 이식하며 memory_map 과 kaslr_offset 을 채운다 (신규 파싱 로직 0 기존
-/// parse_multiboot2 / parse_kaslr_offset 재사용, Security Domain V5). 나머지
-/// BootInfo 필드는 empty 초기값을 유지한다. 이후 `crate::_kernel_start(&BootInfo)`
-/// 로 합류한다.
+/// 주소) 를 수신한다. 파싱 실패 시 fail-safe(`unwrap_or_else(empty)`) 로
+/// memory_map 과 kaslr_offset 을 채우며 parse_multiboot2 와 parse_kaslr_offset 을
+/// 재사용한다. 나머지 BootInfo 필드는 empty 초기값을 유지하고 이후
+/// `crate::_kernel_start(&BootInfo)` 로 합류한다.
 ///
 /// # Safety
 /// boot_stub 이 부팅 초기 단일 코어 identity mapping 상태에서 RDI 규약으로만
 /// 진입시킨다. `BOOT_INFO` 는 본 부팅 단일 스레드 시점에만 기록되며 이후에는
-/// 공유 참조(`&'static`)로만 소비된다 (T-09-01).
-// Multiboot2 는 x86/GRUB 펌웨어 핸드오프 전용이며 x86 `_kernel_start` 로 합류함.
+/// 공유 참조(`&'static`)로만 소비된다.
+// Multiboot2 는 x86/GRUB 펌웨어 핸드오프 전용이며 x86 `_kernel_start` 로 합류함
 // 본 모듈은 crate::arch::x86_64 하위이므로 모듈 전체가 이미 arch cfg 게이트되어
-// aarch64 컴파일 대상에서 배제된다 (per-item arch cfg 불요 HAL-06)
+// aarch64 컴파일 대상에서 배제된다 (per-item arch cfg 불요)
 #[unsafe(no_mangle)]
 pub extern "C" fn _boot_adapter_mb2(mb2_addr: u64) -> ! {
     // SAFETY: BOOT_INFO 는 부팅 단일 코어 진입에서만 기록된 후 공유 참조로만 소비됨
@@ -128,7 +127,7 @@ pub unsafe fn parse_multiboot2(info_addr: u64) -> Result<MemoryMap, ParseError> 
         }
 
         // 태그 타입 6 = 메모리 맵
-        // M7 손상/악성 부트로더 핸드오프가 무경계 tag.size 로 물리 OOB read 를
+        // 손상/악성 부트로더 핸드오프가 무경계 tag.size 로 물리 OOB read 를
         //    유발하지 못하도록 태그 전체가 info 구조 경계 내에 있어야 함
         let info_end = info_addr + total_size as u64;
         let tag_fits = tag_phys.saturating_add(tag.size as u64) <= info_end;
@@ -184,8 +183,8 @@ pub unsafe fn parse_multiboot2(info_addr: u64) -> Result<MemoryMap, ParseError> 
 //
 // KASLR 오프셋 파싱
 //
-// 부트로더가 직접 선형 매핑에 사용할 무작위 오프셋을 커널에 전달하는 방식.
-// Multiboot2 커스텀 태그(type=0x4B415352 "KASR")를 통해 전달됨.
+// 부트로더가 직접 선형 매핑에 사용할 무작위 오프셋을 커널에 전달하는 방식
+// Multiboot2 커스텀 태그(type=0x4B415352 "KASR")를 통해 전달됨
 //
 // 부트로더 구현 요건:
 //   1. KASLR 오프셋을 2 MiB 단위로 무작위 생성

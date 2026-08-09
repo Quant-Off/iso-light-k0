@@ -2,7 +2,7 @@
 //!
 //! # Features
 //! `entropy-degraded-ok` 활성 시 quorum_min = 1 이며 production 빌드 (`tls-external`) 와는
-//! compile-time mutex 로 동시 활성이 차단됩니다 (ENTR-05). 모든 진입은
+//! compile-time mutex 로 동시 활성이 차단됩니다. 모든 진입은
 //! `QuorumEntropy::collect` 또는 `collect_with_retry` 단일점만 허용됩니다.
 
 #[cfg(all(feature = "entropy-degraded-ok", feature = "tls-external"))]

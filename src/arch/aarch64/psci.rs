@@ -7,7 +7,7 @@
 //! conduit 을 대체하면 QEMU virt 에서 미정의 동작이 발생하므로 본 모듈은 오직 HVC
 //! 경로만 배선합니다.
 //!
-//! 함수 ID 상수·반환 규약·에러 타입은 검증된 크레이트에 위임하되, 본 파일은 크레이트를
+//! 함수 ID 상수와 반환 규약, 에러 타입은 검증된 크레이트에 위임하되, 본 파일은 크레이트를
 //! 직접 import 하지 않고 상위 hub(`super`)가 재노출한 별칭(`Hvc` / `psci_version_call`
 //! / `psci_cpu_on_call`)만 경유합니다. 이는 conduit 선택 문자열이 이 파일에 유입되지
 //! 않도록 하는 하드 게이트이며, 커널 전원 표면이 HVC 단일 경로임을 표면 수준에서 봉인
@@ -34,7 +34,7 @@ pub unsafe fn report_version() -> u32 {
     // psci_version_call::<Hvc> 는 PSCI_VERSION 을 HVC conduit 으로 호출하는 재노출 별칭임
     match psci_version_call::<Hvc>() {
         Ok(v) => {
-            // Version -> u32 (major << 16 | minor). PSCI 1.1 은 0x0001_0001 로 >= 0x10000
+            // Version 을 u32 (major << 16 | minor) 로 변환 PSCI 1.1 은 0x0001_0001 로 >= 0x10000
             let raw = u32::from(v);
             // SAFETY console 백엔드는 부팅 초기 유효 초기화되어 emit 안전
             unsafe {
@@ -54,9 +54,9 @@ pub unsafe fn report_version() -> u32 {
     }
 }
 
-/// PSCI CPU_ON 을 HVC conduit 으로 호출하여 보조 코어를 기동하는 표면 (ARM-06 호출 표면).
+/// PSCI CPU_ON 을 HVC conduit 으로 호출하여 보조 코어를 기동하는 표면.
 ///
-/// BSP 단일 코어 v2.0 범위이나 다중 코어 확장을 위한 호출 표면을 제공함. `target_cpu` 는
+/// 현재 BSP 단일 코어 범위이나 다중 코어 확장을 위한 호출 표면을 제공함. `target_cpu` 는
 /// 대상 코어 MPIDR affinity, `entry` 는 보조 코어 진입 물리 주소, `context` 는 진입 시
 /// x0 로 전달될 컨텍스트 값임. conduit 은 HVC 로 고정됨(함수 ID 0xC400_0003).
 ///
@@ -65,9 +65,12 @@ pub unsafe fn report_version() -> u32 {
 /// `Err(())` 를 반환함.
 ///
 /// # Safety
-/// 유효한 보조 코어 진입 물리 주소와 초기 스택·페이지 테이블이 준비된 이후에만 호출해야 함.
+/// 유효한 보조 코어 진입 물리 주소와 초기 스택과 페이지 테이블이 준비된 이후에만 호출해야 함.
+// result_unit_err 억제 근거 PSCI 펌웨어 실패 사유를 호출자가 세분화하지 않고 on/off 만
+// 필요하므로 전용 에러 타입은 과설계다 (# Errors 에 실패 조건 명시)
+#[allow(clippy::result_unit_err)]
 pub unsafe fn cpu_on(target_cpu: u64, entry: u64, context: u64) -> Result<(), ()> {
-    // psci_cpu_on_call::<Hvc> 는 PSCI CPU_ON(0xC400_0003) 을 HVC conduit 으로 호출함
+    // psci_cpu_on_call::<Hvc> 로 PSCI CPU_ON(0xC400_0003) 을 HVC conduit 으로 호출
     psci_cpu_on_call::<Hvc>(target_cpu, entry, context).map_err(|_| ())
 }
 

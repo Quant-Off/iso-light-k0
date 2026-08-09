@@ -9,11 +9,11 @@
 //! 를 호출합니다. 복귀 시 반환값을 X0 에 적재하고 `eret`(x86 sysretq 대응)로 EL0 로
 //! 돌아갑니다.
 //!
-//! # ABI 등가 (ARM-08)
+//! # ABI 등가
 //! X0=번호(x86 RAX), X1..X6=arg0..arg5(x86 RDI/RSI/RDX/R10/R8/R9), 반환 X0 으로
 //! x86 syscall/sysret 과 byte-diff 0 arg 슬롯/errno 표면을 성립시킵니다.
 //!
-//! # DIVERGENCE (10-PATTERNS L395-399)
+//! # DIVERGENCE
 //!   - GS-base 컨텍스트 전환 부재: 예외 진입 시 SP_EL1(커널 스택)이 자동 전환됨.
 //!   - `install()` 은 사실상 no-op: 벡터는 VBAR_EL1 로 이미 등록됨(MSR 설치 불요).
 //!   - PerCpu(x86 gs:0x00/0x08): BSP 단일 코어이므로 정적/SP_EL1 기반.
@@ -25,17 +25,17 @@ use core::arch::global_asm;
 
 use zeroize::volatile::secure_zero;
 
-// arch-중립 syscall 표면을 re-export 하여 `crate::syscall::{...}` 소비 경로를
-// 보존함(x86 syscall.rs 와 대칭). SyscallContext 는 아래 aarch64_svc_entry 의
-// store 순서와 동일 레이아웃으로 결합됨.
+// arch-중립 syscall 표면을 re-export 하여 `crate::syscall::{...}` 소비 경로 보존
+// (x86 syscall.rs 와 대칭). SyscallContext 는 아래 aarch64_svc_entry 의
+// store 순서와 동일 레이아웃으로 결합
 pub use crate::arch::common::syscall::{
     SyscallContext, SyscallError, SyscallNum, is_user_address,
 };
 
 //
-// SVC #0 진입 asm (x86 naked syscall_entry 대응, 10-RESEARCH Pattern 4)
+// SVC #0 진입 asm (x86 naked syscall_entry 대응)
 //
-// 벡터 sync_lower_el 진입 -> ESR_EL1.EC==0b010101 확인 -> ctx save -> dispatch -> eret.
+// 벡터 sync_lower_el 진입 후 ESR_EL1.EC==0b010101 확인, ctx save, dispatch, eret
 // SyscallContext 레이아웃: pc[+0] flags[+8] num[+16] arg0[+24] arg1[+32] arg2[+40]
 //                          arg3[+48] arg4[+56] arg5[+64] (72 byte, 16-정렬 80 예약)
 //

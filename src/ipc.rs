@@ -20,7 +20,7 @@
 
 use crate::capability::{Capability, EP_CRYPTO, EP_LUMEN_WIRE, EP_SIGN, EP_SYSTEM, EndpointId, Rights};
 use zeroize::volatile::secure_zero;
-use zeroize::{Secret, Zeroize};
+use zeroize::{Secret, Zeroable, Zeroize};
 
 //
 // 상수
@@ -88,7 +88,7 @@ pub enum MessageType {
     /// Diffie-Hellman 응답
     DhResp = 0x100E,
 
-    // PQ 서명 서비스 (EP_SIGN) — ML-DSA 청크 프로토콜
+    // PQ 서명 서비스 (EP_SIGN), ML-DSA 청크 프로토콜
     /// 서명 세션 시작 요청
     SignBeginReq = 0x2001,
     /// 서명 세션 시작 응답
@@ -182,7 +182,7 @@ pub struct MessageHeader {
 ///   [3]      flags (예약)
 ///   [4..5]   data_len (실제 데이터 길이)
 ///   [6..7]   예약
-///   [8..71]  key (최대 64 bytes — Ed448/X448 지원용으로 32→64 확장)
+///   [8..71]  key (최대 64 bytes, Ed448/X448 지원 위해 32 에서 64 로 확장)
 ///   [72..83] nonce (최대 12 bytes)
 ///   [84..87] 예약
 ///   [88..255] data (최대 168 bytes)
@@ -209,7 +209,7 @@ pub struct CryptoPayload {
     pub key: [u8; 64],   // 키 (민감 데이터, Ed448/X448 지원 위해 64B)
     pub nonce: [u8; 12], // nonce
     _pad: [u8; 4],
-    pub data: [u8; 168], // 평문 또는 암호문 (key 확장으로 200→168)
+    pub data: [u8; 168], // 평문 또는 암호문 (key 확장으로 200 에서 168 로 축소)
 }
 
 impl CryptoPayload {
@@ -228,6 +228,10 @@ impl CryptoPayload {
         }
     }
 }
+
+// SAFETY: 모든 필드가 정수·바이트 배열이라 all-zero 비트 패턴이 유효한 값
+// Secret<CryptoPayload> 래핑과 Drop 시 zeroize 계약을 위해 Zeroable 마커 부여
+unsafe impl Zeroable for CryptoPayload {}
 
 // 전체 CryptoPayload를 volatile 소거
 impl Zeroize for CryptoPayload {
@@ -288,6 +292,9 @@ impl SignPayload {
     }
 }
 
+// SAFETY: 모든 필드가 정수·바이트 배열이라 all-zero 비트 패턴이 유효한 값
+unsafe impl Zeroable for SignPayload {}
+
 impl Zeroize for SignPayload {
     fn zeroize(&mut self) {
         unsafe {
@@ -307,6 +314,9 @@ pub struct RawPayload {
     pub data: [u8; IPC_MAX_PAYLOAD],
 }
 
+// SAFETY: data 필드가 바이트 배열이라 all-zero 비트 패턴이 유효한 값
+unsafe impl Zeroable for RawPayload {}
+
 impl Zeroize for RawPayload {
     fn zeroize(&mut self) {
         // SAFETY: self.data는 IPC_MAX_PAYLOAD 바이트의 유효한 배열
@@ -324,7 +334,7 @@ impl Zeroize for RawPayload {
 /// 페이로드의 민감 데이터(키, 평문 등)가 volatile write + 메모리 배리어로 자동 소거됨.
 pub struct IpcMessage {
     pub header: MessageHeader,
-    /// 민감 데이터 포함 가능 — Drop 시 자동 소거
+    /// 민감 데이터 포함 가능, Drop 시 자동 소거
     pub payload: Secret<RawPayload>,
 }
 
@@ -555,17 +565,17 @@ impl IpcRegistry {
 // SAFETY: 부팅 초기 단일 코어 접근만 허용 (SMP 이후 spinlock 필요)
 static mut IPC_REGISTRY: IpcRegistry = IpcRegistry::empty();
 
-// Phase 2 신규 — Ring3ProcessBus::open 의 endpoint 존재성 검증 진입점 (RESEARCH §3 / Pitfall B).
+// Ring3ProcessBus::open 의 endpoint 존재성 검증 진입점
 pub fn endpoint_exists(id: EndpointId) -> bool {
     if id == EndpointId::INVALID {
         return false;
     }
-    // SAFETY: BSP single-core read-only access; IPC_REGISTRY is initialized by
-    // ipc::init() in boot order before any user-space attach reaches this path.
+    // SAFETY: BSP 단일 코어 읽기 전용 접근, IPC_REGISTRY 는 어떤 사용자 공간 attach 가
+    //         이 경로에 도달하기 전에 boot 순서상 ipc::init() 로 초기화됨
     let reg = unsafe { &*(&raw const IPC_REGISTRY) };
     reg.endpoints
         .iter()
-        .any(|slot| slot.as_ref().map_or(false, |ep| ep.id == id))
+        .any(|slot| slot.as_ref().is_some_and(|ep| ep.id == id))
 }
 
 //
@@ -588,7 +598,7 @@ pub unsafe fn init() {
     let _ = reg.register(EP_CRYPTO, Rights::CALL);
     // EP_SIGN: CALL 권한 필요 (ML-DSA PQ 서명 서비스)
     let _ = reg.register(EP_SIGN, Rights::CALL);
-    // EP_LUMEN_WIRE: Phase 4 Ring 3 lumen wire endpoint — Ring3ProcessBus::open endpoint_exists 게이트 통과 (Pitfall 5)
+    // EP_LUMEN_WIRE: Ring 3 lumen wire endpoint, Ring3ProcessBus::open endpoint_exists 게이트 통과
     let _ = reg.register(EP_LUMEN_WIRE, Rights::CALL);
 }
 
@@ -726,7 +736,7 @@ pub unsafe fn issue_sign_capability() -> Result<Capability, crate::capability::C
 /// [`issue_crypto_capability`] 와 동일.
 ///
 /// # Safety
-/// [`issue_crypto_capability`] 와 동일 — 부팅 초기 단일 코어에서 호출해야 함.
+/// [`issue_crypto_capability`] 와 동일, 부팅 초기 단일 코어에서 호출해야 함.
 pub unsafe fn issue_system_capability() -> Result<Capability, crate::capability::CapError> {
     unsafe { crate::capability::generate_capability(EP_SYSTEM, Rights::CALL) }
 }

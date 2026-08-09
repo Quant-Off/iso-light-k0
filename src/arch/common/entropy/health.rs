@@ -1,10 +1,9 @@
 //! NIST SP 800-90B §4.4.1 RCT + §4.4.2 APT stream evaluator
 //!
 //! # Features
-//! sample 단위 verdict 평가 + 재허용 메커니즘 (D-04 연속 N=16 sample PASS 시 quorum 재진입)
+//! sample 단위 verdict 평가 + 재허용 메커니즘 (연속 N=16 sample PASS 시 quorum 재진입)
 //! NIST 권장 α=2⁻²⁰ W=1024 H=0.5 의 3 source 공통 baseline
 
-// Wave 3 quorum 합류 전까지 호출자 부재 한시 허용
 #[allow(dead_code)]
 pub const ALPHA_EXP: u32 = 20;
 #[allow(dead_code)]
@@ -13,7 +12,6 @@ pub const APT_WINDOW: usize = 1024;
 #[allow(dead_code)]
 pub const RCT_CUTOFF: u32 = 41;
 // W=1024 H=0.5 binomial CDF precomputed 1 + CRITBINOM(1024, 2^-0.5, 1-2^-20) = 793
-// RESEARCH §A3 가정치 730 은 host reference 실측과 불일치로 정정 (fail-fast 정합)
 // `tests/entropy_health_rct_apt.rs` 의 binomial reference 가 본 값을 잠금
 #[allow(dead_code)]
 pub const APT_CUTOFF: u32 = 793;
@@ -47,6 +45,12 @@ pub struct StreamHealth {
     apt_filled: usize,
     consecutive_pass: u32,
     disabled: bool,
+}
+
+impl Default for StreamHealth {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[allow(dead_code)]
@@ -88,7 +92,7 @@ impl StreamHealth {
             self.rct_last = sample;
         }
 
-        // D-04 sample 단위 재허용 RCT 비실패 sample 마다 증가
+        // sample 단위 재허용 RCT 비실패 sample 마다 증가
         self.consecutive_pass = self.consecutive_pass.saturating_add(1);
         if self.disabled && self.consecutive_pass >= REENTRY_THRESHOLD {
             self.disabled = false;
