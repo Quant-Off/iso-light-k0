@@ -8,7 +8,7 @@
 //! 있고, 컴파일 타임에 이 경계가 강제됩니다.
 //!
 //! 직접 선형 매핑(Direct Linear Map):
-//!   phys [0, highest) -> virt [PHYS_MAP_OFFSET, PHYS_MAP_OFFSET + highest).
+//!   물리 [0, highest) 범위를 가상 [PHYS_MAP_OFFSET, PHYS_MAP_OFFSET + highest) 에 매핑함.
 //!   2 MiB 대용량 페이지를 사용하여 PML4 오버헤드를 1/512 로 줄임.
 //!
 //! KASLR:
@@ -172,6 +172,22 @@ impl PageTableEntry {
         Ok(())
     }
 
+    /// 중간 레벨(비-leaf) 엔트리 설정. PRESENT | WRITABLE, XD=0 고정.
+    ///
+    /// Intel SDM 4.6.1: 실행 권한은 워크 전 레벨의 XD OR 판정이므로 중간 엔트리에
+    /// XD=1 을 두면 하위 leaf 의 실행 가능 매핑(.text R+X)까지 fetch #PF 가 됨.
+    /// W^X 강제는 leaf 엔트리(set / set_huge)가 전담함 (WRITABLE leaf 는 NX 자동).
+    fn set_table(&mut self, phys_addr: u64) -> Result<(), MmuError> {
+        if phys_addr & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(MmuError::UnalignedAddress);
+        }
+        self.0 = (phys_addr & PHYS_ADDR_MASK)
+            | PageTableFlags::PRESENT
+                .union(PageTableFlags::WRITABLE)
+                .bits();
+        Ok(())
+    }
+
     /// 2 MiB 대용량 페이지 엔트리 설정 (PD 레벨 전용).
     /// 물리 주소는 2 MiB 정렬 필수. W^X: WRITABLE 시 NO_EXECUTE 자동 강제.
     pub fn set_huge(&mut self, phys_addr: u64, mut flags: PageTableFlags) -> Result<(), MmuError> {
@@ -253,7 +269,7 @@ impl AddressSpace {
     pub fn pml4_phys_addr(&self) -> u64 {
         let vma = &self.pml4 as *const PageTable as u64;
         if vma >= KERNEL_VMA_BASE {
-            // 커널 .bss에 정적 할당된 경우: VMA -> 물리 주소 변환
+            // 커널 .bss에 정적 할당된 경우: VMA 를 물리 주소로 변환
             vma - KERNEL_VMA_BASE
         } else {
             // 할당자 프레임(물리 주소 직접 사용): 변환 불필요
@@ -339,7 +355,7 @@ impl AddressSpace {
         if !pdpt_entry.is_present() {
             return None;
         }
-        // SAFETY: identity-mapped 단계 — 중간 테이블 phys 주소 = 가상 주소
+        // SAFETY: identity-mapped 단계로 중간 테이블 phys 주소 = 가상 주소
         let pdpt_ptr = pdpt_entry.phys_addr() as *const PageTable;
         let pdpt = unsafe { &*pdpt_ptr };
         let pd_entry = pdpt.entries[PageTable::index(va, 3)];
@@ -399,7 +415,7 @@ impl AddressSpace {
             return Err(MmuError::WxPolicyViolation);
         }
 
-        // 3단계 워크만 수행: PML4 -> PDPT -> PD (PD 엔트리에서 HUGE_PAGE로 종결)
+        // 3단계 워크만 수행: PML4 에서 PDPT 를 거쳐 PD 까지 (PD 엔트리에서 HUGE_PAGE로 종결)
         let pml4_ptr = &mut self.pml4 as *mut PageTable;
         let pdpt = unsafe { alloc_or_get_table(pml4_ptr, PageTable::index(virt_addr, 4))? };
         let pd = unsafe { alloc_or_get_table(pdpt, PageTable::index(virt_addr, 3))? };
@@ -454,7 +470,7 @@ unsafe fn alloc_or_get_table(
     if entry.is_present() {
         // 대용량 페이지(HUGE_PAGE) 리프 엔트리 감지
         // HUGE_PAGE 플래그가 설정된 엔트리는 2 MiB/1 GiB 대용량 페이지의
-        // 리프(leaf) 엔트리임. 하위 페이지 테이블을 가리키는 포인터가 아니므로,
+        // 리프(leaf) 엔트리이며 하위 페이지 테이블을 가리키는 포인터가 아니므로
         // phys_addr()를 *mut PageTable로 해석하면 잘못된(null 포함) 포인터를
         // 역참조하는 UB가 발생함
         // 따라서 AlreadyMapped를 반환하여 호출자(map_page/map_2mib_page)가
@@ -489,11 +505,10 @@ unsafe fn alloc_or_get_table(
             zeroize::volatile::secure_zero(new_ptr as *mut u8, PAGE_SIZE);
         }
 
-        // 중간 레벨 엔트리: PRESENT | WRITABLE | NO_EXECUTE
-        let mid_flags = PageTableFlags::PRESENT
-            .union(PageTableFlags::WRITABLE)
-            .union(PageTableFlags::NO_EXECUTE);
-        entry.set(new_phys, mid_flags)?;
+        // 중간 레벨 엔트리: PRESENT | WRITABLE (XD=0, 실행권은 leaf XD 전담)
+        // 중간 엔트리에 NO_EXECUTE 를 두면 SDM 4.6.1 전 레벨 OR 판정으로 .text fetch 까지
+        // 차단되므로 XD 는 leaf 엔트리에서만 설정함
+        entry.set_table(new_phys)?;
 
         Ok(new_ptr)
     }
@@ -543,7 +558,7 @@ impl Mmu<Uninitialized> {
             *(&raw mut PHYS_MAP_OFFSET) = aligned_offset;
         }
 
-        // TODO(x86_64): IA32_EFER.NXE 활성화, IOMMU/VT-d 설정
+        // TODO(x86_64): IOMMU/VT-d 설정
         // TODO(aarch64): TTBR0_EL1/TTBR1_EL1 설정, SMMU 활성화
         Mmu {
             _marker: PhantomData,
@@ -565,7 +580,7 @@ impl Mmu<Initialized> {
     pub unsafe fn activate(&self, space: &AddressSpace) {
         let pml4_phys = space.pml4_phys_addr();
         // SAFETY: 호출자가 PML4 유효성과 커널 매핑 포함을 보장함
-        //         CR3 쓰기 후 TLB 전체 플러시. 이후 LINEAR_MAP_ACTIVE = true
+        //         CR3 쓰기 후 TLB 전체 플러시하고 이후 LINEAR_MAP_ACTIVE = true
         unsafe {
             core::arch::asm!(
                 "mov cr3, {pml4}",
@@ -610,14 +625,38 @@ impl Mmu<Initialized> {
     /// # 매핑 속성
     /// PRESENT | WRITABLE | NO_EXECUTE | HUGE_PAGE
     /// (물리 메모리는 임의 데이터를 포함하므로 실행 불가로 설정)
+    /// 단, `[ro_phys_start, ro_phys_end)` 물리 범위(커널 .text/.rodata)는
+    /// PRESENT | NO_EXECUTE 로 carve-out 하여 쓰기 가능 별칭을 제거함
     pub fn build_linear_map(
         &self,
         space: &mut AddressSpace,
         highest_phys_addr: u64,
+        ro_phys_start: u64,
+        ro_phys_end: u64,
     ) -> Result<(), MmuError> {
         // PHYS_MAP_OFFSET 읽기: mmu.rs 내부이므로 허용
         let offset = unsafe { *(&raw const PHYS_MAP_OFFSET) };
+        self.map_phys_range(space, offset, highest_phys_addr, ro_phys_start, ro_phys_end)
+    }
 
+    pub fn build_identity_map(
+        &self,
+        space: &mut AddressSpace,
+        highest_phys_addr: u64,
+        ro_phys_start: u64,
+        ro_phys_end: u64,
+    ) -> Result<(), MmuError> {
+        self.map_phys_range(space, 0, highest_phys_addr, ro_phys_start, ro_phys_end)
+    }
+
+    fn map_phys_range(
+        &self,
+        space: &mut AddressSpace,
+        virt_offset: u64,
+        highest_phys_addr: u64,
+        ro_phys_start: u64,
+        ro_phys_end: u64,
+    ) -> Result<(), MmuError> {
         // 비트맵 할당자가 관리하는 물리 메모리 상한 (4 GiB)
         // highest_phys_addr가 매우 클 경우(BIOS Reserved 영역 포함):
         //   (1) highest_phys_addr + SIZE_2MIB - 1 이 u64::MAX를 초과 (Debug 빌드 panic)
@@ -631,14 +670,33 @@ impl Mmu<Initialized> {
         // 방어적으로 적용하여 미래의 MAX_MAPPABLE_PHYS 변경에 안전하게 대응
         let page_count = highest_phys_addr.saturating_add(SIZE_2MIB - 1) / SIZE_2MIB;
 
-        let map_flags = PageTableFlags::PRESENT
+        let rw_flags = PageTableFlags::PRESENT
             .union(PageTableFlags::WRITABLE)
             .union(PageTableFlags::NO_EXECUTE);
+        let ro_flags = PageTableFlags::PRESENT.union(PageTableFlags::NO_EXECUTE);
+        let carve = ro_phys_start < ro_phys_end;
 
         for i in 0..page_count {
             let phys_base = i * SIZE_2MIB;
-            let virt_base = offset + phys_base;
-            space.map_2mib_page(virt_base, phys_base, map_flags)?;
+            let phys_end = phys_base + SIZE_2MIB;
+            let virt_base = virt_offset + phys_base;
+
+            if !carve || phys_end <= ro_phys_start || phys_base >= ro_phys_end {
+                space.map_2mib_page(virt_base, phys_base, rw_flags)?;
+            } else if ro_phys_start <= phys_base && phys_end <= ro_phys_end {
+                space.map_2mib_page(virt_base, phys_base, ro_flags)?;
+            } else {
+                let mut frame = phys_base;
+                while frame < phys_end {
+                    let flags = if ro_phys_start <= frame && frame < ro_phys_end {
+                        ro_flags
+                    } else {
+                        rw_flags
+                    };
+                    space.map_page(virt_offset + frame, frame, flags)?;
+                    frame += PAGE_SIZE as u64;
+                }
+            }
         }
 
         Ok(())

@@ -2,31 +2,32 @@
 //!
 //! # Features
 //! noise source via arch::cpu::cycle_counter HAL hook + 2 KiB memory-fold loop + von Neumann debias
-//! LTO 회피 `#[inline(never)]` + `core::hint::black_box` 모든 fold step ENTR-08 명문 + Pitfall 4 + LWN 642166
+//! LTO 회피를 위해 모든 fold step 에 `#[inline(never)]` 와 `core::hint::black_box` 적용
 //! TCG 환경 self-disable 16384 sample boot self-test fail 시 영구 disable (재허용 미적용)
-//! CMOS RTC port 0x70 0x71 UIP edge polling 기반 TSC calibration fallback (Pitfall 12)
+//! CMOS RTC port 0x70 0x71 UIP edge polling 기반 TSC calibration fallback
 
 use super::health::{HealthVerdict, StreamHealth};
 
 const POOL_SIZE: usize = 2048;
 const SAMPLES_PER_BYTE: usize = 64;
-// ROADMAP SC #2 min-entropy >= 0.5 회귀 게이트 표본 수
+// min-entropy >= 0.5 회귀 게이트 표본 수
 const BOOT_SELF_TEST_SAMPLES: usize = 16384;
 // RTC UIP edge 당 polling 상한 QEMU port IO 지연 기준 수 초 budget RTC 부재 시 Err 폴백
+#[cfg(target_arch = "x86_64")]
 const CALIBRATE_LOOP_ITERS: usize = 8_000_000;
 
 #[used]
 static mut JITTER_POOL: [u8; POOL_SIZE] = [0u8; POOL_SIZE];
 
-// TCG self-disable flag 영구 (재허용 미적용 Pitfall 4)
+// TCG self-disable flag 영구 (재허용 미적용)
 #[used]
 static mut JITTER_DISABLED: bool = false;
 
-// Wave 4 main.rs 가 boot 시점 dump 하는 raw delta 표본 버퍼 host-side 분석용
+// main.rs 가 boot 시점 dump 하는 raw delta 표본 버퍼 host-side 분석용
 #[used]
 static mut BOOT_SELF_TEST_BUF: [u8; BOOT_SELF_TEST_SAMPLES] = [0u8; BOOT_SELF_TEST_SAMPLES];
 
-// Wave 3 quorum 합류 전 LTO 제거 차단 anchor 함수 포인터 참조로 심볼 보존 (ENTR-08)
+// LTO 제거 차단 anchor 함수 포인터 참조로 심볼 보존
 #[used]
 static JITTER_FOLD_KEEP: unsafe fn() -> u64 = jitter_fold_step;
 #[used]
@@ -41,7 +42,7 @@ fn jitter_black_box(v: u64) -> u64 {
     core::hint::black_box(v)
 }
 
-// ENTR-08 instruction count >= 1024 보장 opt-level z 는 자동 unroll 을 하지 않으므로
+// instruction count >= 1024 보장 opt-level z 는 자동 unroll 을 하지 않으므로
 // 매크로 전개로 fold step 본문을 정적 전개함 (256 step x 8 회 반복 = POOL_SIZE)
 macro_rules! fold_one {
     ($pool:ident, $acc:ident, $idx:expr) => {{
@@ -73,7 +74,7 @@ macro_rules! fold_16 {
     }};
 }
 
-/// von Neumann debias 로 1 옥텟 entropy 를 수집하는 함수 (ENTR-08 명문)
+/// von Neumann debias 로 1 옥텟 entropy 를 수집하는 함수
 ///
 /// # Errors
 /// SAMPLES_PER_BYTE budget 안에 8 bit 확보 실패 또는 JITTER_DISABLED 시 None
@@ -151,12 +152,11 @@ unsafe fn jitter_fold_step() -> u64 {
 /// 16384 raw delta 표본을 수집해 boot self-test 를 수행하는 함수
 ///
 /// RCT APT 패스 카운트가 50% 미만이면 JITTER_DISABLED 를 영구 set 하고
-/// false 를 반환함 표본은 BOOT_SELF_TEST_BUF 에 dump 되어 Wave 4 의
+/// false 를 반환함 표본은 BOOT_SELF_TEST_BUF 에 dump 되어
 /// main.rs 가 host-side min-entropy 추정에 사용함
 ///
 /// # Safety
 /// 단일 코어 부팅 초기 1 회 호출 + BOOT_SELF_TEST_BUF JITTER_POOL 단일 진입 가정
-// Wave 4 main.rs boot 합류 전까지 호출자 부재 한시 허용
 #[allow(dead_code)]
 pub unsafe fn jitter_boot_self_test() -> bool {
     // SAFETY BSP single-core BOOT_SELF_TEST_BUF 단일 진입
@@ -189,7 +189,7 @@ pub unsafe fn jitter_boot_self_test() -> bool {
 
 /// boot self-test 원시 delta 표본 buffer 의 읽기 전용 slice 를 반환하는 함수
 ///
-/// Wave 4 main.rs 가 boot serial 로 hex dump 해 host-side min-entropy 추정에 사용함
+/// main.rs 가 boot serial 로 hex dump 해 host-side min-entropy 추정에 사용함
 /// pre-conditioning raw 표본이므로 key material 이 아님
 ///
 /// # Safety
@@ -207,6 +207,9 @@ pub(crate) unsafe fn boot_self_test_samples() -> &'static [u8] {
 ///
 /// # Errors
 /// RTC UIP edge 미검출 (CALIBRATE_LOOP_ITERS 초과) 또는 tick 차이 0 시 Err
+// result_unit_err 억제 근거 단일 실패 모드(캘리브레이션 불가)만 존재하고 호출자는
+// 성공/실패만 필요해 None 으로 lifting 하므로 전용 에러 타입은 과설계다
+#[allow(clippy::result_unit_err)]
 pub fn calibrate_tsc_via_rtc() -> Result<u64, ()> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -228,7 +231,7 @@ pub fn calibrate_tsc_via_rtc() -> Result<u64, ()> {
     Err(())
 }
 
-/// RTC status register A 의 UIP bit 1 -> 0 edge 를 검출하는 함수
+/// RTC status register A 의 UIP bit 이 1 에서 0 으로 내려가는 edge 를 검출하는 함수
 ///
 /// edge 검출 시점의 RDTSC tick 을 반환하며 상한 초과 시 None
 #[cfg(target_arch = "x86_64")]

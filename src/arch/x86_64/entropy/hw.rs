@@ -1,8 +1,7 @@
-//! capability.rs 에서 lossless move 된 x86_64 HW RDSEED/RDRAND 엔트로피 어댑터
+//! x86_64 HW RDSEED/RDRAND 엔트로피 어댑터
 //!
 //! # Features
-//! RDSEED 우선 RDRAND 폴백의 하드웨어 엔트로피 수집을 제공합니다. 본문은
-//! capability.rs 의 기존 구현을 의미 변경 0 으로 이동한 것이며 Wave 3 의
+//! RDSEED 우선 RDRAND 폴백의 하드웨어 엔트로피 수집을 제공합니다.
 //! quorum 합류 시 QuorumEntropy 의 hw source 로 사용됩니다.
 
 use crate::arch::common::entropy::EntropyError;
@@ -66,8 +65,8 @@ pub(crate) unsafe fn rdrand64() -> Option<u64> {
 /// `buf` 를 하드웨어 엔트로피로 채움 (RDSEED 우선, RDRAND 폴백).
 ///
 /// # Errors
-/// `EntropyError::SourceUnavailable` — CPU에 RDSEED/RDRAND 가 없거나 재시도
-/// 한도 내에 충분한 엔트로피를 수집하지 못한 경우.
+/// CPU 에 RDSEED/RDRAND 가 없거나 재시도 한도 내에 충분한 엔트로피를
+/// 수집하지 못하면 `EntropyError::SourceUnavailable` 을 반환합니다.
 ///
 /// # Safety
 /// 단일 코어 부팅 초기 혹은 적절한 동기화 이후에 호출되어야 함.

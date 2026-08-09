@@ -6,11 +6,14 @@
 //! 의 Z 비트로 성공을 판정하며(성공 시 NZCV=0b0000 실패 시 0b0100, x86 `setc` 대응)
 //! FEAT_RNG 는 ID_AA64ISAR0_EL1.RNDR(bits[63:60]) 런타임 탐지로 게이트합니다.
 //! cortex-a72(ARMv8.0-A)는 FEAT_RNG 부재라 RNDR 이 항상 SourceUnavailable 로
-//! 강등되고 arch-중립 `QuorumEntropy::collect` 가 virtio-rng + jitter 2-of-3
-//! quorum 으로 degrade 를 정상 흡수합니다(Phase 8 정책 재사용). jitter 소스는
-//! CNTVCT_EL0 기반 arch-중립 `jitter.rs` 를, virtio-rng 소스는 arch-중립
-//! `virtio_rng.rs` 를 그대로 재사용하며 본 모듈은 quorum.rs 를 변경하지 않습니다
-//! (host 표면 보호). RNDR min-entropy 실검증(-cpu max cell)은 Manual-Only 로 이연됩니다.
+//! 강등되고, QEMU `-cpu max` cell 은 FEAT_RNG 를 TCG 에뮬레이션하여 hw 소스가
+//! 살아납니다. arch-중립 `QuorumEntropy::collect` 는 hw(RNDR) + virtio-mmio +
+//! jitter 3 소스 2-of-3 quorum 을 강제하며, source-0(hw)은 quorum.rs 가 본 모듈의
+//! `collect_hw_into` 를 target_arch 분기로 호출하고, source-1(virtio)은 본 모듈의
+//! `probe_virtio_rng`(virtio-mmio window scan)를 `init_virtio_rng_instance` 가 배선하며,
+//! source-2(jitter)는 CNTVCT_EL0 기반 arch-중립 `jitter.rs` 를 재사용합니다.
+//! QEMU virt `-cpu max` + `-device virtio-rng-device` 에서 ENTROPY_SOURCES_AVAILABLE=2
+//! 로 2-of-3 quorum 이 성립함을 런타임 실증했습니다.
 
 use crate::arch::common::entropy::EntropyError;
 use zeroize::Zeroize;
@@ -98,8 +101,7 @@ unsafe fn rndrrs64() -> Option<u64> {
 ///
 /// # Safety
 /// 단일 코어 부팅 초기 혹은 적절한 동기화 이후에 호출되어야 함
-#[allow(dead_code)]
-unsafe fn collect_hw_into(buf: &mut [u8]) -> Result<(), EntropyError> {
+pub unsafe fn collect_hw_into(buf: &mut [u8]) -> Result<(), EntropyError> {
     if !feat_rng_supported() {
         return Err(EntropyError::SourceUnavailable);
     }
@@ -154,4 +156,48 @@ unsafe fn collect_hw_into(buf: &mut [u8]) -> Result<(), EntropyError> {
 pub unsafe fn collect(buf: &mut [u8]) -> Result<(), EntropyError> {
     // SAFETY 호출자가 Entropy::collect 단일 진입 계약을 승계 quorum 위임
     unsafe { crate::arch::common::entropy::QuorumEntropy::collect(buf) }
+}
+
+/// QEMU virt virtio-mmio window 를 순차 probe 하여 virtio-rng(EntropySource) 디바이스를 탐지함
+///
+/// x86_64 `entropy::virtio_transport::probe_virtio_rng` 의 PCI ECAM scan 에 대응하는
+/// aarch64 MMIO transport 판입니다. `VIRTIO_MMIO_COUNT` 슬롯을 순회해 device_type 이
+/// EntropySource 인 슬롯의 `MmioTransport` 를 `VirtIORng` 로 감쌉니다. 디바이스 부재 시
+/// None 을 반환해 arch-중립 quorum 이 virtio 소스를 SourceUnavailable 로 강등 흡수합니다
+///
+/// # Safety
+/// BSP single-core 부팅 시점 + virtio-mmio window 가 stage1 Device 매핑(identity)에
+/// 포함되어 있다고 가정합니다
+#[cfg(target_os = "none")]
+pub unsafe fn probe_virtio_rng() -> Option<
+    virtio_drivers::device::rng::VirtIORng<
+        crate::arch::common::entropy::virtio_rng::KernelHal,
+        virtio_drivers::transport::mmio::MmioTransport<'static>,
+    >,
+> {
+    use core::ptr::NonNull;
+    use virtio_drivers::device::rng::VirtIORng;
+    use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
+    use virtio_drivers::transport::{DeviceType, Transport};
+
+    use crate::arch::aarch64::mmu::{VIRTIO_MMIO_COUNT, VIRTIO_MMIO_PHYS, VIRTIO_MMIO_STRIDE};
+
+    let mut slot = 0u64;
+    while slot < VIRTIO_MMIO_COUNT {
+        let base = VIRTIO_MMIO_PHYS + slot * VIRTIO_MMIO_STRIDE;
+        slot += 1;
+        let Some(header) = NonNull::new(base as *mut VirtIOHeader) else {
+            continue;
+        };
+        // SAFETY base 는 stage1 이 Device 매핑한 유효 virtio-mmio 슬롯 (슬롯 window 0x200)
+        let transport = match unsafe { MmioTransport::new(header, VIRTIO_MMIO_STRIDE as usize) } {
+            Ok(t) => t,
+            // 빈 슬롯(magic 불일치)이나 미지원 버전은 조용히 다음 슬롯으로 진행
+            Err(_) => continue,
+        };
+        if transport.device_type() == DeviceType::EntropySource {
+            return VirtIORng::new(transport).ok();
+        }
+    }
+    None
 }

@@ -47,8 +47,8 @@ const CANARY_QWORD: u64 = 0xDEAD_BEEF_CAFE_F00D;
 // IST 스택 레이아웃
 //
 // `align(4096)` 으로 페이지 정렬을 강제하여 guard 영역이 정확히 페이지 경계
-// (4 KiB)에 맞도록 한다. 구조체 선두(저주소)에 guard를 배치하여 스택이
-// 아래로 자라면서 guard 영역을 먼저 침범하도록 설계함
+// (4 KiB)에 맞도록 하고, 구조체 선두(저주소)에 guard를 배치하여 스택이
+// 아래로 자라면서 guard 영역을 먼저 침범하도록 설계
 
 /// 가드 페이지 + 스택 본체로 구성된 IST 스택.
 ///
@@ -100,7 +100,7 @@ impl<const N: usize> IstStack<N> {
 // boot_stub 스택 심볼 (확장된 BSP 스택)
 //
 // boot_stub.rs의 .boot_bss 섹션에 정의된 심볼들
-// BSP 스택은 256 KiB, 저주소 끝에 4 KiB 가드 영역이 배치됨
+// BSP 스택은 256 KiB, 저주소 끝에 4 KiB 가드 영역이 배치
 
 unsafe extern "C" {
     /// 부트 스택 가드 영역의 시작(저주소).
@@ -144,7 +144,7 @@ pub unsafe fn install_canaries() {
         fill_canary(bs, be);
     }
 
-    // IST 가드 영역 4종 (x86 실범위 4 종, aarch64 는 SP_EL1 dedicated panic 스택으로 대체 -> 빈 슬라이스 0 회 순회)
+    // IST 가드 영역 4종 (x86 실범위 4 종, aarch64 는 SP_EL1 dedicated panic 스택으로 대체하므로 빈 슬라이스 0 회 순회)
     for (s, e) in crate::arch::active::ist_guard_ranges() {
         // SAFETY: 각 IstStack.guard 배열은 쓰기 가능한 4 KiB 정적 배열
         unsafe {
@@ -168,7 +168,7 @@ pub unsafe fn validate_canaries() -> Result<(), u64> {
             return Err(bs);
         }
     }
-    // x86 TSS/IST 가드 (aarch64 는 SP_EL1 panic 스택으로 대체 IST 개념 부재 -> 빈 슬라이스 0 회 순회)
+    // x86 TSS/IST 가드 (aarch64 는 SP_EL1 panic 스택으로 대체, IST 개념 부재이므로 빈 슬라이스 0 회 순회)
     for (s, e) in crate::arch::active::ist_guard_ranges() {
         unsafe {
             if !check_canary(*s, *e) {

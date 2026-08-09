@@ -1,30 +1,30 @@
 //! arch 디렉토리 루트 cfg-conditional re-export hub
 //!
 //! # Features
-//! Phase 8 D-01 Forward 정합의 디렉토리 골격 루트입니다. arch-중립 모듈은 `common` 아래에,
+//! 디렉토리 골격 루트입니다. arch-중립 모듈은 `common` 아래에,
 //! x86_64 전용 어댑터는 `x86_64` 아래에 배치되며 활성 아키텍처는 `active` 별칭으로
-//! 노출됩니다. Phase 9 의 HAL trait 추출은 본 골격 위에 trait 정의만 추가하면 됩니다.
+//! 노출됩니다. HAL trait 추출은 본 골격 위에 trait 정의만 추가하면 됩니다.
 
 pub mod common;
 pub mod cpu;
 
-// Phase 9 HAL-07 음성 probe feature 게이트 (production 빌드 미포함)
+// 음성 probe feature 게이트 (production 빌드 미포함)
 #[cfg(feature = "mmu-typestate-probe")]
 pub mod mmu_typestate_probe;
 
 //
-// 6 HAL trait (HAL-01 단일 파일 정의)
+// 6 HAL trait 단일 파일 정의
 //
 // 모든 메서드는 수신자 없는 associated fn 으로 정적 디스패치만 가능하며
-// trait object 화가 구조적으로 차단됨 (HAL-02)
-// trait 선언부에는 attr 를 달지 않고 impl 측 (Wave 4) 이 #[inline(always)] 를 강제함 (HAL-03)
-// 본체는 trait 을 직접 호출하지 않고 기존 free fn 경로를 유지함
-// trait 은 Phase 10 aarch64 가 동일 표면을 구현하도록 강제하는 컴파일 타임 계약임
+// trait object 화가 구조적으로 차단
+// trait 선언부에는 attr 를 달지 않고 impl 측이 #[inline(always)] 를 강제
+// 본체는 trait 을 직접 호출하지 않고 기존 free fn 경로를 유지
+// trait 은 aarch64 가 동일 표면을 구현하도록 강제하는 컴파일 타임 계약임
 //
 
 /// CPU 특권 명령 표면에 대한 arch-중립 계약.
 ///
-/// 구현체는 ZST (x86_64 는 기존 free fn 위임) 이며 Phase 10 aarch64 가
+/// 구현체는 ZST (x86_64 는 기존 free fn 위임) 이며 aarch64 가
 /// 동일 표면을 구현함.
 ///
 /// # 보안 불변식
@@ -92,10 +92,10 @@ pub trait Cpu {
 /// MMU 활성화 3 단계 전이에 대한 arch-중립 계약.
 ///
 /// phantom-type 기반 typestate 강제는 기존 `crate::mmu::Mmu<State>` 구체 타입이
-/// 담당하며 (HAL-07) 본 trait 은 전이 표면의 명명만 고정함.
+/// 담당하며 본 trait 은 전이 표면의 명명만 고정함.
 ///
 /// # 보안 불변식
-/// 1. `pre_mmu_enable` -> `mmu_enable` -> `post_mmu_enable` 순서 외의 호출 순서는
+/// 1. `pre_mmu_enable` 다음 `mmu_enable` 다음 `post_mmu_enable` 순서 외의 호출 순서는
 ///    연관 타입 전이로 컴파일 타임에 차단됨.
 /// 2. `mmu_enable` 은 커널 매핑이 완료된 주소 공간에 대해서만 호출됨.
 #[allow(dead_code)]
@@ -126,7 +126,7 @@ pub trait Mmu {
     /// `mmu_enable` 완료 이후에만 호출해야 함.
     unsafe fn post_mmu_enable();
 
-    /// 물리 주소 -> 커널 선형 매핑 가상 주소 변환.
+    /// 물리 주소에서 커널 선형 매핑 가상 주소로 변환.
     fn phys_to_virt(pa: u64) -> u64;
 }
 
@@ -155,7 +155,7 @@ pub trait Idt {
 /// 부팅 콘솔 출력에 대한 arch-중립 계약.
 ///
 /// 색상은 trait 표면에 포함하지 않음 (x86 vga::Color 는 re-export 경로로 존속하고
-/// Phase 10 PL011 구현체는 색상을 무시할 수 있음)
+/// PL011 구현체는 색상을 무시할 수 있음)
 #[allow(dead_code)]
 pub trait Console {
     /// 문자열 출력.
@@ -225,9 +225,10 @@ pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64 as active;
 
-// Phase 9 9-D aarch64 두 번째 구현체 진입 표면 (HAL-02 cfg-conditional re-export 양방향 완성)
-// aarch64 hub 는 unimplemented! 골격이며 aarch64-unknown-none-softfloat 타깃 미설치로
-// 컴파일 배제 상태 (OQ4) — x86_64 산출물에 심볼 미유입, Phase 10 ARM-01 이 첫 컴파일
+// aarch64 두 번째 구현체 진입 표면
+// aarch64-unknown-none-softfloat 타깃으로 컴파일되며 HAL 6 트레이트 + 부팅 합류점
+// (entropy quorum 게이트 + DRBG + 신뢰 루트 + IPC + self-check)까지 실동작함
+// x86_64 산출물에는 target_arch cfg 로 심볼 미유입
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 #[cfg(target_arch = "aarch64")]

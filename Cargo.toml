@@ -21,6 +21,9 @@ kernel-bin = []
 # Phase 9 HAL-07 Mmu typestate 음성 컴파일 probe 전용 production 빌드 미포함
 # check-mmu-typestate leg 가 E0599 컴파일 거부를 grep 검증
 mmu-typestate-probe = []
+# P0-3/P0-4 W^X #PF 실증 probe debug 전용 opt-in release 는 compile_error 거부
+wx-probe-text = []
+wx-probe-linear = []
 
 # Phase 5.1 D-01 trust root dual-path build.rs 가 K0_TRUST_ROOT_KEYSTORE env →
 # cargo:rustc-cfg=k0_trust_root_keystore 노출 (Rust 1.80+ unexpected_cfgs lint 명시)

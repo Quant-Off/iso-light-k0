@@ -19,8 +19,9 @@ QEMU_BIN="qemu-system-aarch64"
 AARCH64_ELF="${AARCH64_ELF:-target/aarch64-unknown-none-softfloat/release/iso-light-k0}"
 QEMU_TIMEOUT="${QEMU_TIMEOUT:-60}"
 
-# 부팅 순서 마커 키 -> grep -E 패턴 (7-line proof)
-MARKER_KEYS=(EL MMU GICR CHILDREN GRP1 IRQ PSCI)
+# 부팅 순서 마커 키 -> grep -E 패턴
+# 앞 7 키는 7-line boot proof, 뒤 5 키는 커널 본체 합류 실증(park 해소)
+MARKER_KEYS=(EL MMU GICR CHILDREN GRP1 IRQ PSCI VIRTIO DRBG QUORUM GAP JOIN)
 marker_pattern() {
     case "$1" in
         EL)       echo 'EL=1' ;;
@@ -30,6 +31,11 @@ marker_pattern() {
         GRP1)     echo 'GRP1 enabled' ;;
         IRQ)      echo 'IRQ [0-9]+ delivered' ;;   # IRQ N delivered (N 은 실제 IRQ 번호)
         PSCI)     echo 'PSCI.*0x1' ;;              # PSCI >= 0x10000 (PSCI_VERSION via HVC)
+        VIRTIO)   echo 'VIRTIO_RNG probe done' ;;  # virtio-mmio source-1 probe
+        DRBG)     echo 'CAP_DRBG init OK' ;;        # Capability Hash-DRBG-SHA256 초기화
+        QUORUM)   echo 'ENTROPY_QUORUM_2_OF_3_OK' ;; # entropy 2-of-3 quorum 게이트 통과
+        GAP)      echo 'gap_self_check OK' ;;       # air-gap 2 층 self-check
+        JOIN)     echo 'kernel init complete' ;;    # 커널 본체 합류 종료 (park 해소 실증)
         *)        echo '' ;;
     esac
 }
@@ -62,11 +68,14 @@ trap cleanup EXIT
 # (백그라운드 실행에서 mon:stdio 는 stdin 점유로 SIGTTIN/조기 EOF 위험 -> file: 로 회피)
 # 커널은 7-line proof 후 wfi park 하여 스스로 종료하지 않으므로 요구 마커 전량 검출 시
 # 조기 kill 로 종결함 (기존 full-timeout grep 대비 PASS/FAIL 판정 동일 실행 시간만 단축)
+# -cpu max 로 FEAT_RNG(RNDR) TCG 에뮬레이션 활성 (entropy source-0 hw)
+# -device virtio-rng-device 로 virtio-mmio entropy source-1 부착 (2-of-3 quorum 성립)
 QEMU_ARGS=(
     -M virt,gic-version=3
-    -cpu cortex-a72
+    -cpu max
     -m 512M
     -display none
+    -device virtio-rng-device
     -serial "file:$SERIAL_LOG"
     -kernel "$AARCH64_ELF"
 )

@@ -1,14 +1,14 @@
 //! 정적 프로세스 슬롯 풀과 Ring 3 진입 메커니즘을 구현한 모듈입니다.
 //!
 //! # 설계 원칙
-//!   - `alloc` 절대 미사용 — `MAX_PROCESSES` 개의 정적 `Option<Process>` 슬롯을
+//!   - `alloc` 절대 미사용, `MAX_PROCESSES` 개의 정적 `Option<Process>` 슬롯을
 //!     사용. 슬롯 할당 실패는 `ProcessError::SlotsFull`.
 //!   - 사용자 주소 공간은 별도 PML4 프레임 한 개를 `allocator::alloc_frame()`
 //!     으로 받아 0-소거 후 커널 PML4 의 상위 절반을 inherit (커널 매핑 공유).
 //!   - 사용자 매핑은 `mmu::AddressSpace::map_user_page()` 로 항상 `USER_ACCESSIBLE`
 //!     플래그 + W^X 가 강제됨.
 //!   - Ring 3 진입은 `enter_ring3()` 에서 단일 atomic asm 블록으로 수행:
-//!     `swapgs` → iretq 스택 frame 구축 → `iretq`. 사이에 어떤 RFLAGS / GS
+//!     `swapgs` 후 iretq 스택 frame 구축 후 `iretq`. 사이에 어떤 RFLAGS / GS
 //!     관찰 윈도우도 두지 않음.
 //!
 //! # 보안 모델
@@ -18,7 +18,7 @@
 //!   - SMEP/SMAP 가 활성이므로 커널이 사용자 페이지에서 실행/접근 불가. 그러나
 //!     반대 방향(사용자가 커널 페이지 접근)은 페이지 테이블의 USER_ACCESSIBLE
 //!     플래그 부재로 자동 차단됨.
-//!   - 사용자 RFLAGS 는 항상 `0x202` (IF=1 + reserved 1 비트) 로 강제 — 사용자
+//!   - 사용자 RFLAGS 는 항상 `0x202` (IF=1 + reserved 1 비트) 로 강제, 사용자
 //!     가 IOPL 상승, 단일 스텝 트랩 등을 임의로 설정할 수 없음.
 //!
 //! # Authors
@@ -51,7 +51,7 @@ pub const DEFAULT_USER_STACK_SIZE: usize = 64 * 1024;
 //
 
 /// 프로세스 핸들. 슬롯 인덱스 + 단조 증가 generation 으로 stale 핸들 사용을
-/// 검출함 (Phase B 1차에는 generation 미사용, 슬롯 인덱스 단독으로 충분).
+/// 검출함 (현재 구현에는 generation 미사용, 슬롯 인덱스 단독으로 충분).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ProcessId(pub u8);
 
@@ -60,7 +60,7 @@ pub struct ProcessId(pub u8);
 pub enum ProcessState {
     /// 메모리에 적재되어 진입 대기 중
     Loaded,
-    /// 현재 CPU 코어에서 실행 중 (Phase B 단일 코어 가정)
+    /// 현재 CPU 코어에서 실행 중 (단일 코어 가정)
     Running,
     /// `sys_exit` 또는 fault 로 종료
     Exited,
@@ -76,7 +76,7 @@ pub struct Process {
     pub entry_rip: u64,
     /// 사용자 RSP (스택 최상단, 16-byte 정렬)
     pub user_rsp: u64,
-    /// 사용자 스택 매핑 범위 [bottom, top) — 디버깅 / 정리에 사용
+    /// 사용자 스택 매핑 범위 [bottom, top), 디버깅과 정리에 사용
     pub user_stack_range: (u64, u64),
 }
 
@@ -115,7 +115,7 @@ impl From<mmu::MmuError> for ProcessError {
 //
 
 // SAFETY: 부팅 초기 단일 코어, 본 모듈의 공개 API 만 슬롯 풀에 접근하며
-//         내부적으로 직렬화됨.
+//         내부적으로 직렬화됨
 static mut PROCESSES: [Option<Process>; MAX_PROCESSES] = [const { None }; MAX_PROCESSES];
 
 /// 첫 번째 빈 슬롯을 찾아 인덱스를 반환.
@@ -149,7 +149,7 @@ pub fn get(id: ProcessId) -> Option<&'static Process> {
     if idx >= MAX_PROCESSES {
         return None;
     }
-    // SAFETY: 단일 코어, 슬롯은 spawn 후 변경되지 않음 (Phase B 단순화 가정)
+    // SAFETY: 단일 코어, 슬롯은 spawn 후 변경되지 않음 (단순화 가정)
     unsafe { (*(&raw const PROCESSES))[idx].as_ref() }
 }
 
@@ -174,14 +174,14 @@ unsafe fn alloc_user_address_space(
     let frame = unsafe { crate::allocator::alloc_frame() }.ok_or(ProcessError::PmAllocFailed)?;
     let phys = frame.addr();
 
-    // 부팅 초기엔 LINEAR_MAP_ACTIVE 이전이라 phys==virt(identity) 가정.
-    // activate() 후에는 mmu::Initialized 가 phys -> virt 로 변환해야 하지만,
-    // 본 함수는 activate 전에만 호출됨 (Phase B 단순화).
+    // 부팅 초기엔 LINEAR_MAP_ACTIVE 이전이라 phys==virt(identity) 가정
+    // activate() 후에는 mmu::Initialized 가 phys 에서 virt 로 변환해야 하지만,
+    // 본 함수는 activate 전에만 호출됨 (단순화)
     let space_ptr = phys as *mut AddressSpace;
 
     // SAFETY: PML4 프레임 4 KiB 를 0-소거 후, AddressSpace::new() 동등의
-    //         초기 상태로 둠. 그 다음 커널 매핑을 inherit + boot_stack 영역
-    //         identity 매핑(저주소).
+    //         초기 상태로 둔 다음 커널 매핑을 inherit + boot_stack 영역
+    //         identity 매핑(저주소)
     unsafe {
         zeroize::volatile::secure_zero(space_ptr as *mut u8, PAGE_SIZE);
         (*space_ptr).inherit_kernel_mappings(kernel_space);
@@ -271,16 +271,16 @@ pub unsafe fn load_flat_payload(
     }
 
     // 2. 매핑된 각 페이지에 페이로드 복사 (identity-mapped 가정)
-    //    페이지 테이블에서 phys 를 다시 읽어와 그 phys 주소를 직접 식별자로 사용.
+    //    페이지 테이블에서 phys 를 다시 읽어와 그 phys 주소를 직접 식별자로 사용
     let mut copied = 0usize;
     for i in 0..pages {
         let va = base_va + (i as u64) * (PAGE_SIZE as u64);
         // SAFETY: 부트 페이지 테이블 활성, 중간 테이블 identity-mapped
         let phys = unsafe { space.walk_to_phys(va) }.ok_or(ProcessError::BadAddress)?;
         let chunk = (total_bytes - copied).min(PAGE_SIZE);
-        // SAFETY: phys 는 방금 allocator 로 받은 4 KiB 프레임의 물리 주소.
+        // SAFETY: phys 는 방금 allocator 로 받은 4 KiB 프레임의 물리 주소
         //         부트 PML4 는 4 GiB identity map 을 보유하므로 phys < 4 GiB
-        //         범위에서 직접 쓰기 가능.
+        //         범위에서 직접 쓰기 가능
         unsafe {
             core::ptr::copy_nonoverlapping(payload.as_ptr().add(copied), phys as *mut u8, chunk);
         }
@@ -340,7 +340,7 @@ pub unsafe fn spawn_flat(
 
     // 1. 사용자 PML4 생성 + 커널 매핑 inherit
     let space_ptr = unsafe { alloc_user_address_space(kernel_space)? };
-    // SAFETY: 갓 할당된 PML4 프레임 — 단독 접근
+    // SAFETY: 갓 할당된 PML4 프레임, 단독 접근
     let space = unsafe { &mut *space_ptr };
 
     // 2. 사용자 코드 페이로드 적재 (R+X)
@@ -378,7 +378,7 @@ pub unsafe fn spawn_flat(
 /// 정적 ELF64 사용자 실행 파일을 새 사용자 프로세스로 적재함.
 ///
 /// 흐름:
-///   1. ELF 파싱 (헤더 + PT_LOAD 검증) → `Elf64Image`
+///   1. ELF 파싱 (헤더 + PT_LOAD 검증) 하여 `Elf64Image` 생성
 ///   2. 새 사용자 PML4 + boot stack identity 매핑
 ///   3. 각 PT_LOAD 세그먼트에 대해 페이지 매핑 + 파일 데이터 복사 + .bss 0-소거
 ///   4. 사용자 스택 매핑
@@ -396,7 +396,7 @@ pub unsafe fn spawn_elf(
 
     // 1. 사용자 PML4 + 커널 매핑 + boot stack identity
     let space_ptr = unsafe { alloc_user_address_space(kernel_space)? };
-    // SAFETY: 갓 만든 PML4 — 단독 접근
+    // SAFETY: 갓 만든 PML4, 단독 접근
     let space = unsafe { &mut *space_ptr };
 
     // 2. PT_LOAD 적재
@@ -446,7 +446,7 @@ unsafe fn load_segment(
     let va_end = (ph.p_vaddr + ph.p_memsz + (PAGE_SIZE as u64 - 1)) & page_mask;
     let pages = ((va_end - va_start) as usize) / PAGE_SIZE;
 
-    // PT_LOAD flags → writable 결정 (PF_W 우선; PF_X 만 있으면 R+X 코드 페이지)
+    // PT_LOAD flags 로 writable 결정 (PF_W 우선; PF_X 만 있으면 R+X 코드 페이지)
     let writable = ph.is_writable();
 
     // 페이지 매핑 + 0-소거 (mmu::map_user_page 의 W^X 가 자동 적용됨)
@@ -455,7 +455,7 @@ unsafe fn load_segment(
         map_user_region(space, va_start, pages, writable)?;
     }
 
-    // 파일 데이터 복사 (p_filesz). p_memsz - p_filesz 영역은 .bss 로 0-유지.
+    // 파일 데이터 복사 (p_filesz), p_memsz - p_filesz 영역은 .bss 로 0-유지
     let file_off = ph.p_offset as usize;
     let file_len = ph.p_filesz as usize;
     let mut copied = 0usize;
@@ -466,8 +466,8 @@ unsafe fn load_segment(
         let page_off = (va & (PAGE_SIZE as u64 - 1)) as usize;
         let page_remain = PAGE_SIZE - page_off;
         let chunk = (file_len - copied).min(page_remain);
-        // SAFETY: phys 는 방금 alloc 된 4 KiB 프레임. 부트 PML4 의 4 GiB
-        //         identity map 으로 직접 쓰기 가능.
+        // SAFETY: phys 는 방금 alloc 된 4 KiB 프레임, 부트 PML4 의 4 GiB
+        //         identity map 으로 직접 쓰기 가능
         unsafe {
             core::ptr::copy_nonoverlapping(
                 raw.as_ptr().add(file_off + copied),
@@ -482,9 +482,9 @@ unsafe fn load_segment(
 
 /// 프로세스를 활성화하고 Ring 3 으로 점프함. 이 함수는 결코 반환하지 않음.
 ///
-/// 1. CR3 ← 사용자 PML4 물리 주소
-/// 2. swapgs (커널 GS=&PerCpu → KERNEL_GS_BASE; 사용자 GS=0)
-/// 3. iretq 스택 frame 구축 후 `iretq` (Ring 0 → Ring 3)
+/// 1. CR3 에 사용자 PML4 물리 주소 적재
+/// 2. swapgs (커널 GS=&PerCpu 를 KERNEL_GS_BASE 로 교체; 사용자 GS=0)
+/// 3. iretq 스택 frame 구축 후 `iretq` (Ring 0 에서 Ring 3 으로)
 ///
 /// # Safety
 /// - `pid` 가 `Loaded` 상태여야 함.
@@ -494,15 +494,15 @@ unsafe fn load_segment(
 pub unsafe fn enter_ring3(pid: ProcessId) -> ! {
     let p = match get(pid) {
         Some(p) => p,
-        // 잘못된 pid -> 즉시 정지 (방어적 fail-stop)
+        // 잘못된 pid 면 즉시 정지 (방어적 fail-stop)
         None => crate::arch::active::cpu::halt_loop(),
     };
     let cr3 = p.pml4_phys;
     let rip = p.entry_rip;
     let rsp = p.user_rsp;
 
-    // SAFETY: cr3 적재 -> swapgs -> iretq 단일 atomic 시퀀스는 arch 표면
-    //         (process_entry::enter_user) 으로 추출됨. 호출자가 enter_ring3 의
-    //         안전 계약 (Loaded 상태 + syscall/tss 설치 완료) 을 그대로 승계함.
+    // SAFETY: cr3 적재 후 swapgs 후 iretq 단일 atomic 시퀀스는 arch 표면
+    //         (process_entry::enter_user) 으로 추출됨, 호출자가 enter_ring3 의
+    //         안전 계약 (Loaded 상태 + syscall/tss 설치 완료) 을 그대로 승계함
     unsafe { crate::arch::active::process_entry::enter_user(cr3, rip, rsp) }
 }

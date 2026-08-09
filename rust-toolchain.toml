@@ -1,4 +1,8 @@
+# P2-3 재현빌드 재현 가능한 릴리즈 빌드는 rolling `nightly` 대신 날짜 고정 채널을
+# 사용한다. 검증 기준 툴체인은 rustc 1.98.0-nightly (54333ff07 2026-05-22) 이며
+# 통제된 릴리즈 환경에서는 아래 channel 을 "nightly-2026-05-22" 로 고정한다
+# (로컬 개발은 rolling nightly 유지 가능). 상세는 docs/RELEASE.md 참조
 [toolchain]
 channel = "nightly"
 components = ["rust-src", "rustfmt", "clippy"]
-targets   = ["x86_64-unknown-none"]
+targets   = ["x86_64-unknown-none", "aarch64-unknown-none-softfloat", "aarch64-unknown-none"]

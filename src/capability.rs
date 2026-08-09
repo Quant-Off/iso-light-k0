@@ -15,7 +15,8 @@
 //! 토큰 비교는 `CtEqOps` 의 constant-time 비교로 타이밍 사이드채널을
 //! 차단하며, 사용이 끝난 Capability 는 `Zeroize` 로 토큰 값이 즉시 소거됩니다.
 
-use constant_time::{Choice, CtEqOps};
+use constant_time::Choice;
+use constant_time::traits::CtEqOps;
 use rng::{DrbgError, HashDRBGSHA256};
 use zeroize::Zeroize;
 
@@ -76,7 +77,7 @@ impl EndpointId {
 pub const EP_SYSTEM: EndpointId = EndpointId(0x0000); // 커널 시스템 콜
 pub const EP_CRYPTO: EndpointId = EndpointId(0x0001); // 암호화 서비스
 pub const EP_SIGN: EndpointId = EndpointId(0x0002);   // ML-DSA PQ 서명 서비스
-pub const EP_LUMEN_WIRE: EndpointId = EndpointId(0x0003); // Phase 4 Ring 3 lumen wire endpoint (D-13)
+pub const EP_LUMEN_WIRE: EndpointId = EndpointId(0x0003); // Ring 3 lumen wire 엔드포인트
 
 //
 // Capability 토큰
@@ -126,13 +127,13 @@ impl Capability {
     #[inline]
     pub fn is_valid_for(&self, endpoint_id: EndpointId, required: Rights) -> bool {
         // 토큰 != 0
-        let token_nonzero: Choice = CtEqOps::ne(&self.token, &0u64);
+        let token_nonzero: Choice = CtEqOps::ct_ne(&self.token, &0u64);
         // 대상 엔드포인트 일치
-        let ep_eq: Choice = CtEqOps::eq(&self.endpoint_id.0, &endpoint_id.0);
+        let ep_eq: Choice = CtEqOps::ct_eq(&self.endpoint_id.0, &endpoint_id.0);
         // 요구 권한이 보유 권한의 부분집합인지 (비트마스크 AND 는 값/인덱스
         // 의존 분기가 없어 본질적으로 상수-시간)
         let masked: u32 = self.rights.0 & required.0;
-        let rights_ok: Choice = CtEqOps::eq(&masked, &required.0);
+        let rights_ok: Choice = CtEqOps::ct_eq(&masked, &required.0);
 
         (token_nonzero & ep_eq & rights_ok).unwrap_u8() == 1
     }
@@ -142,7 +143,7 @@ impl Capability {
     /// 슬롯 조회/위조 탐지 등에서 토큰 일치 여부를 판단할 때 사용.
     #[inline]
     pub fn ct_token_eq(&self, other: &Self) -> Choice {
-        CtEqOps::eq(&self.token, &other.token)
+        CtEqOps::ct_eq(&self.token, &other.token)
     }
 
     /// 권한을 축소하여 새 Capability를 생성 (위임용, GRANT 권한 필요).
@@ -179,7 +180,7 @@ impl Zeroize for Capability {
 /// move 되었으며 본 함수는 그 어댑터로의 bridge 표면만 유지함.
 ///
 /// # Errors
-/// `CapError::NoEntropy` — CPU에 RDSEED/RDRAND 가 없거나 재시도 한도 내에
+/// `CapError::NoEntropy` 는 CPU에 RDSEED/RDRAND 가 없거나 재시도 한도 내에
 /// 충분한 엔트로피를 수집하지 못한 경우.
 ///
 /// # Safety
@@ -188,7 +189,7 @@ impl Zeroize for Capability {
 unsafe fn fill_hw_entropy(buf: &mut [u8]) -> Result<(), CapError> {
     use crate::arch::common::entropy::{EntropyError, QuorumEntropy};
 
-    // ENTR-06 단일점 최종 교체 arch-중립 QuorumEntropy 진입점 D-05 60sec 폴링
+    // arch 중립 QuorumEntropy 진입점, 60초 폴링으로 엔트로피 수집
     // SAFETY: capability::init_prng 또는 reseed_drbg 호출자가 단일 코어 + cpu::features() 완료 보장
     match unsafe { QuorumEntropy::collect_with_retry(buf, 60_000) } {
         Ok(()) => Ok(()),
@@ -243,19 +244,30 @@ pub unsafe fn init_prng() -> Result<(), CapError> {
         fill_hw_entropy(&mut nonce)?;
     }
 
-    // SAFETY: 위 문서화된 안전 조건대로 호출자는 호출자가 강한 엔트로피 주입 책임
-    let drbg = unsafe {
-        HashDRBGSHA256::new_from_entropy(&entropy, &nonce, Some(PERSONALIZATION_TAG))
-            .map_err(|_| CapError::DrbgInit)?
+    // 제자리 초기화 최종 위치(CAP_DRBG)에 default DRBG 를 두고 init_from_entropy 로
+    // 상태를 채워 by-value 반환의 비밀 이동 잔류를 원천 차단 (elib in-place API 계약)
+    // SAFETY: 단일 코어 부팅 초기 CAP_DRBG 단일 진입
+    let init = unsafe {
+        *(&raw mut CAP_DRBG) = Some(HashDRBGSHA256::default());
+        let drbg = (*(&raw mut CAP_DRBG))
+            .as_mut()
+            .ok_or(CapError::DrbgInit)?;
+        // SAFETY: entropy/nonce 는 fill_hw_entropy 로 독립 수집된 강한 엔트로피
+        drbg.init_from_entropy(&entropy, &nonce, Some(PERSONALIZATION_TAG))
+            .map_err(|_| CapError::DrbgInit)
     };
 
-    // 엔트로피 스택 버퍼 즉시 소거
+    // 엔트로피 스택 버퍼 즉시 소거 (init 성공/실패 무관)
     entropy.zeroize();
     nonce.zeroize();
 
-    // SAFETY: 단일 코어 부팅 초기
-    unsafe {
-        *(&raw mut CAP_DRBG) = Some(drbg);
+    if init.is_err() {
+        // 초기화 실패 시 미완성 DRBG 를 남기지 않음 (fail-closed)
+        // SAFETY: 단일 코어 부팅 초기 CAP_DRBG 단일 진입
+        unsafe {
+            *(&raw mut CAP_DRBG) = None;
+        }
+        return Err(CapError::DrbgInit);
     }
     Ok(())
 }
@@ -323,7 +335,7 @@ pub unsafe fn rand_bytes(buf: &mut [u8]) -> Result<(), CapError> {
     let drbg = drbg_slot.as_mut().ok_or(CapError::PrngNotInitialized)?;
 
     // RESEED_INTERVAL 까지의 한 호출당 안전 한계는 elib-k0-nt 가 강제하므로
-    // 단일 generate() 호출로 충분. ReseedRequired 시 재시드 후 재시도
+    // 단일 generate() 호출로 충분하며 ReseedRequired 시 재시드 후 재시도
     loop {
         match drbg.generate(buf, None) {
             Ok(()) => return Ok(()),
@@ -346,6 +358,14 @@ pub unsafe fn rand_bytes(buf: &mut [u8]) -> Result<(), CapError> {
     }
 }
 
+/// CAP_DRBG 로 0 이 아닌 64-bit capability 토큰을 생성한다
+///
+/// # Safety
+/// BSP single-core 에서만 호출 가능하다 CAP_DRBG 를 비원자적으로 갱신하므로 호출자가
+/// `init_prng` 완료와 단일 진입을 보장해야 한다 SMP 도입 시 spinlock 필요
+///
+/// # Errors
+/// DRBG 미초기화 시 `CapError::PrngNotInitialized`, 재시드 실패 시 `CapError::DrbgInit`
 pub unsafe fn gen_token_u64() -> Result<u64, CapError> {
     // SAFETY: 단일 코어 부팅 초기 접근 (CAP_DRBG 비원자적 갱신)
     let drbg_slot = unsafe { &mut *(&raw mut CAP_DRBG) };
@@ -362,7 +382,7 @@ pub unsafe fn gen_token_u64() -> Result<u64, CapError> {
                 if token != 0 {
                     return Ok(token);
                 }
-                // 0 출력은 무효 토큰 규약과 충돌 -> 재시도 (확률 2^-64)
+                // 0 출력은 무효 토큰 규약과 충돌하므로 재시도 (확률 2^-64)
                 continue;
             }
             Err(DrbgError::ReseedRequired) => {
@@ -424,7 +444,7 @@ impl CapabilitySpace {
     /// 상수-시간 토큰 비교로 보유 Capability 슬롯을 탐색.
     ///
     /// 전 슬롯을 순회하여 모든 슬롯에 대해 동일한 시간만큼 비교를 수행함.
-    /// (조기 종료 없음 -> 타이밍 사이드채널 차단)
+    /// (조기 종료 없음, 타이밍 사이드채널 차단)
     pub fn find_by_token(&self, token: u64) -> Option<usize> {
         let mut found_idx: isize = -1;
         let query = Capability {

@@ -1,46 +1,40 @@
-//! aarch64 arch-specific 모듈 re-export hub (Phase 10 진입 anchor stub)
+//! aarch64 arch-specific 모듈 re-export hub
 //!
 //! # Features
 //! x86_64 hub (`crate::arch::x86_64`) 와 대칭인 aarch64 골격입니다. 6 HAL trait
-//! (Cpu Mmu Idt Console BootEntry Entropy) 의 두 번째 구현체가 채워질 자리를
-//! 표면으로만 잠급니다 (9-D 표면 잠금). 본 모듈은 `#[cfg(target_arch = "aarch64")]`
-//! 로만 컴파일 대상에 진입하므로 현재 활성 타깃 x86_64-unknown-none 산출물에는
-//! 유입되지 않습니다.
-//!
-//! 모든 구현체는 크기 0 의 ZST 이며 본문은 `unimplemented!` 골격입니다. 실제
-//! DAIF/CPACR_EL1/TTBR0_EL1/PL011/eret asm 배선과 첫 컴파일
-//! (`cargo check --target aarch64-unknown-none-softfloat`) 은 Phase 10 ARM-01 로
-//! 이월됩니다 (OQ4 텍스트 표면 잠금, aarch64-unknown-none-softfloat 타깃 미설치).
+//! (Cpu Mmu Idt Console BootEntry Entropy) 의 두 번째 구현체를 표면으로 노출합니다.
+//! 본 모듈은 `#[cfg(target_arch = "aarch64")]` 로만 컴파일 대상에 진입하므로 현재
+//! 활성 타깃 x86_64-unknown-none 산출물에는 유입되지 않습니다.
 
 use crate::arch::common::entropy::EntropyError;
 
-// Phase 10 10-B ISA 의존 서브모듈 (x86_64 hub 대칭 위임 전환)
-// cpu 는 DAIF/WFI/CNTVCT_EL0/CPACR_EL1/PAN 시스템 레지스터 배선을 담당함
+// ISA 의존 서브모듈 (x86_64 hub 대칭 위임 전환)
+// cpu 는 DAIF/WFI/CNTVCT_EL0/CPACR_EL1/PAN 시스템 레지스터 배선 담당
 pub mod cpu;
-// boot_stub 는 _start EL2->EL1 eret 강하 + el1_entry 특권 정규화 global_asm
+// boot_stub 는 _start EL2 에서 EL1 로 eret 강하 + el1_entry 특권 정규화 global_asm
 pub mod boot_stub;
-// boot 는 el1_entry 가 bl 로 진입하는 커널 부팅 합류점(aarch64_kernel_entry) 배선 (10.1 ARM-01)
+// boot 는 el1_entry 가 bl 로 진입하는 커널 부팅 합류점(aarch64_kernel_entry) 배선
 pub mod boot;
-// vectors 는 16-entry .vector_table + VBAR_EL1 로드 + SPSel #1 panic 스택 (Pitfall 14)
+// vectors 는 16-entry .vector_table + VBAR_EL1 로드 + SPSel #1 panic 스택
 pub mod vectors;
 // console 은 PL011 UART MMIO 직렬 콘솔 (arm-pl011-uart 위임 + MMU 전/후 base 갱신)
 pub mod console;
 // mmu 는 stage1 4KiB/48-bit VA/TTBR split 페이지 테이블 + 12-step activate + self_test
 pub mod mmu;
-// gic 는 GICv3 redistributor wake(Pitfall 11) + GRP1 + enable_irq/eoi (arm-gic 0.8.1 위임)
+// gic 는 GICv3 redistributor wake + GRP1 + enable_irq/eoi (arm-gic 0.8.1 위임)
 pub mod gic;
 // psci 는 PSCI PSCI_VERSION/CPU_ON 을 HVC conduit 으로 호출하는 전원 표면 (smccc 0.2.3 위임)
 pub mod psci;
-// syscall 은 SVC #0 벡터 진입(ESR_EL1.EC==0b010101) + arch/common dispatch (10-E ARM-08)
+// syscall 은 SVC #0 벡터 진입(ESR_EL1.EC==0b010101) + arch/common dispatch
 pub mod syscall;
-// process_entry 는 EL0 최초 진입 eret 시퀀스(ttbr0/tlbi/elr_el1/sp_el0/spsr_el1) (10-E ARM-09)
+// process_entry 는 EL0 최초 진입 eret 시퀀스(ttbr0/tlbi/elr_el1/sp_el0/spsr_el1)
 pub mod process_entry;
-// entropy 는 FEAT_RNG RNDR/RNDRRS + CNTVCT jitter + virtio-rng 2-of-3 quorum 위임 (10-F ARM-01)
+// entropy 는 FEAT_RNG RNDR/RNDRRS + CNTVCT jitter + virtio-rng 2-of-3 quorum 위임
 pub mod entropy;
 
-// smccc 0.2.3 HVC conduit 표면을 psci 서브모듈에 재노출함
+// smccc 0.2.3 HVC conduit 표면을 psci 서브모듈에 재노출
 // psci.rs 는 Secure Monitor Call conduit 미사용 하드 게이트(문자열 원천 부재)를 위해
-// 크레이트를 직접 import 하지 않고 아래 재노출 별칭(Hvc / psci_version_call / psci_cpu_on_call)만 경유함
+// 크레이트를 직접 import 하지 않고 아래 재노출 별칭(Hvc / psci_version_call / psci_cpu_on_call)만 경유
 pub(crate) use smccc::Hvc;
 pub(crate) use smccc::psci::{cpu_on as psci_cpu_on_call, version as psci_version_call};
 
@@ -48,20 +42,19 @@ pub(crate) use smccc::psci::{cpu_on as psci_cpu_on_call, version as psci_version
 ///
 /// aarch64 는 x86 TSS/IST 대신 SP_EL1 dedicated panic 스택을 사용하므로 순회할
 /// IST 가드가 없다. `stack` 본체가 arch 분기 없이 0 회 순회하도록 빈 슬라이스를
-/// 반환함 (x86 `ist_guard_ranges` 대칭 HAL 표면 HAL-06)
+/// 반환함 (x86 `ist_guard_ranges` 대칭 HAL 표면)
 pub fn ist_guard_ranges() -> &'static [(u64, u64)] {
     &[]
 }
 
 //
-// 6 HAL trait aarch64 두 번째 구현체 골격 (HAL-03 ZST 대칭)
+// 6 HAL trait aarch64 두 번째 구현체
 //
-// x86_64 hub 와 동일하게 dyn/Box 미사용 ZST 이며 Phase 10 이 본문만 채우면 되는
-// 상태로 표면을 고정함. 본문 unimplemented! 은 aarch64 타깃 컴파일 (Phase 10) 전까지
-// 실행 경로에 진입할 수 없음 (cfg 게이트로 x86_64 빌드에서 완전 배제).
+// x86_64 hub 와 동일하게 dyn/Box 미사용 ZST 이며 각 메서드는 대응 ISA 서브모듈로 위임
+// cfg 게이트로 x86_64 빌드에서는 완전 배제
 //
 
-/// Cpu trait aarch64 구현체 골격 (Phase 10 이 DAIF/WFI/CNTVCT_EL0 배선).
+/// Cpu trait aarch64 구현체 (DAIF/WFI/CNTVCT_EL0 배선).
 #[allow(dead_code)]
 pub struct Aarch64Cpu;
 
@@ -120,7 +113,7 @@ impl crate::arch::Cpu for Aarch64Cpu {
 }
 
 /// Mmu trait aarch64 구현체. typestate 강제는 `mmu::Mmu<State>` 가 담당하며 본
-/// 구현체는 3 단계 전이 표면을 위임 매핑함 (x86 X86Mmu 대칭 HAL-07).
+/// 구현체는 3 단계 전이 표면을 위임 매핑함 (x86 X86Mmu 대칭).
 #[allow(dead_code)]
 pub struct Aarch64Mmu;
 
@@ -136,7 +129,7 @@ impl crate::arch::Mmu for Aarch64Mmu {
     #[inline(always)]
     unsafe fn mmu_enable(m: &Self::Init, space: &Self::AddrSpace) {
         // SAFETY 호출자가 space TTBR0/TTBR1 루트 유효성 + 커널 매핑 포함을 보장
-        //        12-step barrier activate 로 승계 (Pitfall 10 순서 강제)
+        //        12-step barrier activate 로 승계 (barrier 순서 강제)
         unsafe { m.activate(space) }
     }
     #[inline(always)]
@@ -151,7 +144,7 @@ impl crate::arch::Mmu for Aarch64Mmu {
     }
 }
 
-/// Idt trait aarch64 구현체 골격 (Phase 10 이 GIC 벡터 테이블/VBAR_EL1 배선).
+/// Idt trait aarch64 구현체 (GIC 벡터 테이블/VBAR_EL1 배선).
 #[allow(dead_code)]
 pub struct Aarch64Idt;
 
@@ -159,8 +152,8 @@ impl crate::arch::Idt for Aarch64Idt {
     #[inline(always)]
     unsafe fn init() {
         // SAFETY 부팅 초기 단일 코어 시퀀스에서 1 회 호출 계약 승계
-        //        VBAR_EL1 벡터 로드 후 GICv3 redistributor wake FIRST + GRP1 활성 (Pitfall 11)
-        //        후 부팅 proof SGI 1 회 delivery -> IRQ N delivered
+        //        VBAR_EL1 벡터 로드 후 GICv3 redistributor wake FIRST + GRP1 활성
+        //        후 부팅 proof SGI 를 1 회 delivery 하여 IRQ N delivered 마커 emit
         unsafe {
             vectors::init();
             gic::setup();
@@ -179,7 +172,7 @@ impl crate::arch::Idt for Aarch64Idt {
     }
 }
 
-/// Console trait aarch64 구현체 골격 (Phase 10 이 PL011 UART MMIO 배선).
+/// Console trait aarch64 구현체 (PL011 UART MMIO 배선).
 #[allow(dead_code)]
 pub struct Aarch64Console;
 
@@ -198,7 +191,7 @@ impl crate::arch::Console for Aarch64Console {
     }
 }
 
-/// BootEntry trait aarch64 구현체 골격 (Phase 10 이 ttbr0 + eret 강하 asm 배선).
+/// BootEntry trait aarch64 구현체 (ttbr0 + eret 강하 asm 배선).
 #[allow(dead_code)]
 pub struct Aarch64BootEntry;
 
@@ -211,7 +204,7 @@ impl crate::arch::BootEntry for Aarch64BootEntry {
     }
 }
 
-/// Entropy trait aarch64 구현체 골격 (Phase 10 이 RNDR/RNDRRS + jitter quorum 배선).
+/// Entropy trait aarch64 구현체 (RNDR/RNDRRS + jitter quorum 배선).
 #[allow(dead_code)]
 pub struct Aarch64Entropy;
 

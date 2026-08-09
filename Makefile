@@ -122,11 +122,14 @@ QEMU_DEBUG_FLAGS := \
 AARCH64_SMOKE_TIMEOUT := 30
 AARCH64_RUN_TIMEOUT   := 12
 
+# -cpu max 로 FEAT_RNG(RNDR/RNDRRS) TCG 에뮬레이션 활성 (엔트로피 source-0 hw 확보)
+# -device virtio-rng-device 로 virtio-mmio 엔트로피 source-1 부착 (2-of-3 quorum 성립)
 QEMU_AARCH64_FLAGS := \
     -M virt,gic-version=3 \
-    -cpu cortex-a72 \
+    -cpu max \
     -m 512M \
     -display none \
+    -device virtio-rng-device \
     -serial mon:stdio \
     -no-reboot
 
@@ -152,7 +155,7 @@ USER_LUMEN_ELF := $(USER_LUMEN_DIR)/target/$(TARGET)/release/iso-user-lumen
 #
 # 기본 타겟
 #
-.PHONY: all build build-rel iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external check-machete ci-phase7 ci-phase8 check-jitter-lto check-virtio-sentinel check-entropy-mutex qemu-tcg qemu-kvm entropy-host-test check-arch-cfg-gate check-ct-branches check-secure-zero check-body-untouched check-mmu-typestate ci-phase9 ci-phase10 build-aarch64 run-aarch64 qemu-smoke-aarch64 test-aarch64
+.PHONY: all build build-rel build-prod sbom release-hash sign-release verify-release iso iso-rel run run-rel run-dbg clean userspace user-hello user-lumen clean-user check-alloc-zero check-alloc-bus qemu-smoke ci-phase1 ci-phase2 ci-phase3 ci-phase4 chan-dudect check-no-dev-sk check-no-dev-pk qemu-smoke-smoke ci-phase5 wire-attest-host-test ci-phase5_1 ci-phase6 check-no-network qemu-smoke-tls-external check-machete ci-phase7 ci-phase8 check-jitter-lto check-virtio-sentinel check-entropy-mutex qemu-tcg qemu-kvm entropy-host-test check-arch-cfg-gate check-ct-branches check-secure-zero check-body-untouched check-mmu-typestate ci-phase9 ci-phase10 build-aarch64 run-aarch64 qemu-smoke-aarch64 test-aarch64
 
 all: iso
 
@@ -181,7 +184,37 @@ build: userspace
 	$(CARGO) build --target $(TARGET)
 
 build-rel: userspace
-	$(CARGO) build --target $(TARGET) --release
+	K0_ALLOW_DEV_TRUST_ROOT=1 $(CARGO) build --target $(TARGET) --release
+
+# C1/M10 프로덕션 신뢰 루트 임베드 빌드
+#
+# K0_TRUST_ROOT_KEYSTORE 로 프로덕션 ML-DSA-44 공개키(1312 옥텟) 경로를 지정하면
+# build.rs 가 검증·임베드하고 dev 상수를 완전히 대체한다. dev escape hatch 없음이므로
+# dev 키가 감지되면 fail-closed. --locked 로 재현빌드 게이트 강제(P2-1)
+build-prod: userspace
+	@if [ -z "$${K0_TRUST_ROOT_KEYSTORE:-}" ]; then \
+		echo "[build-prod] FAIL: K0_TRUST_ROOT_KEYSTORE=<pk44 경로> 지정 필요 (C1/M10)" >&2; \
+		exit 1; \
+	fi
+	$(CARGO) build --locked --target $(TARGET) --release
+
+# P2-4 SBOM CycloneDX 1.5 SBOM 생성 (Cargo.lock 기반 결정론, 외부 도구 의존 0)
+sbom:
+	@python3 scripts/gen-sbom.py -o sbom.cdx.json
+
+# P2-3 재현빌드 검증 프로덕션 바이너리 SHA-256 + 툴체인 버전 기록
+release-hash: build-prod
+	@echo "[release-hash] toolchain: $$(rustc --version)"
+	@sha256sum $(KERNEL_REL) | tee release-hash.txt
+	@echo "[release-hash] recorded -> release-hash.txt"
+
+# P2-2 릴리즈 서명 ML-DSA-87 self-hosted 서명 (keys/release_signing.sk87 필요)
+sign-release:
+	@bash scripts/release-sign.sh sign $(KERNEL_REL) --sk keys/release_signing.sk87
+
+# P2-2 릴리즈 검증 프로덕션 바이너리 서명 검증 (keys/release_signing.pk87 필요)
+verify-release:
+	@bash scripts/release-sign.sh verify $(KERNEL_REL) --pk keys/release_signing.pk87 --sig $(KERNEL_REL).sig87
 
 clean-user:
 	@if [ -d $(USER_HELLO_DIR)/target ]; then $(CARGO) clean --manifest-path $(USER_HELLO_DIR)/Cargo.toml; fi
@@ -260,10 +293,10 @@ run-aarch64: build-aarch64
 
 qemu-smoke-aarch64: build-aarch64
 	@AARCH64_ELF=$(PSCI_ELF) \
-	    EXPECTED_MARKERS="EL MMU GICR CHILDREN GRP1 IRQ PSCI" \
+	    EXPECTED_MARKERS="EL MMU GICR CHILDREN GRP1 IRQ PSCI VIRTIO DRBG QUORUM GAP JOIN" \
 	    QEMU_TIMEOUT=$(AARCH64_SMOKE_TIMEOUT) \
 	    bash scripts/qemu-test-aarch64.sh
-	@echo "[aarch64] qemu-smoke-aarch64 7-line proof 마커 전량 검출 PASS"
+	@echo "[aarch64] qemu-smoke-aarch64 12-marker proof (7-line + 커널 합류 5) 전량 검출 PASS"
 
 # aarch64 전용 회귀 레인 (ci-phase10 은 x86 ci-phase9 를 상속해 macOS 에서 FAIL 하므로
 # 그 x86 baggage 없이 aarch64 산출물만 검증하는 macOS GREEN 레인을 별도 제공)
@@ -378,6 +411,16 @@ ci-phase4: check-alloc-zero check-alloc-bus qemu-smoke chan-dudect
 check-no-dev-sk: build-rel
 	@bash scripts/check-no-dev-sk.sh
 	@echo "[CI] Phase 5 D-19 dev sk leak 가드 통과 (closed profile)"
+
+# C1/P0-1 프로덕션 빌드 dev 공개키 부재 가드
+#
+# check-no-dev-sk 가 dev sk(개인키) 부재를 보는 것과 짝을 이루어, 본 타겟은
+# K0_TRUST_ROOT_KEYSTORE 프로덕션 빌드 산출물에 dev pk(공개키) 옥텟이 임베드되지
+# 않았음을 실측한다. build-prod 가 keystore cfg 로 HSM_TRUST_ROOT_PK_CONST 를
+# 프로덕션 PK 로 대체하므로 dev PK 는 부재해야 한다
+check-no-dev-pk: build-prod
+	@bash scripts/check-no-dev-pk.sh
+	@echo "[CI] C1 프로덕션 빌드 dev pk 부재 가드 통과 (keystore profile)"
 
 #
 # Phase 5 QEMU smoke (feature smoke 활성)
@@ -580,8 +623,8 @@ ci-phase10:
 	@ARCH=aarch64 AARCH64_ELF=$(AARCH64_ELF) bash scripts/check-ct-branches.sh
 	@HOST_TRIPLE=$$(rustc -vV | sed -n 's/^host: //p') && \
 	 $(CARGO) test --no-default-features --target $$HOST_TRIPLE --test arch_parity
-	@echo "[CI] qemu-test-aarch64 leg 7-line 마커 전량 하드 판정 (boot-join 종결 10.1-01 EL MMU GICR CHILDREN GRP1 IRQ PSCI)"
-	@AARCH64_ELF=$(PSCI_ELF) EXPECTED_MARKERS="EL MMU GICR CHILDREN GRP1 IRQ PSCI" QEMU_TIMEOUT=30 bash scripts/qemu-test-aarch64.sh
+	@echo "[CI] qemu-test-aarch64 leg 12-marker 하드 판정 (7-line proof + 커널 본체 합류 VIRTIO DRBG QUORUM GAP JOIN)"
+	@AARCH64_ELF=$(PSCI_ELF) EXPECTED_MARKERS="EL MMU GICR CHILDREN GRP1 IRQ PSCI VIRTIO DRBG QUORUM GAP JOIN" QEMU_TIMEOUT=30 bash scripts/qemu-test-aarch64.sh
 	@echo "[CI] x86 회귀 leg ci-phase9 standing 상속 실행"
 	@$(MAKE) ci-phase9
 	@echo "[CI] Phase 10 ci 게이트 전체 통과 (ARM-01..ARM-12 static host GREEN + qemu 7-line 마커 전량 하드 판정)"

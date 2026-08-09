@@ -90,12 +90,12 @@ impl SignSession {
 //
 // 정적 버퍼 + 세션 상태
 //
-// SMP 이전 단일 코어 전용. 동시 서명 세션 1개 제한.
+// SMP 이전 단일 코어 전용 동시 서명 세션은 1개로 제한
 //
 
-// key 버퍼: SK_LEN(2560) — Sign 시 sk 또는 Verify 시 pk(1312), Keygen 시 seed(32)
+// key 버퍼 SK_LEN(2560), Sign 시 sk 또는 Verify 시 pk(1312), Keygen 시 seed(32)
 static mut KEY_BUF: [u8; SK_LEN] = [0u8; SK_LEN];
-// aux 버퍼: SIG_LEN(2420) — Verify 시 signature
+// aux 버퍼 SIG_LEN(2420), Verify 시 signature
 static mut AUX_BUF: [u8; SIG_LEN] = [0u8; SIG_LEN];
 // 메시지 버퍼
 static mut MSG_BUF: [u8; MSG_BUF_LEN] = [0u8; MSG_BUF_LEN];
@@ -332,8 +332,8 @@ fn handle_exec(rnd: &[u8; 32]) -> Result<u32, SignError> {
                 return Err(SignError::InvalidRequest);
             }
             let sk: &[u8; SK_LEN] =
-                // SAFETY: 단일 코어
-                unsafe { &*((&raw const KEY_BUF) as *const [u8; SK_LEN]) };
+                // SAFETY: 단일 코어 KEY_BUF 는 [u8; SK_LEN] 이므로 재해석 없이 직접 참조
+                unsafe { &*(&raw const KEY_BUF) };
             let msg: &[u8] = unsafe {
                 let b: &[u8; MSG_BUF_LEN] = &*(&raw const MSG_BUF);
                 &b[..msg_len]
@@ -357,7 +357,8 @@ fn handle_exec(rnd: &[u8; 32]) -> Result<u32, SignError> {
             let pk: &[u8; PK_LEN] =
                 unsafe { &*((&raw const KEY_BUF) as *const [u8; PK_LEN]) };
             let sig: &[u8; SIG_LEN] =
-                unsafe { &*((&raw const AUX_BUF) as *const [u8; SIG_LEN]) };
+                // SAFETY 단일 코어 AUX_BUF 는 [u8; SIG_LEN] 이므로 재해석 없이 직접 참조
+                unsafe { &*(&raw const AUX_BUF) };
             let msg: &[u8] = unsafe {
                 let b: &[u8; MSG_BUF_LEN] = &*(&raw const MSG_BUF);
                 &b[..msg_len]

@@ -1,4 +1,4 @@
-//! 본 모듈은 아키텍처 중립 syscall ABI 표면(번호·에러·컨텍스트·주소 판정)을 정의합니다.
+//! 본 모듈은 아키텍처 중립 syscall ABI 표면(번호, 에러, 컨텍스트, 주소 판정)을 정의합니다.
 //!
 //! # Features
 //! x86_64 `syscall`/`sysret` 와 aarch64 `SVC #0` 두 진입 경로가 동일하게 소비하는
@@ -22,7 +22,7 @@
 //! | arg5      | R9          | X6              |
 //!
 //! `num` 슬롯은 진입 시 호출 번호, 복귀 시 반환값을 담습니다(x86 RAX / aarch64 X0
-//! 동일 규약). `pc`/`flags` 는 x86 RCX·R11(RIP·RFLAGS), aarch64 ELR_EL1·SPSR_EL1
+//! 동일 규약). `pc`/`flags` 는 x86 RCX 와 R11(RIP 와 RFLAGS), aarch64 ELR_EL1 과 SPSR_EL1
 //! 스냅샷입니다.
 //!
 //! # Authors
@@ -38,7 +38,7 @@
 pub enum SyscallNum {
     /// 사용자 프로세스 정상 종료
     Exit = 0,
-    /// `write(fd, buf, len)` — 현재는 fd=2(stderr) → 콘솔 출력만 지원
+    /// `write(fd, buf, len)` 현재는 fd=2(stderr) 인 경우 콘솔 출력만 지원
     Write = 1,
     /// `ipc_call(cap_ptr, msg_type, payload_ptr, payload_len, reply_buf, reply_cap)`
     IpcCall = 2,
@@ -46,37 +46,37 @@ pub enum SyscallNum {
     IpcRecv = 3,
     /// `ipc_reply(endpoint_id, reply_type, payload_ptr, payload_len)`
     IpcReply = 4,
-    /// `getrandom(buf, len, flags)` — 커널 DRBG 출력
+    /// `getrandom(buf, len, flags)` 커널 DRBG 출력
     GetRandom = 5,
-    /// `cap_request(endpoint_id, rights)` — 커널이 정책 검증 후 발급
+    /// `cap_request(endpoint_id, rights)` 커널이 정책 검증 후 발급
     CapRequest = 6,
-    HsmAttach = 7,    // Phase 1: 정적 HSM 슬롯 부착 (비인증; Phase 5 attestation gate 예정)
-    HsmDetach = 8,    // Phase 1: HSM 슬롯 해제 + zeroize (post-attach CAP 검사)
-    HsmEnumerate = 9, // Phase 1: 부착된 슬롯 enumerate (post-attach CAP 검사)
-    HsmWrite = 10,    // Phase 3: USE cap → SoftHSM mode-aware write (D-02)
-    HsmRelay = 11,    // Phase 3: src(RELAY_SRC) + dst(RELAY_DST) dual-cap kernel-internal transfer (D-03)
-    HsmRead = 12,     // Phase 4: USE cap → wire frame response 회수 (D-06)
-    /// Phase 5.1 D-04 attest_payload 3733 옥텟 fixture export (feature smoke 한정)
+    HsmAttach = 7,    // 정적 HSM 슬롯 부착 (비인증)
+    HsmDetach = 8,    // HSM 슬롯 해제 + zeroize (post-attach CAP 검사)
+    HsmEnumerate = 9, // 부착된 슬롯 enumerate (post-attach CAP 검사)
+    HsmWrite = 10,    // USE cap 으로 SoftHSM mode-aware write
+    HsmRelay = 11,    // src(RELAY_SRC) + dst(RELAY_DST) dual-cap kernel-internal transfer
+    HsmRead = 12,     // USE cap 으로 wire frame response 회수
+    /// attest_payload 3733 옥텟 fixture export (feature smoke 한정)
     ///
     /// lumen 측 mldsa 의존 부재 우회 kernel 이 attest_phase5_1_wire_smoke_test 에서
     /// 채운 WIRE_ATTEST_FIXTURE BSS 를 사용자 공간으로 복사 closed 빌드 cfg-out
     #[cfg(feature = "smoke")]
     AttestFixtureExport = 13,
-    /// Phase 6 GAP D-03 NETWORK_ATTACH cap one-shot Ring 3 인도 (tls-external 한정)
+    /// NETWORK_ATTACH cap one-shot Ring 3 인도 (tls-external 한정)
     ///
     /// out_ptr 16 옥텟 HsmCapability 응답 first-caller-wins after-take Denied
     /// closed 빌드 cfg-out variant 자체 부재 호출 시 Unknown 폴백 (RAX -1)
     #[cfg(feature = "tls-external")]
     NetworkCapTake = 14,
-    /// Phase 6 GAP D-06 AUDIT_READ cap one-shot Ring 3 인도 (양 프로필 공통)
+    /// AUDIT_READ cap one-shot Ring 3 인도 (양 프로필 공통)
     ///
     /// out_ptr 16 옥텟 HsmCapability 응답 first-caller-wins after-take Denied
     /// audit query 보유자만 sys_hsm_status 진입 가능
     AuditCapTake = 15,
-    /// Phase 6 GAP D-05 sys_hsm_status atomic 456 옥텟 응답 (AUDIT_READ cap 보유자만)
+    /// sys_hsm_status atomic 456 옥텟 응답 (AUDIT_READ cap 보유자만)
     ///
     /// out_ptr arg0 out_len arg1 caller_cap_token arg2 ABI 잠금
-    /// 호출 자체는 AUDIT_RING 미기록 (D-05 audit-of-audit 회피)
+    /// 호출 자체는 AUDIT_RING 미기록 (audit-of-audit 회피)
     HsmStatus = 16,
 }
 
@@ -141,7 +141,7 @@ const _: () = assert!(core::mem::offset_of!(SyscallContext, arg0) == 24);
 /// 사용자 매핑은 첫 페이지(NULL 페이지)를 제외한 `USER_MIN..USER_MAX` 범위에
 /// 위치. NULL 페이지와 그 외(커널 직접 선형 매핑, 커널 세그먼트 등)는 차단.
 /// NULL 하한은 미매핑 0 페이지로의 copy 가 fatal fault 를 유발하는 경로를 조기
-/// 차단함(SYS-05).
+/// 차단함.
 #[inline]
 pub fn is_user_address(va: u64) -> bool {
     const USER_MIN: u64 = 0x1000;

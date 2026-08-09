@@ -3,24 +3,24 @@
 //! # Features
 //! ARMv8 예외 벡터 16 엔트리(4 그룹 x 4 타입, 각 0x80 byte)를 `.vector_table`
 //! 섹션에 배치하고 테이블 베이스를 2KiB(0x800) 정렬하여 VBAR_EL1 계약을
-//! 충족합니다(ARM-03). x86_64 `idt.rs` 의 256-entry IDT + `lidt` 구조를 role
+//! 충족합니다. x86_64 `idt.rs` 의 256-entry IDT + `lidt` 구조를 role
 //! -match 하되 인코딩은 divergent 하며 각 엔트리는 디스크립터가 아니라 핸들러
 //! 코드 자체입니다.
 //!
 //! # Safety
-//! panic 재귀 synchronous exception 을 차단하기 위해(Pitfall 14 SC8) 각 벡터
+//! panic 재귀 synchronous exception 을 차단하기 위해 각 벡터
 //! 핸들러의 두 번째 명령을 `MSR SPSel, #1` 로 두어 SP_EL1 을 선택하고, dedicated
 //! 16 KiB panic 스택을 `MSR SP_EL1` 로 활성한 뒤 상위 핸들러로 분기합니다. x86
 //! IST(Interrupt Stack Table)에 대응하며 손상된 SP 사용으로 인한 재귀 fault
 //! 무한 루프를 차단합니다. SVC(ESR_EL1.EC==0b010101, lower EL AArch64 sync)는
-//! `aarch64_sync_lower_el` 심볼로 10-E syscall dispatch 분기 자리를 예약합니다.
+//! `aarch64_sync_lower_el` 심볼로 syscall dispatch 분기 자리를 예약합니다.
 
 use core::arch::global_asm;
 
 global_asm!(
     r#"
     //
-    // § 1. 예외 벡터 테이블 (.vector_table 2KiB 정렬 ARM-03)
+    // § 1. 예외 벡터 테이블 (.vector_table 2KiB 정렬)
     //     16 entry = 4 그룹(cur SP0 / cur SPx / lower A64 / lower A32) x 4 타입
     //     각 entry 0x80(128) byte 테이블 베이스 0x800(2KiB) 정렬
     //
@@ -29,7 +29,7 @@ global_asm!(
     .global _vector_table
 _vector_table:
 
-    // Pitfall 14 (SC8) 벡터 진입 스텁
+    // 벡터 진입 스텁
     //   1st  msr daifset #0xf  예외 진입 시 DAIF 전 mask 확정
     //   2nd  msr SPSel #1      SP_EL1 선택 (손상 SP 회피)
     //        msr sp_el1        dedicated 16 KiB panic 스택 활성
@@ -46,7 +46,7 @@ _vector_table:
 
     // 복구 가능 IRQ 진입 스텁 (fail-stop 아님)
     //   panic 스택 clobber 없이 인터럽트된 SP_EL1 을 보존한 채 핸들러로 분기
-    //   핸들러가 x0-x30 전량 save/restore 후 eret 로 인터럽트 지점 복귀 (Pitfall 14 무관)
+    //   핸들러가 x0-x30 전량 save/restore 후 eret 로 인터럽트 지점 복귀
 .macro VEC_IRQ handler
     .align 7                            // 2^7 = 0x80 entry 정렬
     b    \handler
@@ -142,7 +142,7 @@ aarch64_irq_current_el:
     .section .bss.panic_stack,"aw",%nobits
     .align 4                            // 2^4 = 16 byte 정렬
 __panic_stack_bottom:
-    .skip 16384                         // 16 KiB dedicated panic 스택 (SC8)
+    .skip 16384                         // 16 KiB dedicated panic 스택
 __panic_stack_top:
 "#
 );
@@ -150,13 +150,13 @@ __panic_stack_top:
 /// 예외 벡터 테이블을 VBAR_EL1 에 로드하고 초기 인터럽트 마스크를 세팅함.
 ///
 /// boot_stub `el1_entry` 가 이미 VBAR_EL1 을 로드했더라도 재확인하며(HAL init
-/// 표면 계약), GIC bring-up(10-D) 전 안전 기본값으로 IRQ 를 mask 함.
+/// 표면 계약), GIC bring-up 전 안전 기본값으로 IRQ 를 mask 함.
 ///
 /// # Safety
 /// 부팅 초기 단일 코어 시퀀스에서 1 회만 호출해야 함.
 pub unsafe fn init() {
     // SAFETY VBAR_EL1 은 EL1 벡터 베이스 레지스터로 부팅 초기 1 회 세팅됨
-    //        _vector_table 은 링커가 0x800 정렬 배치 (ARM-03)
+    //        _vector_table 은 링커가 0x800 정렬 배치
     unsafe {
         core::arch::asm!(
             "adrp {t}, _vector_table",

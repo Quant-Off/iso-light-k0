@@ -1,24 +1,37 @@
-//! virtio-rng 어댑터 모듈 ENTR-04 sentinel + verify-changed 의무 with_attest_buf prior art 정합
+//! virtio-rng 어댑터 모듈 sentinel + verify-changed 의무
 //!
 //! # Features
 //! `VirtIORng<KernelHal, PciTransport>::request_entropy` 의 단일 진입점입니다.
-//! ENTR-04 명문의 0xFE sentinel 사전 채움 + verify-changed 로 DeviceNotReady
-//! silent-pass 를 차단하며 (PITFALLS Pitfall 5) 모든 이탈 경로에서 scratch 를
-//! zeroize 합니다 (with_attest_buf prior art 정합). `KernelHal` 은 static BSS
+//! 0xFE sentinel 사전 채움 + verify-changed 로 DeviceNotReady
+//! silent-pass 를 차단하며 모든 이탈 경로에서 scratch 를
+//! zeroize 합니다. `KernelHal` 은 static BSS
 //! DMA pool 만 사용하는 alloc-zero `virtio_drivers::Hal` 구현입니다.
 //! sentinel + verify-changed 코어는 `sentinel_collect_with` 로 분리되어 host
-//! 전용 테스트 (BLOCKER-5) 가 mock 주입 형태로 동일 본문을 검증합니다.
+//! 전용 테스트가 mock 주입 형태로 동일 본문을 검증합니다.
 
 #[cfg(target_os = "none")]
 use core::ptr::NonNull;
 
-use constant_time::{Choice, CtEqOps};
+use constant_time::Choice;
+use constant_time::traits::CtEqOps;
 #[cfg(target_os = "none")]
 use virtio_drivers::device::rng::VirtIORng;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use virtio_drivers::transport::pci::PciTransport;
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+use virtio_drivers::transport::mmio::MmioTransport;
 #[cfg(target_os = "none")]
 use virtio_drivers::{BufferDirection, Hal, PAGE_SIZE, PhysAddr};
+
+/// 부팅 시 활성화되는 virtio transport 타입 (arch 별 divergence).
+///
+/// x86_64 는 PCI ECAM 경유 `PciTransport`, aarch64 는 QEMU virt virtio-mmio window
+/// 경유 `MmioTransport<'static>` 를 사용하며 `VirtIORng` 의 generic transport 파라미터로
+/// 주입되어 `virtio_collect` 코어는 arch 무관하게 동일 본문을 공유합니다
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub type ActiveTransport = PciTransport;
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub type ActiveTransport = MmioTransport<'static>;
 use zeroize::Zeroize;
 
 use super::EntropyError;
@@ -31,9 +44,9 @@ pub const VIRTIO_SCRATCH_LEN: usize = 32;
 #[used]
 pub static mut VIRTIO_SCRATCH: [u8; VIRTIO_SCRATCH_LEN] = [SENTINEL; VIRTIO_SCRATCH_LEN];
 
-// Wave 4 boot init 시점 probe_virtio_rng 결과로 채움
+// boot init 시점 probe_virtio_rng 결과로 채움
 #[cfg(target_os = "none")]
-pub static mut VIRTIO_RNG_INSTANCE: Option<VirtIORng<KernelHal, PciTransport>> = None;
+pub static mut VIRTIO_RNG_INSTANCE: Option<VirtIORng<KernelHal, ActiveTransport>> = None;
 
 // VirtQueue modern layout 2 page + 여유 2 page
 #[cfg(target_os = "none")]
@@ -69,7 +82,7 @@ fn virt_to_phys(vaddr: usize) -> PhysAddr {
 /// 두 바이트 슬라이스의 동등 여부를 상수-시간 누산으로 판정하는 함수입니다.
 ///
 /// CtEqOps 가 슬라이스에 미구현 (스칼라 + SecureBuffer 만 지원) 이므로
-/// keystore.rs prior art 의 per-byte ct_eq 누산 패턴을 사용합니다.
+/// keystore.rs 의 per-byte ct_eq 누산 패턴을 사용합니다.
 ///
 /// # Arguments
 /// `a` - 비교 대상 슬라이스
@@ -77,14 +90,14 @@ fn virt_to_phys(vaddr: usize) -> PhysAddr {
 fn ct_eq_bytes(a: &[u8], b: &[u8]) -> Choice {
     let mut eq = Choice::from_u8((a.len() == b.len()) as u8);
     for (x, y) in a.iter().zip(b.iter()) {
-        eq &= CtEqOps::eq(x, y);
+        eq &= CtEqOps::ct_eq(x, y);
     }
     eq
 }
 
 /// sentinel 사전 채움 + verify-changed + zeroize 코어 함수입니다.
 ///
-/// ENTR-04 본문의 단일 정본으로 kernel 경로 (`virtio_collect`) 와 host 전용
+/// 단일 정본으로 kernel 경로 (`virtio_collect`) 와 host 전용
 /// 테스트 (mock 주입) 가 동일 코어를 공유합니다. request 가 scratch 를 전혀
 /// 변경하지 않으면 (sentinel 전체 잔존) silent-pass 를 차단합니다.
 ///
@@ -100,7 +113,7 @@ pub fn sentinel_collect_with<E>(
     buf: &mut [u8],
     request: impl FnOnce(&mut [u8]) -> Result<usize, E>,
 ) -> Result<usize, EntropyError> {
-    // (1) sentinel 사전 채움 (Pitfall 5 회피)
+    // (1) sentinel 사전 채움
     for b in scratch.iter_mut() {
         *b = SENTINEL;
     }
@@ -197,7 +210,6 @@ unsafe impl Hal for KernelHal {
 /// # Safety
 /// BSP single-core + VIRTIO_SCRATCH 와 VIRTIO_RNG_INSTANCE 의 단일 진입 가정
 /// FMASK 재진입 차단으로 boot 및 reseed 경로의 단일 호출을 invariant 로 가정함
-// Wave 3 quorum 합류 전까지 호출자 부재 한시 허용
 #[cfg(target_os = "none")]
 #[allow(dead_code)]
 pub unsafe fn virtio_collect(buf: &mut [u8]) -> Result<usize, EntropyError> {
@@ -213,7 +225,7 @@ pub unsafe fn virtio_collect(buf: &mut [u8]) -> Result<usize, EntropyError> {
         }
     };
 
-    // sentinel + verify-changed + zeroize 코어 위임 (ENTR-04 단일 정본)
+    // sentinel + verify-changed + zeroize 코어 위임
     sentinel_collect_with(scratch, buf, |s| rng.request_entropy(s))
 }
 
@@ -221,7 +233,6 @@ pub unsafe fn virtio_collect(buf: &mut [u8]) -> Result<usize, EntropyError> {
 ///
 /// # Safety
 /// BSP single-core 부팅 1 회만 호출 VIRTIO_RNG_INSTANCE 단일 진입 갱신 가정
-// Wave 4 main.rs boot 합류 전까지 호출자 부재 한시 허용
 #[cfg(target_os = "none")]
 #[allow(dead_code)]
 pub unsafe fn init_virtio_rng_instance() {
@@ -229,6 +240,15 @@ pub unsafe fn init_virtio_rng_instance() {
     {
         // SAFETY: BSP single-core boot MMIO ECAM 은 identity map 영역
         let probed = unsafe { crate::arch::x86_64::entropy::virtio_transport::probe_virtio_rng() };
+        // SAFETY: BSP single-core VIRTIO_RNG_INSTANCE 단일 진입 갱신
+        unsafe {
+            *(&raw mut VIRTIO_RNG_INSTANCE) = probed;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: BSP single-core boot virtio-mmio window 는 stage1 Device identity 매핑 영역
+        let probed = unsafe { crate::arch::aarch64::entropy::probe_virtio_rng() };
         // SAFETY: BSP single-core VIRTIO_RNG_INSTANCE 단일 진입 갱신
         unsafe {
             *(&raw mut VIRTIO_RNG_INSTANCE) = probed;

@@ -1,13 +1,13 @@
-//! Phase 8 ENTR-02 QuorumEntropy 정책 + 3 source 결합 mixing 통합점
+//! QuorumEntropy 정책 + 3 source 결합 mixing 통합점
 //!
 //! # Features
 //! hw / virtio / jitter 3 source 를 per-source NIST SP 800-90B StreamHealth 로 평가한
 //! 뒤 production strict 2-of-3 (degraded 빌드 1-of-3) quorum 을 강제합니다. boot path
 //! `collect` 은 quorum_min 미달 시 즉시 `Err(QuorumFailed)` 로 fail-close 하며 runtime path
-//! `collect_with_retry` 는 D-05 재시드 window 안 복구를 폴링하고 초과 시 직접 panic 합니다.
-//! 3 source 결합은 `blake::Blake3` XOF 로만 수행되어 신규 암호 알고리즘이 없습니다 (D-22)
+//! `collect_with_retry` 는 재시드 window 안 복구를 폴링하고 초과 시 직접 panic 합니다.
+//! 3 source 결합은 `blake::Blake3` XOF 로만 수행되어 신규 암호 알고리즘이 없습니다
 
-// D-05 정합 Timeout variant 부재 collect_with_retry 가 window 초과 시 내부에서 직접 panic
+// Timeout variant 부재 collect_with_retry 가 window 초과 시 내부에서 직접 panic
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub enum EntropyError {
@@ -23,8 +23,8 @@ pub enum EntropyError {
 #[allow(dead_code)]
 pub struct QuorumEntropy;
 
-// AUDIT_RING entropy lifecycle result 코드 D-05 잠금 4 events Pitfall 6 12 옥텟 ABI 보존
-// result 9..=12 신규 할당 Phase 5/5.1/6 의 0..=8 영역과 충돌 0 32-entry AUDIT_RING
+// AUDIT_RING entropy lifecycle result 코드 4 events 12 옥텟 ABI 보존
+// result 9..=12 신규 할당 기존 0..=8 영역과 충돌 0 32-entry AUDIT_RING
 // oldest-overwrite tolerance 정합 (boot enroll ~4 + entropy boot 1 + reseed 4 = peak 9)
 #[allow(dead_code)]
 const RESULT_ENTROPY_RESEED_ATTEMPT: u8 = 9;
@@ -36,7 +36,7 @@ const RESULT_ENTROPY_RESEED_RECOVERED: u8 = 11;
 const RESULT_ENTROPY_RESEED_FAILED_PANIC: u8 = 12;
 
 // FAILED_PANIC 의 bus_kind verdict sub-code slot_idx 0xFE 는 quorum-wide
-// slot_idx 0xF0 | source_idx 는 source-specific 실패로 D-05 4 events scope 안 통합
+// slot_idx 0xF0 | source_idx 는 source-specific 실패로 4 events scope 안 통합
 #[allow(dead_code)]
 const SUB_QUORUM_MIN: u8 = 0;
 #[allow(dead_code)]
@@ -46,7 +46,7 @@ const SUB_APT_FAIL: u8 = 2;
 #[allow(dead_code)]
 const SUB_SOURCE_MISSING: u8 = 3;
 
-// production strict 2-of-3 degraded 빌드 1-of-3 Open Question 3 RESEARCH 권고
+// production strict 2-of-3 degraded 빌드 1-of-3
 #[cfg(not(feature = "entropy-degraded-ok"))]
 #[allow(dead_code)]
 const QUORUM_MIN: usize = 2;
@@ -59,7 +59,7 @@ const QUORUM_MIN: usize = 1;
 const SAMPLE_BYTES: usize = 32;
 #[allow(dead_code)]
 const SOURCE_COUNT: usize = 3;
-// D-05 재시드 window 상한 ms
+// 재시드 window 상한 ms
 #[allow(dead_code)]
 const RETRY_BUDGET_MS: u64 = 60_000;
 // timer 부재 fail-open-to-hang 차단 spin 상한 (fail-closed 보증)
@@ -82,7 +82,7 @@ static mut HW_HEALTH: StreamHealth = StreamHealth::new();
 static mut VIRTIO_HEALTH: StreamHealth = StreamHealth::new();
 #[cfg(target_os = "none")]
 static mut JITTER_HEALTH: StreamHealth = StreamHealth::new();
-// Pitfall 5 visibility main.rs 의 ENTROPY_SOURCES_AVAILABLE marker 가 읽음
+// main.rs 의 ENTROPY_SOURCES_AVAILABLE marker 가 읽음
 #[cfg(target_os = "none")]
 static mut SOURCES_AVAILABLE_AT_BOOT: u8 = 0;
 #[cfg(target_os = "none")]
@@ -114,7 +114,13 @@ impl QuorumEntropy {
                     // SAFETY cpu::features() 완료 후 단일 코어 hw RDSEED/RDRAND 수집
                     unsafe { crate::arch::x86_64::entropy::hw::collect_hw_into(&mut buf[..]) }
                 }
-                #[cfg(not(target_arch = "x86_64"))]
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // SAFETY 단일 코어 hw FEAT_RNG RNDR/RNDRRS 수집 미구현 코어는 내부에서
+                    //        SourceUnavailable 로 강등해 quorum 이 virtio+jitter 로 degrade 흡수
+                    unsafe { crate::arch::aarch64::entropy::collect_hw_into(&mut buf[..]) }
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 {
                     Err(EntropyError::SourceUnavailable)
                 }
@@ -156,7 +162,7 @@ impl QuorumEntropy {
             return Err(e);
         }
 
-        // Pitfall 2 0-buffer silent-pass 차단 constant-time 비교
+        // 0-buffer silent-pass 차단 constant-time 비교
         let zero = [0u8; SAMPLE_BYTES];
         if blake::ct_eq_slice(&buf[..], &zero[..]).unwrap_u8() == 1 {
             audit_enqueue(
@@ -211,15 +217,14 @@ impl QuorumEntropy {
         let mut scratches: [[u8; SAMPLE_BYTES]; SOURCE_COUNT] =
             [[0u8; SAMPLE_BYTES]; SOURCE_COUNT];
         let mut live_sources: u8 = 0;
-        for idx in 0..SOURCE_COUNT {
+        for (idx, scratch) in scratches.iter_mut().enumerate() {
             // SAFETY 각 source 어댑터 단일 진입
-            match unsafe { Self::collect_from_source(idx as u8, &mut scratches[idx]) } {
-                Ok(_) => live_sources += 1,
-                Err(_) => {}
+            if unsafe { Self::collect_from_source(idx as u8, scratch) }.is_ok() {
+                live_sources += 1;
             }
         }
 
-        // Pitfall 5 boot source count latch 최초 1 회
+        // boot source count latch 최초 1 회
         // SAFETY BSP single-core SOURCES_* singleton 단일 진입
         unsafe {
             if !(&raw const SOURCES_LATCHED).read() {
@@ -241,7 +246,7 @@ impl QuorumEntropy {
             return Err(EntropyError::QuorumFailed);
         }
 
-        // BLAKE3 XOF mixing 모든 source 항상 결합 unavailable 은 0 buffer 기여 (RESEARCH L177)
+        // BLAKE3 XOF mixing 모든 source 항상 결합 unavailable 은 0 buffer 기여
         let mut hasher = blake::Blake3::new();
         for s in scratches.iter() {
             hasher.update(&s[..]);
@@ -267,7 +272,7 @@ impl QuorumEntropy {
     ///
     /// # Arguments
     /// `buf` - 수집 결과 출력 buffer
-    /// `max_wait_ms` - D-05 재시드 window 상한 ms
+    /// `max_wait_ms` - 재시드 window 상한 ms
     ///
     /// # Errors
     /// `EntropyError::SourceUnavailable` - BLAKE3 XOF 출력 실패
@@ -320,7 +325,7 @@ impl QuorumEntropy {
 /// boot 이후 경과 시간을 ms 로 환산하는 helper 함수
 ///
 /// timer_frequency 가 None 이거나 1 kHz 미만이면 0 을 반환해 collect_with_retry 의
-/// spin ceiling 에 종료를 위임함 (Pitfall 12 divide-by-zero 차단)
+/// spin ceiling 에 종료를 위임함 (divide-by-zero 차단)
 #[cfg(target_os = "none")]
 fn elapsed_since_boot_ms() -> u64 {
     let ticks = crate::arch::cpu::cycle_counter();

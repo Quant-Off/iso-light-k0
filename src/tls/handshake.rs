@@ -2,14 +2,16 @@
 //! 모듈입니다.
 //!
 //! 메시지 흐름은 다음 순서로 진행됩니다.
-//!   1. Client -> Server: ClientHello(psk_id, random, suite, policy,
-//!      ephem_pk[s], binder).
-//!   2. 서버측 ECDHE / KEM 처리 후 Server -> Client: ServerHello(random,
-//!      suite, ephem_pk[s] / kem_ct). 이 시점부터 양측 handshake_traffic_secrets
-//!      이 도출됨.
-//!   3. Server -> Client: {Finished_S} (verify_data over CH..ServerHello).
-//!   4. Client -> Server: {Finished_C} (verify_data over CH..Finished_S).
-//!      이 시점부터 양측 application_traffic_secrets 가 활성화됨.
+//!   1. 클라이언트에서 서버로 ClientHello(psk_id, random, suite, policy,
+//!      ephem_pk[s], binder) 를 보냅니다.
+//!   2. 서버측 ECDHE / KEM 처리 후 서버에서 클라이언트로 ServerHello(random,
+//!      suite, ephem_pk[s] / kem_ct) 를 보냅니다. 이 시점부터 양측
+//!      handshake_traffic_secrets 이 도출됩니다.
+//!   3. 서버에서 클라이언트로 {Finished_S} (verify_data over CH..ServerHello)
+//!      를 보냅니다.
+//!   4. 클라이언트에서 서버로 {Finished_C} (verify_data over CH..Finished_S)
+//!      를 보냅니다. 이 시점부터 양측 application_traffic_secrets 가
+//!      활성화됩니다.
 //!
 //! 본 모듈은 v1 한정 in-kernel loopback 핸드셰이크를 제공합니다. 같은 커널
 //! 내 두 [`crate::tls::ConnHandle`] 간 대칭 PSK 검증, 트래픽 키 셋업, 종료
@@ -21,7 +23,7 @@
 //! (HKDF-Expand-Label, Derive-Secret, binder/finished MAC).
 
 use mlkem::{MLKEM768KeyPair, mlkem768_decaps, mlkem768_encaps, mlkem768_keygen};
-use x25519::SecretKey as X25519Sk;
+use x25519::{SecretKey as X25519Sk, SharedSecret as X25519Shared};
 use zeroize::{Secret, Zeroize};
 
 use crate::capability;
@@ -165,9 +167,11 @@ unsafe fn do_handshake<H: HsmDriver>(
         capability::rand_bytes(&mut c_seed).map_err(|_| TlsError::HsmFailure)?;
         capability::rand_bytes(&mut s_seed).map_err(|_| TlsError::HsmFailure)?;
     }
-    let client_x_sk = X25519Sk::from_bytes(c_seed);
-    let server_x_sk = X25519Sk::from_bytes(s_seed);
-    // TLS-03 임시 시드는 DSE 로 소거가 제거되지 않도록 zeroize 로 볼라타일 소거
+    let mut client_x_sk = X25519Sk::default();
+    client_x_sk.init(&c_seed);
+    let mut server_x_sk = X25519Sk::default();
+    server_x_sk.init(&s_seed);
+    // 임시 시드는 DSE 로 소거가 제거되지 않도록 zeroize 로 볼라타일 소거
     c_seed.zeroize();
     s_seed.zeroize();
     let client_x_pk = client_x_sk.public_key();
@@ -182,8 +186,9 @@ unsafe fn do_handshake<H: HsmDriver>(
                 capability::rand_bytes(&mut d).map_err(|_| TlsError::HsmFailure)?;
                 capability::rand_bytes(&mut z).map_err(|_| TlsError::HsmFailure)?;
             }
-            let kp = mlkem768_keygen(&d, &z);
-            // TLS-03 ML-KEM keygen 시드 볼라타일 소거
+            let mut kp = MLKEM768KeyPair::default();
+            mlkem768_keygen(&d, &z, &mut kp);
+            // ML-KEM keygen 시드 볼라타일 소거
             d.zeroize();
             z.zeroize();
             Some(kp)
@@ -313,13 +318,15 @@ unsafe fn do_handshake<H: HsmDriver>(
     //
     // 8. KEX 공유비밀 도출
     //
-    let client_x_ss = client_x_sk
-        .diffie_hellman(&server_x_pk)
+    let mut client_x_ss = X25519Shared::default();
+    client_x_sk
+        .diffie_hellman_into(&server_x_pk, &mut client_x_ss)
         .map_err(|_| TlsError::Internal)?;
-    let server_x_ss = server_x_sk
-        .diffie_hellman(&client_x_pk)
+    let mut server_x_ss = X25519Shared::default();
+    server_x_sk
+        .diffie_hellman_into(&client_x_pk, &mut server_x_ss)
         .map_err(|_| TlsError::Internal)?;
-    // TLS-02 비밀 공유비밀 동등성 비교는 상수시간으로 수행(타이밍 사이드채널 차단)
+    // 공유비밀 동등성 비교는 상수시간으로 수행(타이밍 사이드채널 차단)
     if !ct_eq_bytes(client_x_ss.as_bytes(), server_x_ss.as_bytes()) {
         return Err(TlsError::Internal);
     }
@@ -332,13 +339,15 @@ unsafe fn do_handshake<H: HsmDriver>(
             unsafe {
                 capability::rand_bytes(&mut m).map_err(|_| TlsError::HsmFailure)?;
             }
-            let encaps = mlkem768_encaps(&kp.ek, &m);
-            // TLS-03 ML-KEM encaps 난수 m 볼라타일 소거
+            let mut kem_ss_server = Secret::new([0u8; 32]);
+            let kem_ct = mlkem768_encaps(&kp.ek, &m, &mut kem_ss_server)
+                .map_err(|_| TlsError::Internal)?;
+            // ML-KEM encaps 난수 m 볼라타일 소거
             m.zeroize();
-            let (kem_ct, kem_ss_server) = encaps.map_err(|_| TlsError::Internal)?;
             sh[q..q + TLS_MLKEM768_CT_LEN].copy_from_slice(&kem_ct);
-            let kem_ss_client = mlkem768_decaps(&kem_ct, kp.dk.expose());
-            // TLS-02 비밀 KEM 공유비밀 비교도 상수시간으로 수행
+            let mut kem_ss_client = Secret::new([0u8; 32]);
+            mlkem768_decaps(&kem_ct, kp.dk.expose(), &mut kem_ss_client);
+            // KEM 공유비밀 비교도 상수시간으로 수행
             if !ct_eq_bytes(kem_ss_client.expose(), kem_ss_server.expose()) {
                 return Err(TlsError::Internal);
             }
@@ -503,8 +512,8 @@ unsafe fn do_handshake<H: HsmDriver>(
         ss.state = ConnState::Connected;
     }
 
-    // 핸드셰이크 시크릿 / 임시 키는 함수 종료 시 Secret::Drop 으로 자동 소거됨
-    // mlkem_kp 의 dk: Secret<[u8; 2400]> 도 동일하게 소거됨
+    // 핸드셰이크 시크릿 / 임시 키는 함수 종료 시 Secret::Drop 으로 자동 소거
+    // mlkem_kp 의 dk: Secret<[u8; 2400]> 도 동일하게 소거
     Ok(())
 }
 

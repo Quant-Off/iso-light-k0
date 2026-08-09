@@ -32,7 +32,7 @@ const BITMAP_WORDS: usize = MAX_FRAMES / 64;
 //
 
 /// 4 KiB 정렬된 물리 프레임 주소를 나타내는 타입.
-/// 생성 시 정렬 보장, 이후 불변 -> 안전하게 raw 포인터로 변환 가능.
+/// 생성 시 정렬 보장, 이후 불변이므로 안전하게 raw 포인터로 변환 가능.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct PhysFrame(u64);
@@ -249,7 +249,7 @@ impl BitmapFrameAllocator {
         }
 
         // 보안 소거: 해제 전 잔류 민감 데이터 완전 소거
-        // 비트맵 해제 전에 소거하여 소거와 해제 사이 경쟁 창구를 최소화함
+        // 비트맵 해제 전에 소거하여 소거와 해제 사이 경쟁 창구 최소화
         // SAFETY: DoubleFree 검사 통과 후 frame.addr()는 유효한 USED 프레임
         unsafe {
             zeroize::volatile::secure_zero(frame.addr() as *mut u8, FRAME_SIZE as usize);
@@ -295,7 +295,7 @@ static mut FRAME_ALLOCATOR: BitmapFrameAllocator = BitmapFrameAllocator::new();
 /// 부팅 초기 단일 코어에서, MMU 활성화 전에 반드시 한 번만 호출해야 함.
 pub unsafe fn init(map: &MemoryMap) {
     // SAFETY: 호출자가 단일 코어 접근을 보장함
-    // &raw mut 로 raw 포인터를 생성하여 Rust 2024 static_mut_refs 규칙을 준수함
+    // &raw mut 로 raw 포인터를 생성하여 Rust 2024 static_mut_refs 규칙을 준수
     unsafe {
         (*(&raw mut FRAME_ALLOCATOR)).init_from_memory_map(map);
     }
@@ -303,7 +303,7 @@ pub unsafe fn init(map: &MemoryMap) {
 
 /// 물리 주소 범위 `[base, base+length)`를 USED로 강제 표시함.
 ///
-/// `init()` 직후 커널 이미지·부트 스택·페이지 테이블 등
+/// `init()` 직후 커널 이미지, 부트 스택, 페이지 테이블 등
 /// 이미 점유된 영역이 `alloc_frame()`으로 반환되지 않도록 보호함.
 ///
 /// # Safety
